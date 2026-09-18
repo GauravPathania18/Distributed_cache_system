@@ -9,6 +9,7 @@ __pycache__/
 *$py.class
 
 # Test and coverage files
+tests/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -27,3 +28,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Layer 5 - SQLite database files
+data/
+*.db

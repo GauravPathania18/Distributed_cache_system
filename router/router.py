@@ -1,11 +1,14 @@
 import os
 
-import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Any, Optional
 
 from cluster.node_manager import NodeManager
+from database.exceptions import DatabaseUnavailableError
+from database.repository import DatabaseRepository
+from services.cache_service import CacheService
+from services.distributed_cache import DistributedCache
 
 
 # ---------------------------------------------------------
@@ -24,6 +27,8 @@ HEALTH_INTERVAL = 2
 FAILURE_THRESHOLD = 3
 TIMEOUT = 2
 
+DEFAULT_DB_PATH = os.environ.get("CACHE_DB_PATH", "data/cache.db")
+
 
 # ---------------------------------------------------------
 # APPLICATION
@@ -31,8 +36,8 @@ TIMEOUT = 2
 
 app = FastAPI(
     title="Distributed Cache Router",
-    description="Layer 4 - Router with Failure Detection & Replication",
-    version="2.0"
+    description="Layer 5.7/5.8 - Cache-Aside, Database fallback, Circuit Breaker & Single-Flight",
+    version="3.1"
 )
 
 
@@ -51,6 +56,13 @@ def nodes_from_env() -> list:
     return list(DEFAULT_NODES)
 
 
+# ---------------------------------------------------------
+# COMPONENTS
+# ---------------------------------------------------------
+
+# Source of truth. Shared by the whole router process.
+database = DatabaseRepository(db_path=DEFAULT_DB_PATH)
+
 node_manager = NodeManager(
     nodes=nodes_from_env(),
     virtual_nodes=VIRTUAL_NODES,
@@ -61,7 +73,51 @@ node_manager = NodeManager(
 
 node_manager.start_health_monitor()
 
-session = requests.Session()
+# Data-plane client over the cluster.
+distributed_cache = DistributedCache(
+    node_manager=node_manager,
+    timeout=TIMEOUT
+)
+
+# Layer 5 cache-aside policy.
+cache_service = CacheService(
+    cache=distributed_cache,
+    database=database
+)
+
+
+def configure_cluster(
+    nodes,
+    replication_factor=REPLICATION_FACTOR,
+    virtual_nodes=VIRTUAL_NODES,
+    health_interval=HEALTH_INTERVAL,
+    failure_threshold=FAILURE_THRESHOLD,
+    start_monitor=False
+):
+    """Rebuild the cluster components (used by tests / demos)."""
+
+    global node_manager, distributed_cache, cache_service
+
+    node_manager = NodeManager(
+        nodes=nodes,
+        virtual_nodes=virtual_nodes,
+        replication_factor=replication_factor,
+        health_interval=health_interval,
+        failure_threshold=failure_threshold
+    )
+
+    if start_monitor:
+        node_manager.start_health_monitor()
+
+    distributed_cache = DistributedCache(
+        node_manager=node_manager,
+        timeout=TIMEOUT
+    )
+
+    cache_service = CacheService(
+        cache=distributed_cache,
+        database=database
+    )
 
 
 # ---------------------------------------------------------
@@ -76,159 +132,170 @@ class CacheEntry(BaseModel):
 
 
 # ---------------------------------------------------------
-# GET (primary -> replica fallback)
+# GET (cache-aside: cache -> database -> populate cache)
 # ---------------------------------------------------------
 
 @app.get("/cache/{key}")
 def get_cache(key: str):
 
-    nodes = node_manager.get_nodes(key)
+    try:
 
-    if not nodes:
+        result = cache_service.get(key)
+
+    except DatabaseUnavailableError:
 
         raise HTTPException(
             status_code=503,
-            detail="No cache nodes available"
+            detail="Database unavailable - try again later"
         )
 
-    # Try primary first, then replicas
-    for node in nodes:
+    if result is None:
 
-        try:
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found in cache or database"
+        )
 
-            response = session.get(
-                f"{node}/cache/{key}",
-                timeout=TIMEOUT
-            )
-
-            if response.status_code == 200:
-
-                return {
-                    "node": node,
-                    "data": response.json()
-                }
-
-            # 404 on this node -> try next
-            if response.status_code == 404:
-
-                continue
-
-        except requests.RequestException:
-
-            continue
-
-    # All nodes missed or failed
-    raise HTTPException(
-        status_code=404,
-        detail="Cache miss"
-    )
+    return {
+        "key": key,
+        "value": result["value"],
+        "source": result["source"],
+        "node": result["node"]
+    }
 
 
 # ---------------------------------------------------------
-# PUT (replicate to primary + replicas)
+# PUT (write-through: database then cache)
 # ---------------------------------------------------------
 
 @app.put("/cache/{key}")
-async def set_cache(
+def set_cache(
     key: str,
-    request: Request
+    entry: CacheEntry
 ):
 
-    nodes = node_manager.get_nodes(key)
+    try:
 
-    if not nodes:
-
-        raise HTTPException(
-            status_code=503,
-            detail="No cache nodes available"
+        result = cache_service.set(
+            key,
+            entry.value,
+            ttl=entry.ttl
         )
 
-    body = await request.json()
-
-    successful_nodes = []
-    errors = []
-
-    # Write to every node in the replica set
-    for node in nodes:
-
-        try:
-
-            response = session.put(
-                f"{node}/cache/{key}",
-                json=body,
-                timeout=TIMEOUT
-            )
-
-            if response.status_code == 200:
-
-                successful_nodes.append(node)
-
-            else:
-
-                errors.append(
-                    f"{node}: HTTP {response.status_code}"
-                )
-
-        except requests.RequestException as e:
-
-            errors.append(f"{node}: {str(e)}")
-
-    # Require at least one successful copy
-    if not successful_nodes:
+    except DatabaseUnavailableError:
 
         raise HTTPException(
             status_code=503,
-            detail="All cache nodes failed"
+            detail="Database unavailable - value was not stored"
+        )
+
+    if not result["nodes"]:
+
+        raise HTTPException(
+            status_code=503,
+            detail="Value stored in database but no cache node accepted it"
         )
 
     return {
         "status": "stored",
         "key": key,
-        "replicated_to": len(successful_nodes),
-        "nodes": successful_nodes
+        "source": "database+cache",
+        "replicated_to": len(result["nodes"]),
+        "nodes": result["nodes"]
     }
 
 
 # ---------------------------------------------------------
-# DELETE (invalidate on primary + replicas)
+# DELETE (database then invalidate cache)
 # ---------------------------------------------------------
 
 @app.delete("/cache/{key}")
 def delete_cache(key: str):
 
-    nodes = node_manager.get_nodes(key)
+    try:
 
-    if not nodes:
+        result = cache_service.delete(key)
+
+    except DatabaseUnavailableError:
 
         raise HTTPException(
             status_code=503,
-            detail="No cache nodes available"
+            detail="Database unavailable - could not delete key"
         )
 
-    deleted_from = []
+    if not result["deleted"]:
 
-    for node in nodes:
-
-        try:
-
-            response = session.delete(
-                f"{node}/cache/{key}",
-                timeout=TIMEOUT
-            )
-
-            # 200 = deleted, 404 = already gone — both count
-            if response.status_code in [200, 404]:
-
-                deleted_from.append(node)
-
-        except requests.RequestException:
-
-            continue
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found"
+        )
 
     return {
         "status": "deleted",
         "key": key,
-        "nodes": deleted_from
+        "deleted_from_database": result["stored_in_database"],
+        "nodes": result["nodes"]
+    }
+
+
+# ---------------------------------------------------------
+# DATABASE (temporary - direct access for testing/debugging)
+# NOTE: to be removed once the cache-aside flow is proven.
+# ---------------------------------------------------------
+
+@app.get("/db/{key}")
+def db_get(key: str):
+
+    try:
+
+        value = database.get(key)
+
+    except DatabaseUnavailableError:
+
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable"
+        )
+
+    if value is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found in database"
+        )
+
+    return {
+        "key": key,
+        "value": value,
+        "source": "database"
+    }
+
+
+@app.delete("/db/{key}")
+def db_delete(key: str):
+
+    try:
+
+        deleted = database.delete(key)
+
+    except DatabaseUnavailableError:
+
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable"
+        )
+
+    if not deleted:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found in database"
+        )
+
+    return {
+        "status": "deleted",
+        "key": key,
+        "source": "database"
     }
 
 
@@ -240,6 +307,16 @@ def delete_cache(key: str):
 def cluster_status():
 
     return node_manager.get_status()
+
+
+# ---------------------------------------------------------
+# CIRCUIT BREAKER STATUS
+# ---------------------------------------------------------
+
+@app.get("/circuit-breaker/status")
+def circuit_breaker_status():
+
+    return cache_service.circuit_breaker_status()
 
 
 # ---------------------------------------------------------

@@ -35,13 +35,29 @@ DCS/
 │   ├── __init__.py
 │   ├── consistent_hash.py   <- consistent hashing + virtual nodes
 │   └── node_manager.py      <- health checks + failure detection
-├── router/               <- Layer 4: replication-aware router
+├── router/               <- Layers 4-5: replication-aware + cache-aside router
 │   ├── __init__.py
 │   └── router.py
+├── database/             <- Layer 5: SQLite source of truth
+│   ├── __init__.py
+│   ├── exceptions.py         <- DatabaseUnavailableError
+│   └── repository.py
+├── services/             <- Layer 5: cache-aside orchestration
+│   ├── __init__.py
+│   ├── cache_service.py      <- cache-aside policy + stampede protection
+│   ├── circuit_breaker.py    <- CLOSED/OPEN/HALF-OPEN DB failure protection
+│   ├── distributed_cache.py  <- data-plane client over the cluster
+│   └── single_flight.py      <- request coalescing (leader/follower)
 ├── tests/                <- test suite
 │   ├── test_cache.py
 │   ├── test_consistent_hash.py
-│   └── test_router.py
+│   ├── test_router.py
+│   ├── test_repository.py
+│   ├── test_cache_service.py
+│   ├── test_circuit_breaker.py
+│   └── test_single_flight.py
+├── data/                 <- generated SQLite DB (gitignored)
+│   └── cache.db
 ├── main.py               <- Layer 2: cache node server
 ├── demo.py               <- Layer 1 demo
 ├── demo_hash.py          <- Layer 3.1 demo
@@ -284,13 +300,212 @@ curl http://localhost:8000/cluster/status
 
 ---
 
+## Layer 5 — Database Integration & Cache-Aside
+
+The router now sits in front of both the cache cluster and a
+SQLite database. Cache nodes stay "dumb" — they never see the DB.
+
+```
+Client
+  │
+  ▼
+Router :8000
+  │
+  ▼
+CacheService
+  │
+  ├──► Distributed Cache (Node 1/2/3)
+  │
+  └──► SQLite  data/cache.db   (source of truth)
+```
+
+GET flow: cache HIT → return; cache MISS → database → populate cache →
+return. SET writes to database **then** cache. DELETE removes from
+database **and** invalidates the cache.
+
+Start the nodes and router exactly as in Layer 4 (4 terminals), then
+try the commands below.
+
+### PUT — writes to database + cache
+
+```powershell
+curl -X PUT http://localhost:8000/cache/user:42 `
+  -H "Content-Type: application/json" `
+  -d '{"value":{"name":"Gaurav","age":20},"ttl":300}'
+```
+
+### GET — served from cache
+
+```powershell
+curl http://localhost:8000/cache/user:42
+```
+
+```json
+{
+    "key": "user:42",
+    "value": { "name": "Gaurav", "age": 20 },
+    "source": "cache",
+    "node": "http://localhost:8002"
+}
+```
+
+### Simulate a cache miss (database fallback)
+
+Delete the key from the cache nodes directly, leaving SQLite intact.
+The simplest way is to restart the nodes, or hit each node's
+`/cache/{key}` DELETE endpoint on ports 8001-8003. Then:
+
+```powershell
+curl http://localhost:8000/cache/user:42
+```
+
+```json
+{
+    "key": "user:42",
+    "value": { "name": "Gaurav", "age": 20 },
+    "source": "database",
+    "node": null
+}
+```
+
+Request it once more — it is now back in the cache (`source: "cache"`).
+
+### Direct database endpoints (TEMPORARY — for testing only)
+
+```powershell
+# Read straight from SQLite (bypasses the cache)
+curl http://localhost:8000/db/user:42
+
+# Delete straight from SQLite (cache is NOT touched)
+curl -X DELETE http://localhost:8000/db/user:42
+```
+
+> These `/db/*` endpoints exist only to make the cache-aside behavior
+> observable while developing. They are not part of the final design.
+
+### Layer 5 tests
+
+```powershell
+pytest tests/test_repository.py tests/test_cache_service.py -v
+pytest tests/test_router.py -v
+```
+
+- `test_repository.py` — SQLite CRUD + JSON round-trip.
+- `test_cache_service.py` — cache-aside logic + stampede protection
+  (5 concurrent misses trigger a single database read) + DB-failure tests.
+- `test_circuit_breaker.py` — CLOSED/OPEN/HALF-OPEN state machine.
+- `test_single_flight.py` — leader/follower request coalescing.
+- `test_router.py` — includes Layer 5 end-to-end tests for database
+  fallback and the `/db/*` endpoints.
+
+---
+
+## Layer 5.7 — Database Failure Handling (Circuit Breaker)
+
+The router distinguishes **404** (key missing in cache AND database) from
+**503** (database unreachable). A `CircuitBreaker` sits between the cache
+service and the database:
+
+```
+CLOSED  --(3 consecutive failures)-->  OPEN
+  ▲                                        │
+  │                                  (30s cooldown)
+  └------(probe success)------------ HALF-OPEN
+```
+
+- CLOSED: every DB call passes through and is counted.
+- OPEN: calls are rejected immediately (fast fail, no DB hammering).
+- HALF-OPEN: one probe call is allowed; success closes the circuit,
+  failure re-opens it.
+
+While the circuit is OPEN, cache **hits are still served normally** —
+only cache misses cannot be satisfied.
+
+### Inspect the breaker
+
+```powershell
+curl http://localhost:8000/circuit-breaker/status
+```
+
+```json
+{
+    "state": "closed",
+    "failure_count": 0,
+    "success_count": 0,
+    "failure_threshold": 3,
+    "recovery_timeout": 30,
+    "success_threshold": 1
+}
+```
+
+### Live demo
+
+1. Start the 3 nodes + router (as in Layer 4).
+2. Delete/corrupt the SQLite file so it cannot open:
+
+```powershell
+Stop-Service -NoWait  # or simply move data/cache.db away
+Move-Item data\cache.db data\cache.db.bak
+```
+
+3. A cache miss now returns **503**:
+
+```powershell
+curl http://localhost:8000/cache/user:404
+```
+
+4. After 3 failures the breaker is OPEN and the router answers fast:
+
+```powershell
+curl http://localhost:8000/circuit-breaker/status
+# state: "open"
+```
+
+5. Restore the DB and wait ~30s for HALF-OPEN → a successful probe
+   returns the breaker to CLOSED.
+
+> SET and DELETE are protected too: writes through a dead database
+> return 503 instead of a raw server error.
+
+---
+
+## Layer 5.8 — Cache Stampede Protection (Single-Flight)
+
+Concurrent GETs for the same key that miss the cache all collapse into
+**one** database read:
+
+```
+GET user:42  x 5  (all miss the cache)
+        │
+        ▼
+   SingleFlight("user:42")
+        │
+        ├── 1 leader  ──►  database read   (one query)
+        │
+        └── 4 followers ──►  wait on Event, reuse leader's result
+```
+
+- Followers never re-query the database.
+- If the leader FAILS (e.g. DB down), the exception is stored and
+  re-raised in every follower — nobody retries the dead database.
+- Different keys are independent (per-key flight).
+- Single-flight is process-local, so it is per-router-process.
+
+Verified by `test_single_flight.py` and the existing
+`test_concurrent_misses_hit_database_only_once` in
+`tests/test_cache_service.py`.
+
+---
+
 ## Full test run
 
 ```powershell
 pytest -v
 ```
 
-Expected: **35 tests pass** (14 cache + 16 consistent hash + 5 router).
+Expected: **74 tests pass** — 14 cache + 16 consistent hash +
+8 router + 7 repository + 13 cache-service + 11 circuit-breaker +
+5 single-flight.
 
 ---
 
@@ -307,7 +522,10 @@ In each terminal press `Ctrl + C`.
 - Each PUT writes to **2 nodes** (replication factor = 2).
   Each GET tries primary first, then falls back to the replica.
 - When a node crashes, its in-memory cache is lost.
-  The database (Layer 5) will repopulate it on the next cache miss.
+  Layer 5 repopulates it from the database on the next cache miss.
+- Layer 5 uses SQLite at `data/cache.db` (no TTL — the DB keeps data
+  forever; TTL only affects the in-memory cache). Override the path
+  with the `CACHE_DB_PATH` environment variable.
 - To point the router at a different set of nodes, set the
   `CACHE_NODES` environment variable before starting it:
   ```powershell
