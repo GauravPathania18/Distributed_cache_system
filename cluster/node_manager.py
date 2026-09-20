@@ -1,10 +1,9 @@
 import threading
-import time
-import requests
 
 from collections import defaultdict
 
 from cluster.consistent_hash import ConsistentHashRing
+from cluster.health_monitor import health_check_loop
 
 
 class NodeManager:
@@ -52,39 +51,8 @@ class NodeManager:
 
         # Initially activate all nodes
         for node in nodes:
-            self._activate_node(node)
-
-    # --------------------------------------------------
-    # NODE MANAGEMENT
-    # --------------------------------------------------
-
-    def _activate_node(self, node: str):
-
-        with self.lock:
-
-            if node in self.active_nodes:
-                return
-
-            self.active_nodes.add(node)
-
-            self.failure_counts[node] = 0
-
-            self.ring.add_node(node)
-
-            print(f"[NODE UP] {node}")
-
-    def _deactivate_node(self, node: str):
-
-        with self.lock:
-
-            if node not in self.active_nodes:
-                return
-
-            self.active_nodes.remove(node)
-
-            self.ring.remove_node(node)
-
-            print(f"[NODE DOWN] {node}")
+            from .node_activation import activate_node
+            activate_node(self, node)
 
     # --------------------------------------------------
     # ROUTING
@@ -119,73 +87,12 @@ class NodeManager:
     # HEALTH CHECK
     # --------------------------------------------------
 
-    def check_node(self, node: str) -> bool:
-        """
-        Hit the /health endpoint of a single node.
-        Returns True if healthy, False otherwise.
-        """
-
-        try:
-
-            response = requests.get(
-                f"{node}/health",
-                timeout=1
-            )
-
-            if response.status_code == 200:
-                return True
-
-        except requests.RequestException:
-            pass
-
-        return False
-
-    def health_check_loop(self):
-        """
-        Infinite loop that checks every node periodically.
-        Runs in a background daemon thread.
-        """
-
-        while True:
-
-            for node in list(self.nodes):
-
-                healthy = self.check_node(node)
-
-                if healthy:
-
-                    # Reset failure counter
-                    self.failure_counts[node] = 0
-
-                    # Node recovered -> re-add to ring
-                    if node not in self.active_nodes:
-                        self._activate_node(node)
-
-                else:
-
-                    self.failure_counts[node] += 1
-
-                    print(
-                        f"[HEALTH FAIL] "
-                        f"{node} "
-                        f"({self.failure_counts[node]}/"
-                        f"{self.failure_threshold})"
-                    )
-
-                    # Enough consecutive failures -> mark DOWN
-                    if (
-                        self.failure_counts[node]
-                        >= self.failure_threshold
-                    ):
-                        self._deactivate_node(node)
-
-            time.sleep(self.health_interval)
-
     def start_health_monitor(self):
         """Start the background health-check thread."""
 
         thread = threading.Thread(
-            target=self.health_check_loop,
+            target=health_check_loop,
+            args=(self,),
             daemon=True
         )
 
