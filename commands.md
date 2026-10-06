@@ -63,10 +63,12 @@ DCS/
 │   ├── test_cache_service.py
 │   ├── test_circuit_breaker.py
 │   ├── test_single_flight.py
-│   └── test_node_lifecycle.py
+│   ├── test_node_lifecycle.py
+│   └── test_import_dataset.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
 ├── main.py               <- Layer 2: cache node server
+├── import_dataset.py     <- load CSV/JSON/JSONL datasets into SQLite
 ├── demo.py               <- Layer 1 demo
 ├── demo_hash.py          <- Layer 3.1 demo
 ├── demo_router.py        <- Layer 3.2 demo
@@ -679,15 +681,77 @@ pytest tests/test_node_lifecycle.py -v
 
 ---
 
+## Loading a dataset (CSV / JSON / JSONL)
+
+Any tabular dataset (Kaggle, OpenML, data.gov, ...) can be loaded
+into the SQLite source of truth with `import_dataset.py`. Each
+record becomes one `cache_data` row:
+
+```
+key   = --prefix + <value of the key column>
+value = the rest of the record, stored as JSON
+```
+
+```powershell
+# CSV — 'id' is detected automatically as the key column
+python import_dataset.py --file users.csv --prefix user:
+
+# Pick the key column yourself
+python import_dataset.py --file products.json --key-column sku --prefix product:
+
+# JSONL (one JSON object per line)
+python import_dataset.py --file logs.jsonl --key-column request_id --prefix log:
+
+# Validate without writing anything
+python import_dataset.py --file users.csv --dry-run
+
+# Import only the first 1000 rows, replacing what is already there
+python import_dataset.py --file users.csv --prefix user: --limit 1000 --clear
+
+# Store only some columns
+python import_dataset.py --file users.csv --value-columns name,age
+```
+
+Options:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--file` | (required) | `.csv`, `.tsv`, `.json`, `.jsonl`, `.ndjson` |
+| `--key-column` | `id`, else first column | Column that builds the cache key |
+| `--prefix` | empty | Prepended to every key (`user:`) |
+| `--value-columns` | all except key | Comma-separated subset to store |
+| `--limit` | none | Import at most N records |
+| `--db` | `data/cache.db` | SQLite path (`CACHE_DB_PATH` respected) |
+| `--batch-size` | 500 | Rows per transaction |
+| `--clear` | off | Delete existing rows first |
+| `--dry-run` | off | Parse and validate, write nothing |
+
+Notes:
+
+- CSV cells are auto-typed: `"21"` becomes the number `21`.
+- Duplicate keys overwrite (last record wins) and are reported.
+- Rows are written in batches, so importing 100k records takes
+  seconds, not minutes.
+- After importing, the data flows through the normal cache-aside
+  path: a `GET` misses the cache, reads SQLite, and populates the
+  cache.
+
+```powershell
+python import_dataset.py --file users.csv --prefix user: --db data/cache.db
+curl http://localhost:8000/cache/user:42
+```
+
+---
+
 ## Full test run
 
 ```powershell
 pytest -v
 ```
 
-Expected: **92 tests pass** — 14 cache + 16 consistent hash +
-8 router + 7 repository + 13 cache-service + 11 circuit-breaker +
-5 single-flight + 18 node lifecycle.
+Expected: **107 tests pass** — 14 cache + 16 consistent hash +
+8 router + 10 repository + 13 cache-service + 11 circuit-breaker +
+5 single-flight + 18 node lifecycle + 12 dataset import.
 
 ---
 

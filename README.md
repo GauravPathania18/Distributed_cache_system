@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 92 tests
+- **Tests:** pytest — 107 tests
 
 ---
 
@@ -119,12 +119,18 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **92 passed** — 14 cache + 16 consistent hash + 8 router +
-7 repository + 13 cache-service + 11 circuit-breaker + 5 single-flight
-+ 18 node lifecycle.
+Expected: **107 passed** — 14 cache + 16 consistent hash + 8 router +
+10 repository + 13 cache-service + 11 circuit-breaker + 5
+single-flight + 18 node lifecycle + 12 dataset import.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).
+
+Have a dataset from Kaggle or elsewhere? Load it into the database:
+
+```powershell
+python import_dataset.py --file users.csv --prefix user:
+```
 
 Full command reference, curl examples and live fault-tolerance
 walkthroughs live in [`commands.md`](commands.md).

@@ -65,6 +65,47 @@ class _CrudMixin:
         finally:
             connection.close()
 
+    def set_many(self, items) -> int:
+        """
+        Batch upsert.
+
+        `items` is an iterable of (key, value) pairs. All rows are
+        written in a single transaction, which is dramatically
+        faster than calling set() once per row (dataset imports).
+        Returns the number of rows written.
+        """
+
+        connection = self._get_connection()
+
+        try:
+
+            rows = [
+                (key, json.dumps(value))
+                for key, value in items
+            ]
+
+            connection.executemany(
+                """
+                INSERT INTO cache_data (key, value)
+                VALUES (?, ?)
+
+                ON CONFLICT(key)
+                DO UPDATE SET value = excluded.value
+                """,
+                rows
+            )
+
+            connection.commit()
+
+            return len(rows)
+
+        except sqlite3.Error as error:
+            raise DatabaseUnavailableError(
+                f"database unavailable during set_many: {error}"
+            )
+        finally:
+            connection.close()
+
     def delete(self, key: str) -> bool:
 
         connection = self._get_connection()
