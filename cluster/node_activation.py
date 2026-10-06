@@ -1,28 +1,35 @@
+from .node_lifecycle import enter_state, register
+from .node_state import NodeState
+
+
 def activate_node(manager, node: str):
+    """
+    Legacy Layer 4 helper: put a node straight into service.
+
+    New code should go through the Layer 6.1 lifecycle
+    (node_lifecycle.on_health_result) so that recovering nodes
+    are gated before they receive traffic.
+    """
 
     with manager.lock:
 
-        if node in manager.active_nodes:
+        if node not in manager.node_states:
+            register(manager, node, NodeState.READY)
             return
 
-        manager.active_nodes.add(node)
-
-        manager.failure_counts[node] = 0
-
-        manager.ring.add_node(node)
-
-        print(f"[NODE UP] {node}")
+        enter_state(manager, node, NodeState.READY, force=True)
 
 
 def deactivate_node(manager, node: str):
+    """
+    Legacy Layer 4 helper: take a node out of service (FAILED).
+
+    New code should go through the Layer 6.1 lifecycle.
+    """
 
     with manager.lock:
 
-        if node not in manager.active_nodes:
+        if node not in manager.node_states:
             return
 
-        manager.active_nodes.remove(node)
-
-        manager.ring.remove_node(node)
-
-        print(f"[NODE DOWN] {node}")
+        enter_state(manager, node, NodeState.FAILED, force=True)

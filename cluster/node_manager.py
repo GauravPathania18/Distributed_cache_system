@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from cluster.consistent_hash import ConsistentHashRing
 from cluster.health_monitor import health_check_loop
+from cluster.node_state import NodeState
 
 
 class NodeManager:
@@ -12,9 +13,11 @@ class NodeManager:
     and the consistent-hash ring.
 
     Responsibilities:
-        - Track active/inactive nodes
+        - Track every node's lifecycle state
+          (STARTING / RECOVERING / READY / UNHEALTHY / FAILED)
         - Run periodic health checks
         - Detect failures (consecutive threshold)
+        - Gate recovering nodes out of the hash ring
         - Add/remove nodes from the hash ring
         - Provide primary + replica node selection
     """
@@ -25,14 +28,22 @@ class NodeManager:
         virtual_nodes=100,
         replication_factor=2,
         health_interval=2,
-        failure_threshold=3
+        failure_threshold=3,
+        initial_state=NodeState.READY,
+        recovery_threshold=2
     ):
+
+        nodes = list(nodes)
 
         self.replication_factor = replication_factor
 
         self.health_interval = health_interval
 
         self.failure_threshold = failure_threshold
+
+        # Consecutive healthy checks required before a RECOVERING
+        # node is allowed back into the ring.
+        self.recovery_threshold = recovery_threshold
 
         self.ring = ConsistentHashRing(
             virtual_nodes=virtual_nodes
@@ -41,18 +52,25 @@ class NodeManager:
         # All known nodes (ever registered)
         self.nodes = set(nodes)
 
-        # Currently healthy nodes
+        # Currently routable nodes (READY + UNHEALTHY)
         self.active_nodes = set()
+
+        # node -> lifecycle state
+        self.node_states = {}
 
         # Consecutive health-check failures per node
         self.failure_counts = defaultdict(int)
 
+        # Consecutive healthy checks while RECOVERING
+        self.recovery_counts = defaultdict(int)
+
         self.lock = threading.RLock()
 
-        # Initially activate all nodes
+        from .node_lifecycle import register
+
+        # Bootstrapped nodes join in the configured initial state.
         for node in nodes:
-            from .node_activation import activate_node
-            activate_node(self, node)
+            register(self, node, initial_state)
 
     # --------------------------------------------------
     # ROUTING
@@ -84,6 +102,31 @@ class NodeManager:
         return nodes[0]
 
     # --------------------------------------------------
+    # LIFECYCLE (Layer 6.1)
+    # --------------------------------------------------
+
+    def register_node(self, node: str, initial_state=NodeState.STARTING):
+        """
+        Add a node at runtime.
+
+        New nodes are gated (STARTING) until the health monitor
+        moves them through RECOVERING and into READY.
+        """
+
+        from .node_lifecycle import register
+
+        register(self, node, initial_state)
+
+    def get_node_state(self, node: str) -> str:
+        """Return the lifecycle state of a single node."""
+
+        with self.lock:
+
+            state = self.node_states.get(node)
+
+            return state.value if state else "unknown"
+
+    # --------------------------------------------------
     # HEALTH CHECK
     # --------------------------------------------------
 
@@ -109,6 +152,12 @@ class NodeManager:
 
         with self.lock:
 
+            def state_of(node):
+                return self.node_states.get(
+                    node,
+                    NodeState.FAILED
+                )
+
             return {
                 "total_nodes": len(self.nodes),
                 "active_nodes": sorted(
@@ -117,7 +166,22 @@ class NodeManager:
                 "inactive_nodes": sorted(
                     self.nodes - self.active_nodes
                 ),
+                "node_states": {
+                    node: state_of(node).value
+                    for node in sorted(self.nodes)
+                },
+                "recovering_nodes": sorted(
+                    node
+                    for node in self.nodes
+                    if state_of(node) is NodeState.RECOVERING
+                ),
+                "failed_nodes": sorted(
+                    node
+                    for node in self.nodes
+                    if state_of(node) is NodeState.FAILED
+                ),
                 "replication_factor": self.replication_factor,
                 "health_interval": self.health_interval,
-                "failure_threshold": self.failure_threshold
+                "failure_threshold": self.failure_threshold,
+                "recovery_threshold": self.recovery_threshold
             }

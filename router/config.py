@@ -13,6 +13,10 @@ HEALTH_INTERVAL = 2
 FAILURE_THRESHOLD = 3
 TIMEOUT = 2
 
+# Layer 6.1 - node lifecycle
+RECOVERY_THRESHOLD = int(os.environ.get("RECOVERY_THRESHOLD", "2"))
+BOOTSTRAP_STATE = os.environ.get("CLUSTER_BOOTSTRAP_STATE", "starting")
+
 DEFAULT_DB_PATH = os.environ.get("CACHE_DB_PATH", "data/cache.db")
 
 

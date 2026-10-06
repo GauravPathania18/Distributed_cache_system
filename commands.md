@@ -31,13 +31,20 @@ DCS/
 │   ├── __init__.py
 │   ├── lru_cache.py
 │   └── node.py
-├── cluster/              <- Layer 4: cluster management
+├── cluster/              <- Layer 4 + 6.1: cluster management
 │   ├── __init__.py
 │   ├── consistent_hash.py   <- consistent hashing + virtual nodes
-│   └── node_manager.py      <- health checks + failure detection
+│   ├── health_monitor.py    <- periodic checks -> lifecycle driver
+│   ├── node_manager.py      <- membership, states, ring
+│   ├── node_state.py        <- NodeState enum + transition table
+│   ├── node_lifecycle.py    <- STARTING/RECOVERING/READY/... logic
+│   └── node_activation.py   <- legacy Layer 4 wrappers
 ├── router/               <- Layers 4-5: replication-aware + cache-aside router
 │   ├── __init__.py
-│   └── router.py
+│   ├── app.py / config.py / models.py
+│   ├── routes_cache.py / routes_cluster.py / routes_db.py
+│   ├── _components.py       <- shared database / node_manager / services
+│   └── router.py            <- public re-export shim
 ├── database/             <- Layer 5: SQLite source of truth
 │   ├── __init__.py
 │   ├── exceptions.py         <- DatabaseUnavailableError
@@ -55,7 +62,8 @@ DCS/
 │   ├── test_repository.py
 │   ├── test_cache_service.py
 │   ├── test_circuit_breaker.py
-│   └── test_single_flight.py
+│   ├── test_single_flight.py
+│   └── test_node_lifecycle.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
 ├── main.py               <- Layer 2: cache node server
@@ -63,6 +71,7 @@ DCS/
 ├── demo_hash.py          <- Layer 3.1 demo
 ├── demo_router.py        <- Layer 3.2 demo
 ├── requirements.txt
+├── README.md
 └── commands.md
 ```
 
@@ -170,6 +179,18 @@ health-monitoring thread.
 uvicorn router.router:app --port 8000
 ```
 
+> **Layer 6.1 note — gated startup:** the router does NOT send
+> traffic to a node the moment it boots. Declared nodes start as
+> `starting`, become `recovering` on their first healthy check, and
+> only enter the hash ring as `ready` after `RECOVERY_THRESHOLD`
+> (default 2) consecutive healthy checks. With a 2-second health
+> interval that is roughly 4 seconds — longer if dead ports are
+> dropped rather than refused (see the timing note in the
+> fault-tolerance demo below). During that window the ring
+> is empty: GETs fall through to the database and PUTs return 503.
+> Wait for `/cluster/status` to list the nodes under
+> `active_nodes` before running the demo below.
+
 Architecture now running:
 
 ```
@@ -212,11 +233,23 @@ Returns:
     "total_nodes": 3,
     "active_nodes": ["http://localhost:8001", ...],
     "inactive_nodes": [],
+    "node_states": {
+        "http://localhost:8001": "ready",
+        "http://localhost:8002": "ready",
+        "http://localhost:8003": "ready"
+    },
+    "recovering_nodes": [],
+    "failed_nodes": [],
     "replication_factor": 2,
     "health_interval": 2,
-    "failure_threshold": 3
+    "failure_threshold": 3,
+    "recovery_threshold": 2
 }
 ```
+
+`active_nodes` = nodes currently in the hash ring (`ready` +
+`unhealthy`). `node_states` shows the precise lifecycle state of
+every known node — see Layer 6.1.
 
 ### PUT (replicated to primary + replica)
 
@@ -267,8 +300,14 @@ curl -X PUT http://localhost:8000/cache/user:101 `
 [HEALTH FAIL] http://localhost:8002 (1/3)
 [HEALTH FAIL] http://localhost:8002 (2/3)
 [HEALTH FAIL] http://localhost:8002 (3/3)
-[NODE DOWN] http://localhost:8002
+[NODE FAILED] http://localhost:8002
 ```
+
+> Timing note: a health pass takes `health_interval` plus the time
+> the checks themselves take. If your firewall drops connection
+> attempts instead of refusing them, each dead-node check costs the
+> full 1-second timeout (2s when `localhost` resolves to both IPv4
+> and IPv6), so detection can take noticeably longer than 6s.
 
 4. **GET still works** via the replica:
 
@@ -283,10 +322,14 @@ curl http://localhost:8000/cache/user:101
 python main.py --port 8002 --capacity 100
 ```
 
-6. Router detects recovery:
+6. Router detects recovery — note the gate: a node that comes back
+   after a failure does NOT rejoin immediately. It must prove itself
+   through `RECOVERING` first (2 healthy checks by default):
 
 ```
-[NODE UP] http://localhost:8002
+[NODE FAILED] http://localhost:8002       <- while it was down
+[NODE RECOVERING] http://localhost:8002   <- first healthy check after restart
+[NODE READY] http://localhost:8002        <- 2 healthy checks later
 ```
 
 7. Node 2 rejoins the ring. Check:
@@ -497,15 +540,154 @@ Verified by `test_single_flight.py` and the existing
 
 ---
 
+## Layer 6.1 — Node Lifecycle Management
+
+Layer 4 only knew UP / DOWN. Layer 6 needs more: a node that has
+just (re)started is reachable but its RAM is empty — sending it
+normal traffic would turn every cache hit into a database miss.
+
+The router therefore tracks a lifecycle state per node:
+
+```
+                     register (router boot)
+                             │
+                         ┌───▼────┐
+         3 failures ┌───►│STARTING│
+         ───────────┤    └───┬────┘
+                    │        │ first healthy check
+                    │        ▼
+                    │   ┌──────────┐
+         3 failures ├──►│RECOVERING│  gated: NOT in the ring
+         ───────────┤   └───┬──────┘
+                    │        │ recovery_threshold healthy checks
+                    │        ▼
+                    │   ┌───────┐
+                    ├──►│ READY │──── in the ring, takes traffic
+                    │   └───┬───┘
+                    │        │ first failed check
+                    │        ▼
+                    │   ┌───────────┐
+         3 failures ├──►│ UNHEALTHY │── healthy ──► back to READY
+         ───────────┤   └─────┬─────┘
+                    │         │
+                    ▼         ▼
+              ┌────────────────────┐
+              │       FAILED       │  evicted from the ring
+              └─────────┬──────────┘
+                        │ healthy: gated rejoin
+                        └──────────► RECOVERING
+```
+
+Rules:
+
+- **Only `ready` and `unhealthy` nodes are in the consistent-hash
+  ring.** `starting`, `recovering` and `failed` nodes are invisible
+  to routing.
+- `unhealthy` = transient blip (failures below `failure_threshold`):
+  the node stays routable, exactly like Layer 4 behaved.
+- `failed` = `failure_threshold` (default 3) consecutive failures:
+  the node is evicted from the ring.
+- **Gated rejoin:** a `failed` node that becomes healthy again goes
+  to `recovering`, NOT straight back to `ready`. It must pass
+  `recovery_threshold` (default 2) consecutive healthy checks
+  before traffic is routed to it again.
+- A node flapping during `recovering` has its recovery count reset.
+
+### Configuration
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `RECOVERY_THRESHOLD` | `2` | Healthy checks required in `recovering` before `ready` |
+| `CLUSTER_BOOTSTRAP_STATE` | `starting` | Initial state of declared nodes at router boot |
+
+Set `CLUSTER_BOOTSTRAP_STATE=ready` to restore the old Layer 4
+behavior (nodes trusted immediately at boot).
+
+Tests and demos call `configure_cluster(...)`, which bootstraps as
+`ready` so they can route traffic without waiting for the monitor.
+
+### Inspect the lifecycle
+
+```powershell
+curl http://localhost:8000/cluster/status
+```
+
+```json
+{
+    "total_nodes": 3,
+    "active_nodes": ["http://localhost:8001", "http://localhost:8002"],
+    "inactive_nodes": ["http://localhost:8003"],
+    "node_states": {
+        "http://localhost:8001": "ready",
+        "http://localhost:8002": "unhealthy",
+        "http://localhost:8003": "recovering"
+    },
+    "recovering_nodes": ["http://localhost:8003"],
+    "failed_nodes": [],
+    "replication_factor": 2,
+    "health_interval": 2,
+    "failure_threshold": 3,
+    "recovery_threshold": 2
+}
+```
+
+### Live demo (gated rejoin)
+
+Start 3 nodes + router as in Layer 4, wait until all three show up
+under `active_nodes`, then:
+
+1. Store a key and kill Node 2 (`Ctrl+C` in its terminal).
+
+2. Watch the router log (Layer 4 demo above):
+   `[HEALTH FAIL] ... (3/3)` → `[NODE FAILED] http://localhost:8002`.
+
+3. `GET` still works through the replica.
+
+4. Restart Node 2:
+
+```powershell
+python main.py --port 8002 --capacity 100
+```
+
+5. The router logs `[NODE RECOVERING] http://localhost:8002` on the
+   first healthy check — the node is reachable but still gated out
+   of the ring. Only after `recovery_threshold` more healthy checks
+   does it log `[NODE READY]` and rejoin.
+
+6. Verify:
+
+```powershell
+curl http://localhost:8000/cluster/status
+```
+
+### Layer 6.1 tests
+
+```powershell
+pytest tests/test_node_lifecycle.py -v
+```
+
+- Bootstrap gating (`starting` nodes are not routable)
+- `STARTING → RECOVERING → READY` timing against `recovery_threshold`
+- `READY → UNHEALTHY → READY` blip tolerance (node stays in ring)
+- `READY → FAILED` eviction at `failure_threshold`
+- Gated rejoin: `FAILED → RECOVERING → READY` (never straight back)
+- Recovery count reset on flapping
+- Invalid transitions raise `InvalidTransitionError`
+- `get_status()` lifecycle fields
+- Health pass with an injected checker (no HTTP)
+- Concurrency: ring membership always matches state
+
+---
+
 ## Full test run
 
 ```powershell
 pytest -v
 ```
 
-Expected: **74 tests pass** — 14 cache + 16 consistent hash +
+Expected: **92 tests pass** — 14 cache + 16 consistent hash +
 8 router + 7 repository + 13 cache-service + 11 circuit-breaker +
-5 single-flight.
+5 single-flight + 18 node lifecycle.
 
 ---
 
@@ -518,7 +700,12 @@ In each terminal press `Ctrl + C`.
 ## Notes
 
 - The router runs a background health-check thread every 2 seconds.
-  A node is marked DOWN after **3 consecutive failures** (~6 seconds).
+  A node is marked FAILED after **3 consecutive failures** and
+  evicted from the hash ring. A recovered node must then sit through
+  RECOVERING for **2 healthy checks** before it is routable again
+  (Layer 6.1).
+- Declared nodes boot as `starting` (gated) — see the Layer 4
+  startup note. Override with `CLUSTER_BOOTSTRAP_STATE=ready`.
 - Each PUT writes to **2 nodes** (replication factor = 2).
   Each GET tries primary first, then falls back to the replica.
 - When a node crashes, its in-memory cache is lost.

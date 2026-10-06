@@ -1,6 +1,7 @@
 import sys
 
 from cluster.node_manager import NodeManager
+from cluster.node_state import NodeState
 from database.repository import DatabaseRepository
 from services.cache_service import CacheService
 from services.distributed_cache import DistributedCache
@@ -11,6 +12,8 @@ from .config import (
     REPLICATION_FACTOR,
     HEALTH_INTERVAL,
     FAILURE_THRESHOLD,
+    RECOVERY_THRESHOLD,
+    BOOTSTRAP_STATE,
     TIMEOUT,
     nodes_from_env,
 )
@@ -19,12 +22,16 @@ from .config import (
 # Source of truth. Shared by the whole router process.
 database = DatabaseRepository(db_path=DEFAULT_DB_PATH)
 
+# Production bootstrap gates nodes (STARTING -> RECOVERING -> READY)
+# so cold nodes never receive traffic before they prove healthy.
 node_manager = NodeManager(
     nodes=nodes_from_env(),
     virtual_nodes=VIRTUAL_NODES,
     replication_factor=REPLICATION_FACTOR,
     health_interval=HEALTH_INTERVAL,
-    failure_threshold=FAILURE_THRESHOLD
+    failure_threshold=FAILURE_THRESHOLD,
+    initial_state=BOOTSTRAP_STATE,
+    recovery_threshold=RECOVERY_THRESHOLD
 )
 
 node_manager.start_health_monitor()
@@ -48,9 +55,17 @@ def configure_cluster(
     virtual_nodes=VIRTUAL_NODES,
     health_interval=HEALTH_INTERVAL,
     failure_threshold=FAILURE_THRESHOLD,
+    initial_state=NodeState.READY,
+    recovery_threshold=RECOVERY_THRESHOLD,
     start_monitor=False
 ):
-    """Rebuild the cluster components (used by tests / demos)."""
+    """
+    Rebuild the cluster components (used by tests / demos).
+
+    Tests and demos bootstrap as READY so they can route traffic
+    immediately without waiting for the health monitor. The
+    production wiring above uses the gated BOOTSTRAP_STATE instead.
+    """
 
     global node_manager, distributed_cache, cache_service
 
@@ -59,7 +74,9 @@ def configure_cluster(
         virtual_nodes=virtual_nodes,
         replication_factor=replication_factor,
         health_interval=health_interval,
-        failure_threshold=failure_threshold
+        failure_threshold=failure_threshold,
+        initial_state=initial_state,
+        recovery_threshold=recovery_threshold
     )
 
     if start_monitor:

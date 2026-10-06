@@ -24,45 +24,29 @@ def check_node(node: str) -> bool:
     return False
 
 
-def health_check_loop(manager):
+def run_health_pass(manager, checker=check_node):
+    """
+    Check every known node exactly once and feed the results
+    into the Layer 6.1 lifecycle state machine.
+    """
+
+    from .node_lifecycle import on_health_result
+
+    for node in list(manager.nodes):
+
+        healthy = checker(node)
+
+        on_health_result(manager, node, healthy)
+
+
+def health_check_loop(manager, checker=check_node):
     """
     Infinite loop that checks every node periodically.
     Runs in a background daemon thread.
     """
 
-    from .node_activation import activate_node, deactivate_node
-
     while True:
 
-        for node in list(manager.nodes):
-
-            healthy = check_node(node)
-
-            if healthy:
-
-                # Reset failure counter
-                manager.failure_counts[node] = 0
-
-                # Node recovered -> re-add to ring
-                if node not in manager.active_nodes:
-                    activate_node(manager, node)
-
-            else:
-
-                manager.failure_counts[node] += 1
-
-                print(
-                    f"[HEALTH FAIL] "
-                    f"{node} "
-                    f"({manager.failure_counts[node]}/"
-                    f"{manager.failure_threshold})"
-                )
-
-                # Enough consecutive failures -> mark DOWN
-                if (
-                    manager.failure_counts[node]
-                    >= manager.failure_threshold
-                ):
-                    deactivate_node(manager, node)
+        run_health_pass(manager, checker)
 
         time.sleep(manager.health_interval)
