@@ -27,10 +27,11 @@ Project layout after setup:
 ```
 DCS/
 ├── .venv/                <- virtual environment (packages)
-├── cache/                <- Layer 1: LRU cache engine
+├── cache/                <- Layer 1 + 6.2: LRU cache engine
 │   ├── __init__.py
 │   ├── lru_cache.py
-│   └── node.py
+│   ├── node.py
+│   └── statistics.py       <- Layer 6.2: hit/miss counters + hot keys
 ├── cluster/              <- Layer 4 + 6.1: cluster management
 │   ├── __init__.py
 │   ├── consistent_hash.py   <- consistent hashing + virtual nodes
@@ -64,6 +65,7 @@ DCS/
 │   ├── test_circuit_breaker.py
 │   ├── test_single_flight.py
 │   ├── test_node_lifecycle.py
+│   ├── test_statistics.py
 │   └── test_import_dataset.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
@@ -127,6 +129,11 @@ curl -X DELETE http://localhost:8001/cache/user:101
 
 # Stats (hits / misses / hit_rate / evictions)
 curl http://localhost:8001/stats
+
+# Layer 6.2 - current statistics window + hottest keys
+curl http://localhost:8001/stats/window
+curl "http://localhost:8001/stats/window?limit=5"
+curl "http://localhost:8001/stats/top-keys?limit=10"
 ```
 
 Missing keys return HTTP 404 `{"detail": "Cache miss"}`.
@@ -573,11 +580,13 @@ The router therefore tracks a lifecycle state per node:
          ───────────┤   └─────┬─────┘
                     │         │
                     ▼         ▼
-              ┌────────────────────┐
-              │       FAILED       │  evicted from the ring
-              └─────────┬──────────┘
-                        │ healthy: gated rejoin
-                        └──────────► RECOVERING
+               ┌────────────────────┐
+               │       FAILED       │  evicted from the ring
+               └─────────┬──────────┘
+                         │ healthy: gated rejoin
+                         ├──────────► RECOVERING
+                         │ start_node(): explicit restart
+                         └──────────► STARTING
 ```
 
 Rules:
@@ -594,6 +603,31 @@ Rules:
   `recovery_threshold` (default 2) consecutive healthy checks
   before traffic is routed to it again.
 - A node flapping during `recovering` has its recovery count reset.
+
+### Named lifecycle operations
+
+`NodeManager` exposes the state machine through five named
+operations (public API over `node_lifecycle.enter_state`):
+
+| Method | Effect |
+|---|---|
+| `start_node(node)` | Unknown node → `starting` (gated). `failed` node → `starting` (explicit restart, failure counters reset). Otherwise no-op. |
+| `mark_recovering(node)` | Gate the node: leaves the ring. Legal from `starting` / `failed`. |
+| `mark_ready(node)` | Put the node into the ring. Legal from `recovering` / `unhealthy` — from `failed` it raises `InvalidTransitionError` (the rejoin gate cannot be skipped). |
+| `mark_failed(node)` | Evict the node from the ring. Legal from every state. |
+| `is_available(node)` | `True` when the node is routable (`ready` + `unhealthy`). |
+
+Illegal jumps raise `InvalidTransitionError`; operations on an
+unregistered node raise `ValueError`. The health monitor keeps
+driving transitions with the thresholds — these methods are the
+manual/API surface over the same machine.
+
+```python
+manager.start_node("http://localhost:8004")   # -> starting (gated)
+manager.mark_recovering("http://localhost:8004")  # -> recovering
+manager.mark_ready("http://localhost:8004")       # -> ready, in ring
+manager.is_available("http://localhost:8004")     # -> True
+```
 
 ### Configuration
 
@@ -675,9 +709,148 @@ pytest tests/test_node_lifecycle.py -v
 - Gated rejoin: `FAILED → RECOVERING → READY` (never straight back)
 - Recovery count reset on flapping
 - Invalid transitions raise `InvalidTransitionError`
+- Named operations: `start_node` / `mark_recovering` / `mark_ready` /
+  `mark_failed` / `is_available` (incl. the `FAILED -> READY` block)
 - `get_status()` lifecycle fields
 - Health pass with an injected checker (no HTTP)
 - Concurrency: ring membership always matches state
+
+---
+
+## Layer 6.2 — Cache Statistics & Hot-Key Tracking
+
+Layer 6.1 decides *which nodes* get traffic. Layer 6.2 makes the
+cache measure *what the traffic actually uses* — the raw material
+for the Layer 6.3/6.4 warm-up.
+
+Each cache node process owns one `CacheStatistics` object:
+
+```
+GET  ──► record_hit(key) / record_miss(key)   ──┐
+SET  ──► record_set()                          ──┤  all in memory,
+DEL  ──► record_delete()                       ──┤  never the DB
+LRU  ──► record_eviction(key)  (on_eviction)   ──┘  (on_eviction hook)
+```
+
+Every operation increments counters and (for GETs) bumps
+`key_access[key]`, so the node can rank keys:
+
+```
+user:42       → 50,231 accesses
+product:10    → 42,819 accesses
+user:91       → 31,452 accesses
+```
+
+Two properties keep this from becoming its own problem:
+
+- **Bounded tracking** — `key_access` holds at most
+  `max_tracked_keys` (default 100,000) entries. Once full,
+  brand-new keys are not tracked (they land in `untracked`),
+  known keys keep counting, and the global counters always count.
+- **5-minute windows** — counters describe the *current* window
+  only. A background thread rotates every `window_seconds`
+  (default 300): the finished window is stored as `last_window`
+  and everything resets, so "hot" always means *recently* hot.
+
+Hit rate follows the plain definition:
+
+```
+hit_rate = hits / (hits + misses)        # 0.92 == 92%
+```
+
+### Endpoints (per node, ports 8001-8003)
+
+```powershell
+# Current window: counters + hit rate + hottest keys + last_window
+curl "http://localhost:8001/stats/window?limit=5"
+```
+
+```json
+{
+    "hits": 9200,
+    "misses": 800,
+    "sets": 750,
+    "deletes": 50,
+    "evictions": 100,
+    "total_gets": 10000,
+    "hit_rate": 0.92,
+    "untracked": 0,
+    "tracked_keys": 342,
+    "max_tracked_keys": 100000,
+    "window_seconds": 300,
+    "window_started_at": 1730000000.0,
+    "last_window": null,
+    "top_keys": [["user:42", 5000], ["product:10", 3200]]
+}
+```
+
+```powershell
+# Just the ranking
+curl "http://localhost:8001/stats/top-keys?limit=10"
+```
+
+```json
+{
+    "top_keys": [["user:42", 5000], ["product:10", 3200]],
+    "tracked_keys": 342,
+    "window_seconds": 300
+}
+```
+
+The Layer 1 `GET /stats` endpoint is unchanged (capacity / size /
+LRU hit percentage).
+
+> **Local statistics.** These numbers are per node. `GET user:42`
+> hitting Node 2 is invisible to Nodes 1 and 3 — which is exactly
+> right, because with consistent hashing only the owner sees the
+> traffic. Cluster-level aggregation across nodes arrives with
+> Layer 6.3, which needs it to compute a cluster-wide hot list
+> for warm-up.
+
+### Live demo
+
+```powershell
+# Generate some traffic against a running node (Layer 4 setup)
+curl -X PUT http://localhost:8001/cache/user:42 `
+  -H "Content-Type: application/json" `
+  -d '{"value":"Gaurav","ttl":300}'
+
+curl http://localhost:8001/cache/user:42     # hit
+curl http://localhost:8001/cache/nope        # 404 -> miss
+
+curl "http://localhost:8001/stats/top-keys?limit=5"
+```
+
+### Configuration
+
+Constructor defaults used by `main.py`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `max_tracked_keys` | `100000` | Bound on `key_access` entries |
+| `window_seconds` | `300` | Automatic window rotation period |
+| `auto_rotate` | off in tests / on via `start()` | Background rotation thread |
+
+`python main.py` starts the rotation thread automatically; when the
+module is imported (tests), no thread is started.
+
+### Layer 6.2 tests
+
+```powershell
+pytest tests/test_statistics.py -v
+```
+
+- Counter recording + `hit_rate` (incl. zero-GET edge)
+- Misses count toward key access (they were requested)
+- Hot-key ranking via `top_keys()`
+- Bounded tracking: new keys dropped at the cap, known keys and
+  global counters keep counting (`untracked`)
+- Window rotation: reset + `last_window` snapshot
+- Automatic rotation thread (start / stop / daemon)
+- Concurrency: 4 threads × repeated events stay consistent
+- `LRUCache` eviction hook receives the evicted key
+- Node HTTP endpoints: `/stats/window`, `/stats/top-keys`,
+  and unchanged `/stats`
 
 ---
 
@@ -749,9 +922,10 @@ curl http://localhost:8000/cache/user:42
 pytest -v
 ```
 
-Expected: **107 tests pass** — 14 cache + 16 consistent hash +
+Expected: **132 tests pass** — 14 cache + 16 consistent hash +
 8 router + 10 repository + 13 cache-service + 11 circuit-breaker +
-5 single-flight + 18 node lifecycle + 12 dataset import.
+5 single-flight + 28 node lifecycle + 12 dataset import +
+15 statistics.
 
 ---
 
@@ -774,6 +948,11 @@ In each terminal press `Ctrl + C`.
   Each GET tries primary first, then falls back to the replica.
 - When a node crashes, its in-memory cache is lost.
   Layer 5 repopulates it from the database on the next cache miss.
+- Cache nodes measure their own traffic in memory (Layer 6.2):
+  per-node hit/miss counters and a bounded, 5-minute sliding list
+  of hot keys, exposed through `/stats/window` and
+  `/stats/top-keys`. Nothing is ever written to the database just
+  to measure cache usage.
 - Layer 5 uses SQLite at `data/cache.db` (no TTL — the DB keeps data
   forever; TTL only affects the in-memory cache). Override the path
   with the `CACHE_DB_PATH` environment variable.

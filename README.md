@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 107 tests
+- **Tests:** pytest — 132 tests
 
 ---
 
@@ -37,7 +37,7 @@ recovery when the cluster restarts.
         cache MISS ──► SingleFlight ──► CircuitBreaker ──► SQLite
                            ▲                               │
                            └──────── Cache Warm-up ◄───────┘
-                                 (Layer 6, next)
+                                 (Layer 6.3/6.4, next)
 ```
 
 The router is the only public entry point. Cache nodes are "dumb"
@@ -59,7 +59,7 @@ layer that can be emptied and rebuilt at any time.
 | 5.7 | Circuit breaker (CLOSED / OPEN / HALF-OPEN) | Done |
 | 5.8 | Single-flight request coalescing | Done |
 | **6.1** | **Node lifecycle: STARTING → RECOVERING → READY → UNHEALTHY → FAILED** | **Done** |
-| 6.2 | Cache statistics & hot-key tracking | Planned |
+| **6.2** | **Cache statistics & hot-key tracking** | **Done** |
 | 6.3 | Recovery mode on the node itself | Planned |
 | 6.4 | Cache warm-up from hot keys | Planned |
 | 6.5 | Recovery throttling (rate-limited DB loads) | Planned |
@@ -74,6 +74,17 @@ temporarily `UNHEALTHY`) nodes sit in the hash ring. A node that
 recovers from a failure must spend `RECOVERY_THRESHOLD` consecutive
 healthy checks in `RECOVERING` before it is allowed to receive
 traffic again, so a cold node is never slammed all at once.
+
+### Layer 6.2 in one paragraph
+
+A cache node counts its own operations (hits, misses, sets,
+deletes, evictions) and its per-key access frequency entirely in
+memory — measuring usage must never add writes to the database.
+The key tracker is bounded (`max_tracked_keys`) so it cannot
+become a second memory problem, and counters are reset every
+5-minute window so "hot keys" means *recently* hot. The ranked
+key list produced here is the raw material Layer 6.3/6.4 needs
+to decide what to warm up after a node restarts.
 
 ---
 
@@ -119,9 +130,10 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **107 passed** — 14 cache + 16 consistent hash + 8 router +
+Expected: **132 passed** — 14 cache + 16 consistent hash + 8 router +
 10 repository + 13 cache-service + 11 circuit-breaker + 5
-single-flight + 18 node lifecycle + 12 dataset import.
+single-flight + 28 node lifecycle + 12 dataset import +
+15 statistics.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).

@@ -15,6 +15,9 @@ class NodeManager:
     Responsibilities:
         - Track every node's lifecycle state
           (STARTING / RECOVERING / READY / UNHEALTHY / FAILED)
+        - Expose the Layer 6.1 public lifecycle API
+          (start_node / mark_recovering / mark_ready /
+          mark_failed / is_available)
         - Run periodic health checks
         - Detect failures (consecutive threshold)
         - Gate recovering nodes out of the hash ring
@@ -105,11 +108,94 @@ class NodeManager:
     # LIFECYCLE (Layer 6.1)
     # --------------------------------------------------
 
+    def start_node(self, node: str) -> str:
+        """
+        Bring a node online (gated).
+
+            unknown node -> registered as STARTING (not routable yet)
+            FAILED node  -> explicit restart: FAILED -> STARTING,
+                            the node must re-prove itself through
+                            RECOVERING before it gets traffic
+            any other    -> no-op; the lifecycle is already running
+
+        Public API over the Layer 6.1 state machine.
+        Returns the node's state value.
+        """
+
+        from .node_lifecycle import enter_state, register
+
+        with self.lock:
+
+            current = self.node_states.get(node)
+
+            if current is None:
+                register(self, node, NodeState.STARTING)
+
+            elif current is NodeState.FAILED:
+                enter_state(self, node, NodeState.STARTING)
+
+            return self.node_states[node].value
+
+    def mark_recovering(self, node: str) -> str:
+        """
+        Gate a node: RECOVERING, not in the hash ring.
+
+        Legal from STARTING (first healthy check) and FAILED
+        (gated rejoin). Illegal jumps raise InvalidTransitionError.
+        """
+
+        return self._mark(node, NodeState.RECOVERING)
+
+    def mark_ready(self, node: str) -> str:
+        """
+        Put a node into service: READY, in the hash ring.
+
+        Legal from RECOVERING (recovery_threshold reached) and
+        UNHEALTHY (blip over). From FAILED it raises
+        InvalidTransitionError - rejoin must go through RECOVERING.
+        """
+
+        return self._mark(node, NodeState.READY)
+
+    def mark_failed(self, node: str) -> str:
+        """
+        Take a node out of service: FAILED, evicted from the ring.
+
+        Legal from every other state.
+        """
+
+        return self._mark(node, NodeState.FAILED)
+
+    def is_available(self, node: str) -> bool:
+        """
+        True if the node currently receives traffic.
+
+        Routable states are READY and UNHEALTHY (a transient blip
+        keeps the node in the ring). STARTING, RECOVERING, FAILED
+        and unknown nodes are not available.
+        """
+
+        with self.lock:
+            return node in self.active_nodes
+
+    def _mark(self, node: str, target: NodeState) -> str:
+        """Validated transition helper for the named lifecycle ops."""
+
+        from .node_lifecycle import enter_state
+
+        with self.lock:
+
+            if node not in self.node_states:
+                raise ValueError(f"unknown node: {node}")
+
+            return enter_state(self, node, target).value
+
     def register_node(self, node: str, initial_state=NodeState.STARTING):
         """
         Add a node at runtime.
 
-        New nodes are gated (STARTING) until the health monitor
+        Layer 4 name for the same operation as start_node():
+        new nodes are gated (STARTING) until the health monitor
         moves them through RECOVERING and into READY.
         """
 

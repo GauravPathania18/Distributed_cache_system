@@ -1,11 +1,11 @@
 import argparse
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Optional
 
-from cache import LRUCache
+from cache import LRUCache, CacheStatistics
 
 
 # ---------------------------------------------------------
@@ -33,8 +33,17 @@ app = FastAPI(
     version="1.0"
 )
 
+# Layer 6.2 - node-local statistics + hot-key tracking.
+# In-memory only: counters are never written to the database.
+statistics = CacheStatistics()
+
 # Each cache node process gets its own independent cache.
-cache = LRUCache(capacity=DEFAULT_CAPACITY)
+# Capacity evictions are reported to the statistics object
+# through the on_eviction hook.
+cache = LRUCache(
+    capacity=DEFAULT_CAPACITY,
+    on_eviction=statistics.record_eviction
+)
 
 
 # ---------------------------------------------------------
@@ -71,10 +80,14 @@ def get_value(key: str):
 
     if value is None:
 
+        statistics.record_miss(key)
+
         raise HTTPException(
             status_code=404,
             detail="Cache miss"
         )
+
+    statistics.record_hit(key)
 
     return {
         "key": key,
@@ -107,6 +120,8 @@ def set_value(
             entry.ttl
         )
 
+    statistics.record_set()
+
     return {
         "status": "stored",
         "key": key
@@ -119,6 +134,8 @@ def set_value(
 
 @app.delete("/cache/{key}")
 def delete_value(key: str):
+
+    statistics.record_delete()
 
     deleted = cache.delete(key)
 
@@ -159,6 +176,39 @@ def stats():
 
 
 # ---------------------------------------------------------
+# WINDOW STATISTICS (Layer 6.2)
+# ---------------------------------------------------------
+
+@app.get("/stats/window")
+def stats_window(
+    limit: int = Query(default=10, ge=1, le=1000)
+):
+    """
+    Current statistics window: operation counters, hit rate and
+    the hottest keys, plus the previous window after each rotation.
+    """
+
+    snapshot = statistics.snapshot()
+
+    snapshot["top_keys"] = statistics.top_keys(limit)
+
+    return snapshot
+
+
+@app.get("/stats/top-keys")
+def stats_top_keys(
+    limit: int = Query(default=10, ge=1, le=1000)
+):
+    """Ranking of the most accessed keys in the current window."""
+
+    return {
+        "top_keys": statistics.top_keys(limit),
+        "tracked_keys": statistics.snapshot()["tracked_keys"],
+        "window_seconds": statistics.window_seconds
+    }
+
+
+# ---------------------------------------------------------
 # START SERVER
 # ---------------------------------------------------------
 
@@ -166,8 +216,15 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    # Rebind the module-level cache for the requested capacity.
-    cache = LRUCache(capacity=args.capacity)
+    # Rebind the module-level statistics + cache for the requested
+    # capacity and start the automatic statistics window rotation.
+    statistics = CacheStatistics()
+    statistics.start()
+
+    cache = LRUCache(
+        capacity=args.capacity,
+        on_eviction=statistics.record_eviction
+    )
 
     uvicorn.run(
         app,

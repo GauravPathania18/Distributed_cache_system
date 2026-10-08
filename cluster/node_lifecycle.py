@@ -51,6 +51,13 @@ def enter_state(manager, node: str, target: NodeState, force=False):
             manager.failure_counts[node] = 0
             manager.recovery_counts[node] = 0
 
+        elif target is NodeState.STARTING:
+            # Explicit restart (start_node): start counting from
+            # scratch so stale failures cannot re-kill the node
+            # on its very first check.
+            manager.failure_counts[node] = 0
+            manager.recovery_counts[node] = 0
+
         elif target is NodeState.RECOVERING:
             manager.recovery_counts[node] = 0
 

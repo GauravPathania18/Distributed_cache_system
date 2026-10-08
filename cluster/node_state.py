@@ -9,11 +9,13 @@ class NodeState(str, Enum):
                                      |
                                  UNHEALTHY
                                      |
-                                  FAILED -> RECOVERING (gated rejoin)
+                                   FAILED -> RECOVERING (gated rejoin)
+                                   FAILED -> STARTING (explicit restart)
 
-    Only READY nodes sit in the consistent-hash ring and receive
-    normal traffic. Everything else is invisible to routing, which
-    is what protects the database from a cold node being slammed.
+    Only routable states (READY + UNHEALTHY) sit in the
+    consistent-hash ring and receive normal traffic. Everything
+    else is invisible to routing, which is what protects the
+    database from a cold node being slammed.
     """
 
     STARTING = "starting"
@@ -49,6 +51,7 @@ ALLOWED_TRANSITIONS = {
     NodeState.FAILED: {
         NodeState.FAILED,     # still down
         NodeState.RECOVERING, # healthy again -> gated rejoin
+        NodeState.STARTING,   # explicit restart (start_node) -> re-gate
     },
 }
 

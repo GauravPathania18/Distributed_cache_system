@@ -29,11 +29,20 @@ class LRUCache(_LinkedListOps, _CacheStats):
     TTL expiration is checked lazily whenever an entry is accessed.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(
+        self,
+        capacity: int,
+        on_eviction: Optional[Callable[[str], None]] = None
+    ):
         if capacity <= 0:
             raise ValueError("Cache capacity must be greater than 0")
 
         self.capacity = capacity
+
+        # Optional hook: called with the evicted key whenever the
+        # cache removes an entry to stay within capacity
+        # (Layer 6.2 - wires LRUCache to CacheStatistics).
+        self.on_eviction = on_eviction
 
         # HashMap:
         # key -> Node
@@ -233,6 +242,9 @@ class LRUCache(_LinkedListOps, _CacheStats):
                     del self.cache[lru_node.key]
 
                     self.evictions += 1
+
+                    if self.on_eviction is not None:
+                        self.on_eviction(lru_node.key)
 
     def delete(self, key: str) -> bool:
         """
