@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 170 tests
+- **Tests:** pytest — 191 tests
 
 ---
 
@@ -115,15 +115,24 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 2. Terminal 1-3: cache nodes
+# 2. THE one command: opens the 3 nodes + router, each in its own
+#    visible console window, waits for the cluster, then shows an
+#    interactive control/query UI (option 0 stops everything)
+python tui.py
+```
+
+Manual startup (4 terminals), if you prefer:
+
+```powershell
+# Terminal 1-3: cache nodes
 python main.py --port 8001 --capacity 100
 python main.py --port 8002 --capacity 100
 python main.py --port 8003 --capacity 100
 
-# 3. Terminal 4: router (do NOT use --reload)
+# Terminal 4: router (do NOT use --reload)
 uvicorn router.router:app --port 8000
 
-# 4. Watch the cluster come up
+# Watch the cluster come up
 curl http://localhost:8000/cluster/status
 ```
 
@@ -136,7 +145,7 @@ Configuration (environment variables):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CACHE_NODES` | `8001,8002,8003` | Comma-separated node URLs |
+| `CACHE_NODES` | `http://127.0.0.1:8001,...:8003` | Comma-separated node URLs (or bare ports) |
 | `CACHE_DB_PATH` | `data/cache.db` | SQLite location |
 | `RECOVERY_THRESHOLD` | `2` | Healthy checks required in `RECOVERING` before `READY` |
 | `CLUSTER_BOOTSTRAP_STATE` | `starting` | Initial state of declared nodes (`starting` / `ready`) |
@@ -153,10 +162,11 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **170 passed** — 14 cache + 16 consistent hash + 8 router +
+Expected: **191 passed** — 14 cache + 16 consistent hash + 8 router +
 15 repository + 13 cache-service + 11 circuit-breaker + 5
 single-flight + 28 node lifecycle + 14 dataset import +
-15 statistics + 21 warm-up + 10 dataset generator.
+15 statistics + 21 warm-up + 10 dataset generator +
+21 terminal UI.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).

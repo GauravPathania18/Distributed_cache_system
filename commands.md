@@ -72,7 +72,8 @@ DCS/
 │   ├── test_statistics.py
 │   ├── test_warmup.py
 │   ├── test_import_dataset.py
-│   └── test_generate_dataset.py
+│   ├── test_generate_dataset.py
+│   └── test_tui.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
 ├── datasets/             <- generated sample datasets (gitignored)
@@ -80,6 +81,7 @@ DCS/
 │   ├── products.json
 │   └── orders.jsonl
 ├── main.py               <- Layer 2: cache node server
+├── tui.py                <- ONE command: spawns everything + query UI
 ├── import_dataset.py     <- load CSV/JSON/JSONL datasets into SQLite
 ├── generate_dataset.py   <- synthesize test datasets for import_dataset.py
 ├── demo.py               <- Layer 1 demo
@@ -89,6 +91,96 @@ DCS/
 ├── README.md
 └── commands.md
 ```
+
+---
+
+## Terminal UI — the one command
+
+```powershell
+python tui.py
+```
+
+That single command:
+
+1. Starts the router + 3 cache nodes, **each in its own visible
+   console window** (you can watch every log live).
+2. Waits for the cluster: `waiting for router OK` →
+   `waiting for 3 node(s) to become active OK`.
+3. Drops into the control/query menu. The header shows cluster
+   state, breaker state and how many spawned windows are alive.
+
+If something is already running (started by hand), the TUI attaches
+to it instead of double-starting, and only ever stops what it
+spawned itself. `b` restarts anything that died.
+
+### Menu
+
+```
+  CONTROL
+    1   Cluster status & lifecycle
+    2   PUT      write through the router
+    3   GET      read  through the router
+    4   DELETE   invalidate
+    5   DB get   read the source of truth through the router
+    b   Start anything that is down
+
+  QUERY
+    6   Key inspector: every node vs database   <==
+    7   List database keys / prefixes
+    8   Run SQL on the source of truth (read-only)
+    9   Statistics, hot keys & warm-up
+
+    0   Stop everything this UI started & exit
+```
+
+### The key inspector (6) — generalized cache vs DB query
+
+Enter any key and the TUI reads **every node directly** (no
+cache-aside side effects) plus the database, then prints a verdict:
+
+```
+  CACHE - direct node reads for 'user:42'
+    :8001   HIT   {"name": "Elena Aziz", ...}
+    :8002   HIT   {"name": "Elena Aziz", ...}
+    :8003   MISS
+
+  DATABASE - source of truth (read-only)
+    FOUND   {"name": "Elena Aziz", ...}
+
+  VERDICT  CONSISTENT - 2 caching node(s) match the database
+```
+
+| Verdict | Meaning |
+|---|---|
+| `CONSISTENT` | every caching node matches the database |
+| `PARTIAL` | some nodes match, some hold stale data |
+| `STALE` | the key is cached everywhere but differs from the DB |
+| `CACHE-ONLY` | cached, but the database does not have the key |
+| `DB-ONLY` | source of truth has it, the cache is cold |
+| `NOT FOUND` | neither cache nor database |
+| `DATABASE UNAVAILABLE` | cannot verify (breaker likely open) |
+
+### SQL console (8)
+
+Read-only SQL against `data/cache.db` (single `SELECT` / `WITH` /
+`PRAGMA` / `EXPLAIN` statements, max 50 rows shown):
+
+```
+  SQL: SELECT key, json_extract(value,'$.city') AS city
+        FROM cache_data WHERE key LIKE 'user:%' LIMIT 5;
+```
+
+Writes are rejected twice over: statement allow-list + the
+connection is opened with SQLite `mode=ro`.
+
+### Note on `127.0.0.1` vs `localhost`
+
+The router and TUI talk to the cluster over `127.0.0.1` on purpose:
+on Windows a `localhost` connect may try IPv6 `::1` first, wait out
+the whole connect timeout (~2s) and then fall back to IPv4 — every
+single request would crawl. Same machine, same ports, no penalty.
+`curl http://localhost:8000/...` from your own terminal is
+unaffected (curl tries both instantly).
 
 ---
 
@@ -1196,10 +1288,11 @@ curl http://localhost:8000/cache/user:42
 pytest -v
 ```
 
-Expected: **170 tests pass** — 14 cache + 16 consistent hash +
+Expected: **191 tests pass** — 14 cache + 16 consistent hash +
 8 router + 15 repository + 13 cache-service + 11 circuit-breaker +
 5 single-flight + 28 node lifecycle + 14 dataset import +
-15 statistics + 21 warm-up + 10 dataset generator.
+15 statistics + 21 warm-up + 10 dataset generator +
+21 terminal UI.
 
 ---
 

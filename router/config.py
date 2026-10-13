@@ -1,10 +1,13 @@
 import os
 
 
+# 127.0.0.1 instead of localhost: on Windows a "localhost" connect
+# may try IPv6 ::1 first and wait for the full connect timeout before
+# falling back to IPv4 (~2s per connection). Same machine, no penalty.
 DEFAULT_NODES = [
-    "http://localhost:8001",
-    "http://localhost:8002",
-    "http://localhost:8003",
+    "http://127.0.0.1:8001",
+    "http://127.0.0.1:8002",
+    "http://127.0.0.1:8003",
 ]
 
 VIRTUAL_NODES = 100
