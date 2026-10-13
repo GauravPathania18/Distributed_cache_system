@@ -33,5 +33,8 @@ Thumbs.db
 data/
 *.db
 
+# Generated sample datasets
+datasets/
+
 # Research papers
 /DCS_research

@@ -60,6 +60,7 @@ DCS/
 │   ├── single_flight.py      <- request coalescing (leader/follower)
 │   └── warmup.py             <- Layer 6.3: CacheWarmup + rate limiter
 ├── tests/                <- test suite
+│   ├── conftest.py         <- points tests at a throwaway database
 │   ├── test_cache.py
 │   ├── test_consistent_hash.py
 │   ├── test_router.py
@@ -70,11 +71,17 @@ DCS/
 │   ├── test_node_lifecycle.py
 │   ├── test_statistics.py
 │   ├── test_warmup.py
-│   └── test_import_dataset.py
+│   ├── test_import_dataset.py
+│   └── test_generate_dataset.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
+├── datasets/             <- generated sample datasets (gitignored)
+│   ├── users.csv
+│   ├── products.json
+│   └── orders.jsonl
 ├── main.py               <- Layer 2: cache node server
 ├── import_dataset.py     <- load CSV/JSON/JSONL datasets into SQLite
+├── generate_dataset.py   <- synthesize test datasets for import_dataset.py
 ├── demo.py               <- Layer 1 demo
 ├── demo_hash.py          <- Layer 3.1 demo
 ├── demo_router.py        <- Layer 3.2 demo
@@ -1058,6 +1065,69 @@ pytest tests/test_warmup.py -v
 
 ---
 
+## Generating a synthetic dataset
+
+No Kaggle account or downloaded file needed — `generate_dataset.py`
+writes ready-to-import datasets in all three supported formats:
+
+```powershell
+# All three datasets, 1000 records each (deterministic: seed 42)
+python generate_dataset.py --kind all --count 1000
+
+# Just one dataset, larger, different seed
+python generate_dataset.py --kind users --count 5000 --seed 7
+```
+
+| Kind | File | Format | Key column | Suggested prefix |
+|---|---|---|---|---|
+| `users` | `datasets/users.csv` | CSV | `id` | `user:` |
+| `products` | `datasets/products.json` | JSON | `sku` | `product:` |
+| `orders` | `datasets/orders.jsonl` | JSONL | `order_id` | `order:` |
+
+The same `--seed` always produces byte-identical files, so
+re-generating never changes existing rows on re-import.
+
+Import what it generated (the script prints these commands too):
+
+```powershell
+python import_dataset.py --file datasets/users.csv     --key-column id      --prefix user:
+python import_dataset.py --file datasets/products.json --key-column sku     --prefix product:
+python import_dataset.py --file datasets/orders.jsonl  --key-column order_id --prefix order:
+```
+
+Verify what landed in the database:
+
+```powershell
+python -c "from database.repository import DatabaseRepository as R; r = R(); print('rows:', r.count()); print(r.keys(limit=5))"
+```
+
+```powershell
+rows: 3000
+['order:o-000001', 'order:o-000002', 'order:o-000003', 'order:o-000004', 'order:o-000005']
+```
+
+`count()` and `keys(limit)` are small read-only helpers on
+`DatabaseRepository` for exactly this kind of sanity check.
+
+Then exercise the cache-aside path against a running cluster
+(Layer 4 setup): a first `GET` misses the cache and reads SQLite,
+the second is served from the cache:
+
+```powershell
+curl http://localhost:8000/cache/user:42          # source: "database"
+curl http://localhost:8000/cache/user:42          # source: "cache"
+curl http://localhost:8000/db/product:p-000007    # straight from SQLite
+curl http://localhost:8000/db/order:o-000007       # straight from SQLite
+```
+
+### Generator tests
+
+```powershell
+pytest tests/test_generate_dataset.py tests/test_repository.py -v
+```
+
+---
+
 ## Loading a dataset (CSV / JSON / JSONL)
 
 Any tabular dataset (Kaggle, OpenML, data.gov, ...) can be loaded
@@ -1126,10 +1196,10 @@ curl http://localhost:8000/cache/user:42
 pytest -v
 ```
 
-Expected: **153 tests pass** — 14 cache + 16 consistent hash +
-8 router + 10 repository + 13 cache-service + 11 circuit-breaker +
-5 single-flight + 28 node lifecycle + 12 dataset import +
-15 statistics + 21 warm-up.
+Expected: **170 tests pass** — 14 cache + 16 consistent hash +
+8 router + 15 repository + 13 cache-service + 11 circuit-breaker +
+5 single-flight + 28 node lifecycle + 14 dataset import +
+15 statistics + 21 warm-up + 10 dataset generator.
 
 ---
 
@@ -1141,6 +1211,10 @@ In each terminal press `Ctrl + C`.
 
 ## Notes
 
+- Tests are hermetic: `tests/conftest.py` points `CACHE_DB_PATH` at a
+  throwaway file, so `pytest` never reads or clears the real
+  `data/cache.db` (the router tests used to call `database.clear()`
+  against it).
 - The router runs a background health-check thread every 2 seconds.
   A node is marked FAILED after **3 consecutive failures** and
   evicted from the hash ring. A recovered node must then sit through

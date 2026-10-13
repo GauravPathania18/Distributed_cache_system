@@ -156,6 +156,48 @@ class _CrudMixin:
         finally:
             connection.close()
 
+    def count(self) -> int:
+
+        connection = self._get_connection()
+
+        try:
+
+            cursor = connection.execute("SELECT COUNT(*) FROM cache_data")
+
+            return int(cursor.fetchone()[0])
+
+        except sqlite3.Error as error:
+            raise DatabaseUnavailableError(
+                f"database unavailable during count: {error}"
+            )
+        finally:
+            connection.close()
+
+    def keys(self, limit: Optional[int] = None) -> list:
+
+        connection = self._get_connection()
+
+        try:
+
+            if limit is None:
+                cursor = connection.execute(
+                    "SELECT key FROM cache_data ORDER BY key"
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT key FROM cache_data ORDER BY key LIMIT ?",
+                    (limit,)
+                )
+
+            return [row["key"] for row in cursor.fetchall()]
+
+        except sqlite3.Error as error:
+            raise DatabaseUnavailableError(
+                f"database unavailable during keys: {error}"
+            )
+        finally:
+            connection.close()
+
     def clear(self) -> None:
 
         connection = self._get_connection()

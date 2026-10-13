@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 153 tests
+- **Tests:** pytest — 170 tests
 
 ---
 
@@ -153,13 +153,19 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **153 passed** — 14 cache + 16 consistent hash + 8 router +
-10 repository + 13 cache-service + 11 circuit-breaker + 5
-single-flight + 28 node lifecycle + 12 dataset import +
-15 statistics + 21 warm-up.
+Expected: **170 passed** — 14 cache + 16 consistent hash + 8 router +
+15 repository + 13 cache-service + 11 circuit-breaker + 5
+single-flight + 28 node lifecycle + 14 dataset import +
+15 statistics + 21 warm-up + 10 dataset generator.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).
+
+No dataset handy? Generate synthetic ones (deterministic, CSV/JSON/JSONL):
+
+```powershell
+python generate_dataset.py --kind all --count 1000
+```
 
 Have a dataset from Kaggle or elsewhere? Load it into the database:
 

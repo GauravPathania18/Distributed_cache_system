@@ -180,12 +180,19 @@ def read_rows(path: str, file_format: str):
 
 
 def coerce(value):
-    """CSV cells are always strings; turn plain numbers into numbers."""
+    """CSV cells are always strings; turn plain numbers and booleans
+    into their real types."""
 
     if not isinstance(value, str):
         return value
 
     stripped = value.strip()
+
+    if stripped in ("True", "true"):
+        return True
+
+    if stripped in ("False", "false"):
+        return False
 
     try:
         return int(stripped)
