@@ -18,6 +18,7 @@ class DatabaseRepository(_ConnectionMixin, _CrudMixin):
         exists(key)
         count()
         keys(limit)
+        query(sql)
         clear()
 
     The rest of the application does not know that SQLite is used,

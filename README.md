@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 191 tests
+- **Tests:** pytest — 194 tests
 
 ---
 
@@ -162,11 +162,11 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **191 passed** — 14 cache + 16 consistent hash + 8 router +
-15 repository + 13 cache-service + 11 circuit-breaker + 5
+Expected: **194 passed** — 14 cache + 16 consistent hash + 8 router +
+20 repository + 13 cache-service + 11 circuit-breaker + 5
 single-flight + 28 node lifecycle + 14 dataset import +
 15 statistics + 21 warm-up + 10 dataset generator +
-21 terminal UI.
+6 config + 13 terminal UI.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).

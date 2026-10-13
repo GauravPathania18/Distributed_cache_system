@@ -21,15 +21,18 @@ import atexit
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
 
-from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
+
+from cluster.health_monitor import check_node
+from database import DatabaseRepository
+from database.exceptions import DatabaseUnavailableError
+from router.config import nodes_from_env
 
 
 # ---------------------------------------------------------
@@ -42,7 +45,6 @@ ROUTER_HOST = "127.0.0.1"
 ROUTER_PORT = 8000
 ROUTER_URL = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 
-DEFAULT_NODE_PORTS = [8001, 8002, 8003]
 DEFAULT_CAPACITY = 100
 
 BOOT_TIMEOUT = 60
@@ -53,46 +55,6 @@ VALUE_LIMIT = 600
 GREEN, YELLOW, RED, CYAN, DIM, BOLD, RESET = (
     "32", "33", "31", "36", "2", "1", "0"
 )
-
-
-def normalize_node(entry: str):
-    """
-    CACHE_NODES entries may be full URLs or bare ports.
-
-    localhost is rewritten to 127.0.0.1: a "localhost" connect can
-    try IPv6 ::1 first and burn the whole connect timeout before
-    falling back to IPv4 (~2s per request on Windows).
-    """
-
-    entry = entry.strip()
-
-    if not entry:
-        return None
-
-    if entry.startswith("http://") or entry.startswith("https://"):
-        entry = entry.rstrip("/")
-    else:
-        entry = f"http://localhost:{entry}"
-
-    host = urlparse(entry).hostname or ""
-
-    if host.lower() in ("localhost", "::1"):
-        entry = entry.replace(f"://{host}", "://127.0.0.1", 1)
-
-    return entry
-
-
-def parse_node_urls(raw=None) -> list:
-    """CACHE_NODES entries may be full URLs or bare ports."""
-
-    if raw is None:
-        raw = os.environ.get("CACHE_NODES", "")
-
-    if raw.strip():
-        urls = [normalize_node(entry) for entry in raw.split(",")]
-        return [url for url in urls if url]
-
-    return [f"http://127.0.0.1:{port}" for port in DEFAULT_NODE_PORTS]
 
 
 def node_port(url: str) -> str:
@@ -106,6 +68,10 @@ def db_path() -> str:
         return path
 
     return os.path.normpath(os.path.join(ROOT, path))
+
+
+def repository() -> DatabaseRepository:
+    return DatabaseRepository(db_path=db_path())
 
 
 # ---------------------------------------------------------
@@ -186,10 +152,6 @@ def _detail(data):
     return "HTTP error"
 
 
-def is_up(url: str) -> bool:
-    return http("GET", url, timeout=1.5)["ok"]
-
-
 # ---------------------------------------------------------
 # PROCESS CONTROL
 # ---------------------------------------------------------
@@ -241,18 +203,18 @@ def ensure_running(children) -> list:
 
     python = project_python()
 
-    if not is_up(f"{ROUTER_URL}/health") and not _spawned(children, "router"):
+    if not check_node(ROUTER_URL) and not _spawned(children, "router"):
         children.append(spawn("router", [
             python, "-m", "uvicorn", "router.router:app",
             "--port", str(ROUTER_PORT)
         ]))
         started.append("router  :8000")
 
-    for url in parse_node_urls():
+    for url in nodes_from_env():
 
         label = f"node :{node_port(url)}"
 
-        if is_up(f"{url}/health") or _spawned(children, label):
+        if check_node(url) or _spawned(children, label):
             continue
 
         children.append(spawn(label, [
@@ -360,10 +322,10 @@ def boot(children):
 
     print()
 
-    wait_for(lambda: is_up(f"{ROUTER_URL}/health"),
+    wait_for(lambda: check_node(ROUTER_URL),
              "waiting for router", timeout=30)
 
-    expected = len(parse_node_urls())
+    expected = len(nodes_from_env())
 
     wait_for(lambda: len(active_nodes()) >= expected,
              f"waiting for {expected} node(s) to become active",
@@ -525,102 +487,6 @@ def render_table(headers, rows) -> None:
         print("  " + "  ".join(
             item.ljust(widths[i]) for i, item in enumerate(row)
         ))
-
-
-# ---------------------------------------------------------
-# DATABASE HELPERS (read-only, independent of the router)
-# ---------------------------------------------------------
-
-def db_connect():
-
-    path = db_path()
-
-    if not os.path.exists(path):
-        raise sqlite3.OperationalError(f"no such database: {path}")
-
-    uri = "file:" + Path(path).as_posix() + "?mode=ro"
-
-    connection = sqlite3.connect(uri, uri=True, timeout=2)
-    connection.row_factory = sqlite3.Row
-
-    return connection
-
-
-def is_safe_sql(sql: str) -> bool:
-
-    text = sql.strip().rstrip(";").strip()
-
-    if not text:
-        return False
-
-    first_word = text.split(None, 1)[0].upper()
-
-    if first_word not in ("SELECT", "WITH", "PRAGMA", "EXPLAIN"):
-        return False
-
-    return ";" not in text
-
-
-def run_sql(sql: str, params=()) -> dict:
-
-    if not is_safe_sql(sql):
-        return {"ok": False, "error": "only single read-only statements "
-                                      "(SELECT / WITH / PRAGMA / EXPLAIN)"}
-
-    try:
-
-        connection = db_connect()
-
-        try:
-            cursor = connection.execute(sql, params)
-            headers = [column[0] for column in cursor.description or []]
-            rows = cursor.fetchmany(MAX_SQL_ROWS + 1)
-        finally:
-            connection.close()
-
-    except sqlite3.Error as error:
-        return {"ok": False, "error": str(error)}
-
-    truncated = len(rows) > MAX_SQL_ROWS
-
-    return {
-        "ok": True,
-        "headers": headers,
-        "rows": [list(row) for row in rows[:MAX_SQL_ROWS]],
-        "truncated": truncated,
-    }
-
-
-def db_read(key: str):
-    """('found', value) | ('missing', None) | ('error', message)"""
-
-    try:
-
-        connection = db_connect()
-
-        try:
-            cursor = connection.execute(
-                "SELECT value FROM cache_data WHERE key = ?",
-                (key,)
-            )
-            row = cursor.fetchone()
-        finally:
-            connection.close()
-
-    except sqlite3.Error as error:
-        return "error", str(error)
-
-    if row is None:
-        return "missing", None
-
-    try:
-        return "found", json.loads(row["value"])
-    except (ValueError, TypeError):
-        return "found", row["value"]
-
-
-def escape_like(prefix: str) -> str:
-    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 # ---------------------------------------------------------
@@ -807,9 +673,9 @@ def action_resume(children):
     else:
         for label in started:
             print(f"  {paint('started', GREEN)} {label}")
-        wait_for(lambda: is_up(f"{ROUTER_URL}/health"),
+        wait_for(lambda: check_node(ROUTER_URL),
                  "waiting for router", timeout=30)
-        expected = len(parse_node_urls())
+        expected = len(nodes_from_env())
         wait_for(lambda: len(active_nodes()) >= expected,
                  f"waiting for {expected} node(s)", timeout=BOOT_TIMEOUT)
 
@@ -827,7 +693,7 @@ def action_inspect(children):
 
     cache_results = []
 
-    for url in parse_node_urls():
+    for url in nodes_from_env():
         label = f":{node_port(url)}"
         response = http("GET", f"{url}/cache/{encoded}", timeout=1.5)
 
@@ -846,7 +712,12 @@ def action_inspect(children):
     print()
     print(paint("  DATABASE - source of truth (read-only)", BOLD))
 
-    kind, payload = db_read(key)
+    try:
+        value = repository().get(key)
+        kind, payload = (("found", value) if value is not None
+                         else ("missing", None))
+    except DatabaseUnavailableError as error:
+        kind, payload = "error", str(error)
 
     if kind == "found":
         print(f"    FOUND   {_short(payload)}")
@@ -879,75 +750,67 @@ def action_list_keys(children):
     except ValueError:
         limit = 20
 
+    limit = max(1, limit)
+
+    store = repository()
+
     try:
 
-        connection = db_connect()
+        if prefix:
 
-        try:
+            # substr() prefix match instead of LIKE: no wildcards to escape.
+            matching = store.query(
+                "SELECT key, length(value) AS size FROM cache_data "
+                "WHERE substr(key, 1, length(?)) = ? "
+                "ORDER BY key LIMIT ?",
+                (prefix, prefix, limit),
+                max_rows=limit
+            )
 
-            if prefix:
+            total = store.query(
+                "SELECT COUNT(*) FROM cache_data "
+                "WHERE substr(key, 1, length(?)) = ?",
+                (prefix, prefix)
+            )["rows"][0][0]
 
-                cursor = connection.execute(
-                    "SELECT key, length(value) AS size "
-                    "FROM cache_data WHERE key LIKE ? ESCAPE '\\' "
-                    "ORDER BY key LIMIT ?",
-                    (escape_like(prefix) + "%", limit)
-                )
-                rows = cursor.fetchall()
+            print()
+            print(paint(f"  {total} key(s) matching {prefix!r}"
+                        f" - showing {len(matching['rows'])}", BOLD))
+            print()
 
-                total = connection.execute(
-                    "SELECT COUNT(*) FROM cache_data WHERE key LIKE ? "
-                    "ESCAPE '\\'",
-                    (escape_like(prefix) + "%",)
-                ).fetchone()[0]
+            if matching["rows"]:
+                render_table(["key", "value bytes"], matching["rows"])
 
-                print()
-                print(paint(f"  {total} key(s) matching {prefix!r}"
-                            f" - showing {len(rows)}", BOLD))
-                print()
+        else:
 
-                if rows:
-                    render_table(["key", "value bytes"],
-                                 [(row["key"], row["size"]) for row in rows])
+            summary = store.query(
+                "SELECT CASE WHEN instr(key, ':') > 0 "
+                "THEN substr(key, 1, instr(key, ':')) "
+                "ELSE '(no prefix)' END AS prefix, COUNT(*) AS n "
+                "FROM cache_data GROUP BY prefix ORDER BY n DESC"
+            )
 
-            else:
+            print()
+            print(paint(f"  {store.count()} row(s) total", BOLD))
+            print()
 
-                cursor = connection.execute(
-                    "SELECT CASE WHEN instr(key, ':') > 0 "
-                    "THEN substr(key, 1, instr(key, ':')) "
-                    "ELSE '(no prefix)' END AS prefix, COUNT(*) AS n "
-                    "FROM cache_data GROUP BY prefix ORDER BY n DESC"
-                )
-                summaries = cursor.fetchall()
+            if summary["rows"]:
+                render_table(["prefix", "rows"], summary["rows"])
 
-                total = connection.execute(
-                    "SELECT COUNT(*) FROM cache_data"
-                ).fetchone()[0]
+            print()
+            print(paint(f"  first {limit} keys", BOLD))
+            print()
 
-                print()
-                print(paint(f"  {total} row(s) total", BOLD))
-                print()
+            sample = store.query(
+                "SELECT key FROM cache_data ORDER BY key LIMIT ?",
+                (limit,),
+                max_rows=limit
+            )
 
-                if summaries:
-                    render_table(["prefix", "rows"],
-                                 [(row["prefix"], row["n"])
-                                  for row in summaries])
+            for row in sample["rows"]:
+                print(f"    {row[0]}")
 
-                print()
-                print(paint(f"  first {limit} keys", BOLD))
-                print()
-
-                cursor = connection.execute(
-                    "SELECT key FROM cache_data ORDER BY key LIMIT ?",
-                    (limit,)
-                )
-                for row in cursor:
-                    print(f"    {row['key']}")
-
-        finally:
-            connection.close()
-
-    except sqlite3.Error as error:
+    except (ValueError, DatabaseUnavailableError) as error:
         print(paint(f"  database error: {error}", RED))
 
 
@@ -963,10 +826,10 @@ def action_sql(children):
     if not sql:
         return
 
-    result = run_sql(sql)
-
-    if not result["ok"]:
-        print(paint(f"  {result['error']}", RED))
+    try:
+        result = repository().query(sql, max_rows=MAX_SQL_ROWS)
+    except (ValueError, DatabaseUnavailableError) as error:
+        print(paint(f"  {error}", RED))
         return
 
     print()
@@ -1009,7 +872,7 @@ def action_stats(children):
               f"(failures {data.get('failure_count')}/"
               f"{data.get('failure_threshold')})")
 
-    for url in parse_node_urls():
+    for url in nodes_from_env():
 
         print()
         print(paint(f"  NODE {url}", BOLD))

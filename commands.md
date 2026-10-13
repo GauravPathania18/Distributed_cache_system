@@ -73,6 +73,7 @@ DCS/
 │   ├── test_warmup.py
 │   ├── test_import_dataset.py
 │   ├── test_generate_dataset.py
+│   ├── test_config.py
 │   └── test_tui.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
@@ -1288,11 +1289,11 @@ curl http://localhost:8000/cache/user:42
 pytest -v
 ```
 
-Expected: **191 tests pass** — 14 cache + 16 consistent hash +
-8 router + 15 repository + 13 cache-service + 11 circuit-breaker +
+Expected: **194 tests pass** — 14 cache + 16 consistent hash +
+8 router + 20 repository + 13 cache-service + 11 circuit-breaker +
 5 single-flight + 28 node lifecycle + 14 dataset import +
 15 statistics + 21 warm-up + 10 dataset generator +
-21 terminal UI.
+6 config + 13 terminal UI.
 
 ---
 

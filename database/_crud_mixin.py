@@ -8,6 +8,56 @@ from .exceptions import DatabaseUnavailableError
 
 class _CrudMixin:
 
+    READ_ONLY_STATEMENTS = ("SELECT", "WITH", "PRAGMA", "EXPLAIN")
+
+    def query(self, sql: str, params=(), max_rows: int = 50) -> dict:
+        """
+        Run one read-only statement and return the result as
+        {"headers": [...], "rows": [[...]], "truncated": bool}.
+
+        Only single SELECT / WITH / PRAGMA / EXPLAIN statements are
+        accepted, so this can back an interactive SQL console without
+        any way to modify the source of truth. Raises ValueError for
+        rejected input and DatabaseUnavailableError for storage
+        failures.
+        """
+
+        text = sql.strip().rstrip(";").strip()
+
+        if not text:
+            raise ValueError("empty statement")
+
+        first_word = text.split(None, 1)[0].upper()
+
+        if (first_word not in self.READ_ONLY_STATEMENTS
+                or ";" in text):
+            raise ValueError(
+                "only single read-only statements are allowed "
+                "(SELECT / WITH / PRAGMA / EXPLAIN)"
+            )
+
+        connection = self._get_connection()
+
+        try:
+
+            cursor = connection.execute(text, params)
+
+            headers = [column[0] for column in cursor.description or []]
+            rows = cursor.fetchmany(max_rows + 1)
+
+        except sqlite3.Error as error:
+            raise DatabaseUnavailableError(
+                f"database unavailable during query: {error}"
+            )
+        finally:
+            connection.close()
+
+        return {
+            "headers": headers,
+            "rows": [list(row) for row in rows[:max_rows]],
+            "truncated": len(rows) > max_rows,
+        }
+
     def get(self, key: str) -> Optional[Any]:
 
         connection = self._get_connection()
