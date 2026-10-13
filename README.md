@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 132 tests
+- **Tests:** pytest — 153 tests
 
 ---
 
@@ -37,7 +37,7 @@ recovery when the cluster restarts.
         cache MISS ──► SingleFlight ──► CircuitBreaker ──► SQLite
                            ▲                               │
                            └──────── Cache Warm-up ◄───────┘
-                                 (Layer 6.3/6.4, next)
+                                 (Layer 6.3, done)
 ```
 
 The router is the only public entry point. Cache nodes are "dumb"
@@ -60,10 +60,13 @@ layer that can be emptied and rebuilt at any time.
 | 5.8 | Single-flight request coalescing | Done |
 | **6.1** | **Node lifecycle: STARTING → RECOVERING → READY → UNHEALTHY → FAILED** | **Done** |
 | **6.2** | **Cache statistics & hot-key tracking** | **Done** |
-| 6.3 | Recovery mode on the node itself | Planned |
-| 6.4 | Cache warm-up from hot keys | Planned |
-| 6.5 | Recovery throttling (rate-limited DB loads) | Planned |
-| 6.6 | Cluster rejoin orchestration | Planned |
+| **6.3** | **Hot-key aggregation & cache warm-up (incl. the 6.4 rejoin gate)** | **Done** |
+| 7.1 | Replica selection (placement) | Next |
+| 7.2 | Replicated writes (primary → replicas) | Planned |
+| 7.3 | Replication log, versions & sync | Planned |
+| 7.4 | Failure detection formalized | Planned |
+| 7.5 | Automatic failover | Planned |
+| 7.6 | Re-replication & rebalancing | Planned |
 
 ### Layer 6.1 in one paragraph
 
@@ -83,8 +86,24 @@ memory — measuring usage must never add writes to the database.
 The key tracker is bounded (`max_tracked_keys`) so it cannot
 become a second memory problem, and counters are reset every
 5-minute window so "hot keys" means *recently* hot. The ranked
-key list produced here is the raw material Layer 6.3/6.4 needs
+key list produced here is the raw material Layer 6.3 needs
 to decide what to warm up after a node restarts.
+
+### Layer 6.3 in one paragraph
+
+A restarted node is empty, but the cluster remembers what is hot:
+the router records every key it proxies into its own bounded
+ranking (which survives node restarts) and folds in each node's
+Layer 6.2 window before warming. When a node sits in `RECOVERING`,
+the router reloads the hottest keys it *would own* (ownership is
+computed on a ring view that includes the gated node) — read from
+the database, throttled to `WARMUP_RATE_LIMIT` reads/second,
+written directly to the recovering node. Only then, together with
+`RECOVERY_THRESHOLD` healthy checks, does the node become `READY`
+and rejoin the ring. Missing keys are skipped (the database stays
+the source of truth), and a database outage keeps the node in
+`RECOVERING` with retries every health pass — warm-up is an
+optimization, never a correctness blocker.
 
 ---
 
@@ -121,6 +140,10 @@ Configuration (environment variables):
 | `CACHE_DB_PATH` | `data/cache.db` | SQLite location |
 | `RECOVERY_THRESHOLD` | `2` | Healthy checks required in `RECOVERING` before `READY` |
 | `CLUSTER_BOOTSTRAP_STATE` | `starting` | Initial state of declared nodes (`starting` / `ready`) |
+| `WARMUP_ENABLED` | `on` | Warm-up master switch (off = ungated READY) |
+| `WARMUP_LIMIT` | `1000` | Top-K keys reloaded during warm-up |
+| `WARMUP_RATE_LIMIT` | `100` | Max database reads/second during warm-up |
+| `HOTKEY_MAX_KEYS` | `10000` | Bound on the router-side hot-key ranking |
 
 ---
 
@@ -130,10 +153,10 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **132 passed** — 14 cache + 16 consistent hash + 8 router +
+Expected: **153 passed** — 14 cache + 16 consistent hash + 8 router +
 10 repository + 13 cache-service + 11 circuit-breaker + 5
 single-flight + 28 node lifecycle + 12 dataset import +
-15 statistics.
+15 statistics + 21 warm-up.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).

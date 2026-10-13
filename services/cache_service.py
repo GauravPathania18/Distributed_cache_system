@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional
 
+from cache.hot_keys import HotKeyManager
 from database.exceptions import DatabaseUnavailableError
 from services.circuit_breaker import CircuitBreaker
 from services.single_flight import SingleFlight
@@ -27,6 +28,10 @@ class CacheService:
     the database is unavailable the service raises DatabaseUnavailableError
     (or returns a "database_unavailable" result for GET), so the HTTP layer
     can answer 503 instead of handing back an unhandled 500.
+
+    Layer 6.3: every key the application touches is recorded into the
+    router-side HotKeyManager (one Counter bump per request, never the
+    database) so warm-up knows what is hot even after nodes restart.
     """
 
     def __init__(
@@ -34,7 +39,8 @@ class CacheService:
         cache,
         database,
         single_flight: SingleFlight = None,
-        circuit_breaker: CircuitBreaker = None
+        circuit_breaker: CircuitBreaker = None,
+        hot_keys: HotKeyManager = None
     ):
 
         self.cache = cache
@@ -43,6 +49,10 @@ class CacheService:
         self.single_flight = single_flight or SingleFlight()
 
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
+
+        # Layer 6.3 cluster-wide hot-key ranking. Auto-created when
+        # not injected so existing constructors keep working.
+        self.hot_keys = hot_keys if hot_keys is not None else HotKeyManager()
 
     # --------------------------------------------------
     # GET (cache-aside)
@@ -54,6 +64,8 @@ class CacheService:
         Raises DatabaseUnavailableError when the database is down and the
         key was not already in the cache.
         """
+
+        self.hot_keys.record(key)
 
         # 1. Fast path: distributed cache.
         value, node = self.cache.get(key)
@@ -114,6 +126,8 @@ class CacheService:
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> dict:
 
+        self.hot_keys.record(key)
+
         # Source of truth first (through the circuit breaker).
         self.circuit_breaker.call(self.database.set, key, value)
 
@@ -131,6 +145,8 @@ class CacheService:
     # --------------------------------------------------
 
     def delete(self, key: str) -> dict:
+
+        self.hot_keys.record(key)
 
         database_deleted = self.circuit_breaker.call(self.database.delete, key)
 

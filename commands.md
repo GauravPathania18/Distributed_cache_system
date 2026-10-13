@@ -27,16 +27,18 @@ Project layout after setup:
 ```
 DCS/
 ├── .venv/                <- virtual environment (packages)
-├── cache/                <- Layer 1 + 6.2: LRU cache engine
+├── cache/                <- Layer 1 + 6.2/6.3: LRU cache engine
 │   ├── __init__.py
+│   ├── hot_keys.py         <- Layer 6.3: cluster-wide hot-key ranking
 │   ├── lru_cache.py
 │   ├── node.py
 │   └── statistics.py       <- Layer 6.2: hit/miss counters + hot keys
-├── cluster/              <- Layer 4 + 6.1: cluster management
+├── cluster/              <- Layer 4 + 6.1/6.3: cluster management
 │   ├── __init__.py
-│   ├── consistent_hash.py   <- consistent hashing + virtual nodes
+│   ├── consistent_hash.py   <- hashing + ring views (with_node)
+│   ├── events.py            <- Layer 6.3: lifecycle event bus
 │   ├── health_monitor.py    <- periodic checks -> lifecycle driver
-│   ├── node_manager.py      <- membership, states, ring
+│   ├── node_manager.py      <- membership, states, ring, gate, listeners
 │   ├── node_state.py        <- NodeState enum + transition table
 │   ├── node_lifecycle.py    <- STARTING/RECOVERING/READY/... logic
 │   └── node_activation.py   <- legacy Layer 4 wrappers
@@ -50,12 +52,13 @@ DCS/
 │   ├── __init__.py
 │   ├── exceptions.py         <- DatabaseUnavailableError
 │   └── repository.py
-├── services/             <- Layer 5: cache-aside orchestration
+├── services/             <- Layer 5 + 6.3: cache-aside orchestration
 │   ├── __init__.py
 │   ├── cache_service.py      <- cache-aside policy + stampede protection
 │   ├── circuit_breaker.py    <- CLOSED/OPEN/HALF-OPEN DB failure protection
-│   ├── distributed_cache.py  <- data-plane client over the cluster
-│   └── single_flight.py      <- request coalescing (leader/follower)
+│   ├── distributed_cache.py  <- data-plane client + write_to_node
+│   ├── single_flight.py      <- request coalescing (leader/follower)
+│   └── warmup.py             <- Layer 6.3: CacheWarmup + rate limiter
 ├── tests/                <- test suite
 │   ├── test_cache.py
 │   ├── test_consistent_hash.py
@@ -66,6 +69,7 @@ DCS/
 │   ├── test_single_flight.py
 │   ├── test_node_lifecycle.py
 │   ├── test_statistics.py
+│   ├── test_warmup.py
 │   └── test_import_dataset.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
@@ -854,6 +858,206 @@ pytest tests/test_statistics.py -v
 
 ---
 
+## Layer 6.3 — Hot-Key Aggregation & Cache Warm-Up
+
+When a cache node restarts its memory is empty. Layer 6.3 uses the
+Layer 6.2 statistics to proactively reload the most important keys
+back into that node **before** it is allowed to serve normal traffic:
+
+```
+Node restarts
+     │
+     ▼
+  STARTING ──health check──► RECOVERING   (gated: not in the ring)
+                                  │
+                                  ▼
+                    hot keys (router view + node stats)
+                                  │
+                                  ▼
+                 ownership filter (ring view WITH this node)
+                                  │
+                                  ▼
+                          rate limiter (100 DB reads/s)
+                                  │
+                                  ▼
+                     database (source of truth; missing = skip)
+                                  │
+                                  ▼
+                   direct write to the recovering node
+                                  │
+                                  ▼
+                     warm-up done + recovery_threshold
+                                  │
+                                  ▼
+                               READY ──► rejoin the ring
+```
+
+### Who knows what is hot?
+
+Two sources are combined:
+
+- **Router-side `HotKeyManager`** (`cache/hot_keys.py`) — every key
+  the application touches through the router (GET/SET/DELETE) is
+  recorded here. Because it lives in the router process it *survives
+  node restarts* — exactly when warm-up needs it.
+- **Node-local Layer 6.2 windows** — before each warm-up (and on
+  each `/cluster/hot-keys` call) the router fans out to every active
+  node's `/stats/top-keys` and folds the rankings in, so traffic
+  that bypassed the router is covered too. Merged counts are
+  additive; only the order matters.
+
+The ranking is bounded (`HOTKEY_MAX_KEYS`, default 10,000).
+
+### Ownership (Section 10 corrected)
+
+A RECOVERING node is gated **out of the live ring**, so
+`ring.get_node(key)` can never return it. Warm-up therefore computes
+ownership on a ring *view* that includes the node
+(`ConsistentHashRing.with_node` / `NodeManager.expected_primary`) and
+warms only the keys for which it would be the **primary**. Keys where
+it is merely a replica come back later via Layer 7.6 re-replication;
+the database remains the correctness source meanwhile.
+
+### Recovery gate (Layer 6.4)
+
+`RECOVERING → READY` now requires the warm-up record to be
+`done` (or warm-up disabled) **in addition to** the recovery
+threshold of healthy checks. A node cannot rejoin the hash ring
+before its recovery requirements are met — 6.4 "not routed until
+recovery complete" is satisfied by construction.
+
+**Database failure during warm-up** (Section 16): the attempt is
+marked `failed`, the node **stays RECOVERING**, and the health loop
+retries the warm-up on every pass until the database returns.
+`FAILED` stays reserved for actual health-check failures. Reaching
+the top-`WARMUP_LIMIT` keys counts as recovered (Section 17) —
+everything else loads lazily on cache MISS.
+
+### Endpoints (router, port 8000)
+
+```powershell
+# Merged cluster hot-key ranking (+ per-node window summaries)
+curl "http://localhost:8000/cluster/hot-keys?limit=10&per_node=100"
+
+# Warm-up state per node
+curl http://localhost:8000/cluster/warmup
+
+# Manually (re)start a warm-up for one node
+curl -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A8001"
+```
+
+```json
+{
+    "top_keys": [["user:42", 5000], ["product:17", 4200]],
+    "tracked_keys": 342,
+    "max_keys": 10000,
+    "untracked": 0,
+    "nodes_queried": 3,
+    "per_node": {
+        "http://localhost:8001": {
+            "top_keys": [["user:42", 1200]],
+            "tracked_keys": 140
+        }
+    }
+}
+```
+
+```json
+{
+    "enabled": true,
+    "limit": 1000,
+    "rate_limit": 100,
+    "hot_keys": {"tracked_keys": 342, "max_keys": 10000, "untracked": 0},
+    "nodes": {
+        "http://localhost:8001": {
+            "state": "done",
+            "attempts": 1,
+            "keys_attempted": 4,
+            "keys_loaded": 3,
+            "keys_not_owned": 96,
+            "keys_missing": 1,
+            "keys_write_failed": 0,
+            "duration": 0.04,
+            "error": null
+        }
+    }
+}
+```
+
+Warm-up states: `pending → running → done | failed` (plus
+`disabled`). A manual trigger on an unknown node returns 404.
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `WARMUP_ENABLED` | `on` | Master switch (off = ungated READY) |
+| `WARMUP_LIMIT` | `1000` | Top-K target — reaching it = recovered |
+| `WARMUP_RATE_LIMIT` | `100` | Max database reads/second during warm-up |
+| `HOTKEY_MAX_KEYS` | `10000` | Bound on the router-side ranking |
+
+```powershell
+$env:WARMUP_LIMIT = "200"
+$env:WARMUP_RATE_LIMIT = "50"
+uvicorn router.router:app --port 8000
+```
+
+### Live demo (with the Layer 4 setup running)
+
+```powershell
+# 1. Generate traffic through the router (feeds both views)
+1..10 | ForEach-Object {
+  curl -X PUT http://localhost:8000/cache/user:42 `
+    -H "Content-Type: application/json" -d '{"value":"Gaurav","ttl":300}'
+  curl http://localhost:8000/cache/user:42 | Out-Null
+}
+
+# 2. Inspect the merged hot list
+curl "http://localhost:8000/cluster/hot-keys?limit=5"
+
+# 3. Kill a node (Ctrl+C its terminal), then restart it:
+python main.py --port 8001
+
+# 4. Watch it recover: state=running -> done, then READY
+curl http://localhost:8000/cluster/warmup
+curl http://localhost:8000/cluster/status
+
+# 5. Or drive a warm-up manually for any node
+curl -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A8002"
+```
+
+On a **cold boot** (no statistics yet) warm-up completes instantly
+with zero keys and the node goes READY right away — warm-up is an
+optimization, never a blocker (Section 18).
+
+### Layer 6.3 tests
+
+```powershell
+pytest tests/test_warmup.py -v
+```
+
+- `HotKeyManager`: ranking, record bound (6.2 policy), merge
+  (additive + trim to bound)
+- `CacheService` records every proxied key into the ranking
+- Rate limiter: spacing, unlimited mode, negative rejected
+- Ownership: only keys the recovering node would own are warmed
+  (regression: the live ring never returns a gated node)
+- Warm-up work: DB → direct write, stale stats (deleted keys)
+  skipped, node statistics merged before warming
+- DB failure → `failed` + gate blocks READY → health-pass retry →
+  eventual READY (Section 16)
+- No gate configured → plain 6.1 rejoin still works
+- Failed writes still complete the attempt (health monitor owns
+  node failure, Section 18)
+- Listeners fire after the lock is released; listener errors are
+  isolated
+- Explicit restart (→ STARTING) forgets the old warm-up record
+- Double `ensure()` dedupes; disabled mode gates nothing
+- Endpoints: `/cluster/hot-keys` (merge + shape),
+  `/cluster/warmup` (status + manual trigger + 404)
+
+---
+
 ## Loading a dataset (CSV / JSON / JSONL)
 
 Any tabular dataset (Kaggle, OpenML, data.gov, ...) can be loaded
@@ -922,10 +1126,10 @@ curl http://localhost:8000/cache/user:42
 pytest -v
 ```
 
-Expected: **132 tests pass** — 14 cache + 16 consistent hash +
+Expected: **153 tests pass** — 14 cache + 16 consistent hash +
 8 router + 10 repository + 13 cache-service + 11 circuit-breaker +
 5 single-flight + 28 node lifecycle + 12 dataset import +
-15 statistics.
+15 statistics + 21 warm-up.
 
 ---
 
@@ -953,6 +1157,12 @@ In each terminal press `Ctrl + C`.
   of hot keys, exposed through `/stats/window` and
   `/stats/top-keys`. Nothing is ever written to the database just
   to measure cache usage.
+- The router keeps its own cluster-wide hot-key ranking (Layer 6.3)
+  and uses it to warm a restarted node before the node re-enters the
+  hash ring. Warm-up is throttled (`WARMUP_RATE_LIMIT`) and never
+  blocks on a missing key — the database stays the source of truth.
+  A database outage during warm-up keeps the node in RECOVERING
+  (retried every health pass) instead of routing to a cold node.
 - Layer 5 uses SQLite at `data/cache.db` (no TTL — the DB keeps data
   forever; TTL only affects the in-memory cache). Override the path
   with the `CACHE_DB_PATH` environment variable.

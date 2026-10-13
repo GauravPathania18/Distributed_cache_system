@@ -148,6 +148,41 @@ class ConsistentHashRing:
         return result
 
     # ---------------------------------------------------------
+    # RING COPIES (Layer 6.3 - gated-node ownership views)
+    # ---------------------------------------------------------
+
+    def copy(self):
+        """Independent shallow copy of this ring."""
+
+        clone = ConsistentHashRing(
+            virtual_nodes=self.virtual_nodes
+        )
+
+        clone.ring = dict(self.ring)
+        clone.sorted_keys = list(self.sorted_keys)
+        clone.node_positions = {
+            node: list(positions)
+            for node, positions in self.node_positions.items()
+        }
+
+        return clone
+
+    def with_node(self, node: str):
+        """
+        Ring copy that also contains `node`.
+
+        A RECOVERING node is gated out of the live ring, so
+        get_node() can never return it. Warm-up needs ownership
+        computed as if the node were back in service - this view
+        is what makes that answer without touching the live ring.
+        """
+
+        clone = self.copy()
+        clone.add_node(node)
+
+        return clone
+
+    # ---------------------------------------------------------
     # INFO
     # ---------------------------------------------------------
 

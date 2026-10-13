@@ -113,3 +113,36 @@ class DistributedCache:
                 continue
 
         return deleted_from
+
+    # --------------------------------------------------
+    # DIRECT SINGLE-NODE WRITE (Layer 6.3 warm-up)
+    # --------------------------------------------------
+
+    def write_to_node(self, node: str, key: str, value, ttl=None) -> bool:
+        """
+        Write `key` to exactly `node`, bypassing ring placement.
+
+        A RECOVERING node is gated out of the live ring, so normal
+        set() routing would never reach it - and warm-up has already
+        decided this key belongs there. Returns True when the node
+        acknowledged the write.
+        """
+
+        body = {"value": value}
+
+        if ttl is not None:
+            body["ttl"] = ttl
+
+        try:
+
+            response = self.session.put(
+                f"{node}/cache/{key}",
+                json=body,
+                timeout=self.timeout
+            )
+
+            return response.status_code == 200
+
+        except requests.RequestException:
+
+            return False

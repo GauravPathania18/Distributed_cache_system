@@ -1,3 +1,4 @@
+from .events import LifecycleEvent, fire_listeners
 from .node_state import (
     NodeState,
     InvalidTransitionError,
@@ -102,6 +103,47 @@ def register(manager, node: str, initial_state=NodeState.STARTING):
 # HEALTH RESULT (the state machine driver)
 # ---------------------------------------------------------
 
+def _recovery_gate_satisfied(manager, node: str) -> bool:
+    """
+    Ask the optional recovery gate (Layer 6.3 warm-up) whether this
+    node has finished its recovery requirements.
+
+    No gate configured -> satisfied (plain Layer 6.1 behavior).
+    A gate that raises -> NOT satisfied: on error we hold the node
+    back rather than route to it (Section 16).
+    """
+
+    gate = manager.recovery_gate
+
+    if gate is None:
+        return True
+
+    try:
+        return bool(gate(node))
+
+    except Exception as error:
+        print(f"[RECOVERY GATE ERROR] {node}: {error!r}")
+        return False
+
+
+def _transition(manager, node: str, target: NodeState):
+    """
+    enter_state + build the lifecycle event for it.
+
+    Caller must hold manager.lock. Returns None for self-loops
+    (no state change -> no event).
+    """
+
+    before = manager.node_states.get(node, target)
+
+    after = enter_state(manager, node, target)
+
+    if after is before:
+        return None
+
+    return LifecycleEvent(node, before, after)
+
+
 def on_health_result(manager, node: str, healthy: bool):
     """
     Feed one health-check outcome into the lifecycle.
@@ -109,6 +151,7 @@ def on_health_result(manager, node: str, healthy: bool):
         healthy:
             STARTING   -> RECOVERING
             RECOVERING -> count++; READY once recovery_threshold hit
+                           AND the recovery gate (if any) is satisfied
             UNHEALTHY  -> READY
             FAILED     -> RECOVERING (gated rejoin)
             READY      -> stay
@@ -117,7 +160,12 @@ def on_health_result(manager, node: str, healthy: bool):
             failure counter increments; once failure_threshold
             consecutive failures are seen -> FAILED (leave the ring).
             Otherwise READY -> UNHEALTHY, and gated states stay gated.
+
+    Any state change is delivered to listeners AFTER the lock is
+    released (Layer 6.3: warm-up starts without blocking routing).
     """
+
+    event = None
 
     with manager.lock:
 
@@ -131,7 +179,9 @@ def on_health_result(manager, node: str, healthy: bool):
             manager.failure_counts[node] = 0
 
             if current is NodeState.STARTING:
-                enter_state(manager, node, NodeState.RECOVERING)
+                event = _transition(
+                    manager, node, NodeState.RECOVERING
+                )
 
             elif current is NodeState.RECOVERING:
                 manager.recovery_counts[node] += 1
@@ -139,14 +189,21 @@ def on_health_result(manager, node: str, healthy: bool):
                 if (
                     manager.recovery_counts[node]
                     >= manager.recovery_threshold
+                    and _recovery_gate_satisfied(manager, node)
                 ):
-                    enter_state(manager, node, NodeState.READY)
+                    event = _transition(
+                        manager, node, NodeState.READY
+                    )
 
             elif current is NodeState.UNHEALTHY:
-                enter_state(manager, node, NodeState.READY)
+                event = _transition(
+                    manager, node, NodeState.READY
+                )
 
             elif current is NodeState.FAILED:
-                enter_state(manager, node, NodeState.RECOVERING)
+                event = _transition(
+                    manager, node, NodeState.RECOVERING
+                )
 
             # READY: already in service, nothing to do.
 
@@ -164,10 +221,17 @@ def on_health_result(manager, node: str, healthy: bool):
             )
 
             if failures >= manager.failure_threshold:
-                enter_state(manager, node, NodeState.FAILED)
+                event = _transition(
+                    manager, node, NodeState.FAILED
+                )
 
             elif current is NodeState.READY:
-                enter_state(manager, node, NodeState.UNHEALTHY)
+                event = _transition(
+                    manager, node, NodeState.UNHEALTHY
+                )
 
             # STARTING / RECOVERING / UNHEALTHY / FAILED:
             # keep waiting for the threshold before changing state.
+
+    if event is not None:
+        fire_listeners(manager, event)

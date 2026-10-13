@@ -8,6 +8,8 @@ from ._components import (
     node_manager,
     distributed_cache,
     cache_service,
+    hot_keys,
+    warmup,
     configure_cluster,
 )
 
@@ -22,5 +24,7 @@ __all__ = [
     "node_manager",
     "distributed_cache",
     "cache_service",
+    "hot_keys",
+    "warmup",
     "configure_cluster",
 ]

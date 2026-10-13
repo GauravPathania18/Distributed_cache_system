@@ -3,6 +3,7 @@ import threading
 from collections import defaultdict
 
 from cluster.consistent_hash import ConsistentHashRing
+from cluster.events import LifecycleEvent, fire_listeners
 from cluster.health_monitor import health_check_loop
 from cluster.node_state import NodeState
 
@@ -23,6 +24,10 @@ class NodeManager:
         - Gate recovering nodes out of the hash ring
         - Add/remove nodes from the hash ring
         - Provide primary + replica node selection
+        - Fire lifecycle events after the lock is released
+          (Layer 6.3: warm-up trigger, later failover hooks)
+        - Hold the optional recovery gate that a RECOVERING
+          node must satisfy before it may become READY
     """
 
     def __init__(
@@ -67,6 +72,16 @@ class NodeManager:
         # Consecutive healthy checks while RECOVERING
         self.recovery_counts = defaultdict(int)
 
+        # LifecycleEvent callbacks (fired after the lock is released)
+        self.listeners = []
+
+        # callback(manager) run after every health pass (post-lock)
+        self.health_hooks = []
+
+        # Optional extra condition(node) -> bool gating
+        # RECOVERING -> READY (None = ungated).
+        self.recovery_gate = None
+
         self.lock = threading.RLock()
 
         from .node_lifecycle import register
@@ -104,6 +119,82 @@ class NodeManager:
 
         return nodes[0]
 
+    def ring_view(self, node: str = None):
+        """
+        Snapshot of the ring, optionally including `node` even when
+        that node is gated out of the live ring (Layer 6.3).
+
+        Build it once per warm-up, then answer many ownership
+        questions against the snapshot - the live ring keeps
+        mutating underneath (health monitor) and must not be read
+        without the lock.
+        """
+
+        with self.lock:
+
+            if node is None:
+                return self.ring.copy()
+
+            return self.ring.with_node(node)
+
+    def expected_primary(self, key: str, node: str):
+        """
+        Who WOULD be the primary for `key` once `node` rejoins
+        (Layer 6.3 ownership check, Section 10 corrected).
+
+        The live ring can never return a gated node, so ownership
+        is computed on a view with `node` included.
+        """
+
+        view = self.ring_view(node)
+
+        nodes = view.get_nodes(key, 1)
+
+        return nodes[0] if nodes else None
+
+    # --------------------------------------------------
+    # LISTENERS + RECOVERY GATE (Layer 6.3)
+    # --------------------------------------------------
+
+    def add_listener(self, callback):
+        """
+        Register for lifecycle events. Callbacks receive a
+        LifecycleEvent and run AFTER the lock is released, so they
+        may safely do HTTP/DB work.
+        """
+
+        with self.lock:
+            self.listeners.append(callback)
+
+    def remove_listener(self, callback):
+
+        with self.lock:
+
+            if callback in self.listeners:
+                self.listeners.remove(callback)
+
+    def add_health_hook(self, callback):
+        """
+        Register callback(manager): runs after every health pass,
+        outside the lock (Layer 6.3 warm-up retries).
+        """
+
+        with self.lock:
+            self.health_hooks.append(callback)
+
+    def set_recovery_gate(self, gate):
+        """
+        Set the extra RECOVERING -> READY condition.
+
+        `gate(node) -> bool` must return True before a RECOVERING
+        node is allowed into the ring (Layer 6.3: warm-up done).
+        None removes the gate. The explicit mark_ready() admin API
+        bypasses it - it is a human override.
+        """
+
+        with self.lock:
+            self.recovery_gate = gate
+
     # --------------------------------------------------
     # LIFECYCLE (Layer 6.1)
     # --------------------------------------------------
@@ -124,6 +215,8 @@ class NodeManager:
 
         from .node_lifecycle import enter_state, register
 
+        event = None
+
         with self.lock:
 
             current = self.node_states.get(node)
@@ -132,9 +225,17 @@ class NodeManager:
                 register(self, node, NodeState.STARTING)
 
             elif current is NodeState.FAILED:
-                enter_state(self, node, NodeState.STARTING)
+                after = enter_state(self, node, NodeState.STARTING)
 
-            return self.node_states[node].value
+                if after is not current:
+                    event = LifecycleEvent(node, current, after)
+
+            result = self.node_states[node].value
+
+        if event is not None:
+            fire_listeners(self, event)
+
+        return result
 
     def mark_recovering(self, node: str) -> str:
         """
@@ -183,12 +284,26 @@ class NodeManager:
 
         from .node_lifecycle import enter_state
 
+        event = None
+
         with self.lock:
 
             if node not in self.node_states:
                 raise ValueError(f"unknown node: {node}")
 
-            return enter_state(self, node, target).value
+            current = self.node_states[node]
+
+            after = enter_state(self, node, target)
+
+            if after is not current:
+                event = LifecycleEvent(node, current, after)
+
+            result = after.value
+
+        if event is not None:
+            fire_listeners(self, event)
+
+        return result
 
     def register_node(self, node: str, initial_state=NodeState.STARTING):
         """

@@ -17,6 +17,15 @@ TIMEOUT = 2
 RECOVERY_THRESHOLD = int(os.environ.get("RECOVERY_THRESHOLD", "2"))
 BOOTSTRAP_STATE = os.environ.get("CLUSTER_BOOTSTRAP_STATE", "starting")
 
+# Layer 6.3 - hot keys + cache warm-up
+WARMUP_ENABLED = os.environ.get(
+    "WARMUP_ENABLED", "on"
+).strip().lower() in ("1", "on", "true", "yes")
+
+WARMUP_LIMIT = int(os.environ.get("WARMUP_LIMIT", "1000"))
+WARMUP_RATE_LIMIT = float(os.environ.get("WARMUP_RATE_LIMIT", "100"))
+HOTKEY_MAX_KEYS = int(os.environ.get("HOTKEY_MAX_KEYS", "10000"))
+
 DEFAULT_DB_PATH = os.environ.get("CACHE_DB_PATH", "data/cache.db")
 
 
