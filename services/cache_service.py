@@ -40,7 +40,8 @@ class CacheService:
         database,
         single_flight: SingleFlight = None,
         circuit_breaker: CircuitBreaker = None,
-        hot_keys: HotKeyManager = None
+        hot_keys: HotKeyManager = None,
+        replication=None
     ):
 
         self.cache = cache
@@ -53,6 +54,10 @@ class CacheService:
         # Layer 6.3 cluster-wide hot-key ranking. Auto-created when
         # not injected so existing constructors keep working.
         self.hot_keys = hot_keys if hot_keys is not None else HotKeyManager()
+
+        # Layer 7.3 - router-side replication coordinator. Optional
+        # so existing constructors/tests keep working without it.
+        self.replication = replication
 
     # --------------------------------------------------
     # GET (cache-aside)
@@ -128,11 +133,26 @@ class CacheService:
 
         self.hot_keys.record(key)
 
+        # Layer 7.3 - allocate a cluster-wide sequence and record the
+        # mutation before fanning out, so a crash mid-write still
+        # leaves the log describing what was intended.
+        sequence = None
+
+        if self.replication is not None:
+            sequence = self.replication.next_sequence()
+
         # Source of truth first (through the circuit breaker).
         self.circuit_breaker.call(self.database.set, key, value)
 
-        # Then the fast copies.
-        nodes = self.cache.set(key, value, ttl=ttl)
+        # Then the fast copies, carrying the sequence.
+        nodes = self.cache.set(key, value, ttl=ttl, sequence=sequence)
+
+        if self.replication is not None:
+
+            self.replication.record(key, "set", value, ttl, sequence)
+
+            for node in nodes:
+                self.replication.ack(node, sequence)
 
         return {
             "key": key,
@@ -148,9 +168,21 @@ class CacheService:
 
         self.hot_keys.record(key)
 
+        sequence = None
+
+        if self.replication is not None:
+            sequence = self.replication.next_sequence()
+
         database_deleted = self.circuit_breaker.call(self.database.delete, key)
 
-        nodes = self.cache.delete(key)
+        nodes = self.cache.delete(key, sequence=sequence)
+
+        if self.replication is not None:
+
+            self.replication.record(key, "delete", None, None, sequence)
+
+            for node in nodes:
+                self.replication.ack(node, sequence)
 
         return {
             "key": key,

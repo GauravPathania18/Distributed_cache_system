@@ -164,11 +164,40 @@ class LRUCache(_LinkedListOps, _CacheStats):
                 del self._loads[key]
                 load_state.done.set()
 
+    def get_entry(self, key: str):
+        """
+        Layer 7.3 - versioned read.
+
+        Returns:
+            (value, sequence) if found and not expired
+            (None, None)      if missing/expired
+
+        Does NOT touch hit/miss statistics - this is the
+        replication/sync view, not the client data path.
+        """
+
+        with self.lock:
+
+            node = self.cache.get(key)
+
+            if node is None:
+                return None, None
+
+            if node.is_expired(time.monotonic()):
+
+                self._remove_node(node)
+                del self.cache[key]
+
+                return None, None
+
+            return node.value, node.sequence
+
     def set(
         self,
         key: str,
         value: Any,
-        ttl: Optional[float] = None
+        ttl: Optional[float] = None,
+        sequence: Optional[int] = None
     ) -> None:
         """
         Insert or update a cache entry.
@@ -185,6 +214,10 @@ class LRUCache(_LinkedListOps, _CacheStats):
 
                 None -> never expires.
                 10   -> expires after 10 seconds.
+
+            sequence:
+                Layer 7.3 - router-assigned replication sequence for
+                this write. None -> unversioned (warm-up bootstrap).
 
         O(1)
         """
@@ -209,6 +242,7 @@ class LRUCache(_LinkedListOps, _CacheStats):
 
                 existing_node.value = value
                 existing_node.expires_at = expires_at
+                existing_node.sequence = sequence
 
                 # Updating an item means it was recently used.
                 self._move_to_front(existing_node)
@@ -222,7 +256,8 @@ class LRUCache(_LinkedListOps, _CacheStats):
             new_node = Node(
                 key=key,
                 value=value,
-                expires_at=expires_at
+                expires_at=expires_at,
+                sequence=sequence
             )
 
             self.cache[key] = new_node

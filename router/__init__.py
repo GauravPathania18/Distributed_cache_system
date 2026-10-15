@@ -14,9 +14,12 @@ _EXPORTS = {
     "configure_cluster": ("._components", "configure_cluster"),
     "database": ("._components", "database"),
     "cache_service": ("._components", "cache_service"),
+    "replication": ("._components", "replication"),
 }
 
-__all__ = ["app", "configure_cluster", "database", "cache_service"]
+__all__ = [
+    "app", "configure_cluster", "database", "cache_service", "replication"
+]
 
 
 def __getattr__(name):

@@ -6,6 +6,7 @@ from cluster.node_state import NodeState
 from database.repository import DatabaseRepository
 from services.cache_service import CacheService
 from services.distributed_cache import DistributedCache
+from services.replication import ReplicationManager
 from services.warmup import CacheWarmup
 
 from .config import (
@@ -21,6 +22,9 @@ from .config import (
     WARMUP_LIMIT,
     WARMUP_RATE_LIMIT,
     HOTKEY_MAX_KEYS,
+    REPLICATION_ENABLED,
+    REPLICATION_LOG_SIZE,
+    SYNC_SNAPSHOT_THRESHOLD,
     nodes_from_env,
 )
 
@@ -51,11 +55,23 @@ distributed_cache = DistributedCache(
 # Layer 6.3 - cluster-wide hot-key ranking (router view).
 hot_keys = HotKeyManager(max_keys=HOTKEY_MAX_KEYS)
 
-# Layer 5 cache-aside policy (also records into hot_keys).
+# Layer 7.3 - replication log + sequence coordinator.
+replication = ReplicationManager(
+    node_manager=node_manager,
+    distributed_cache=distributed_cache,
+    database=database,
+    log_size=REPLICATION_LOG_SIZE,
+    snapshot_threshold=SYNC_SNAPSHOT_THRESHOLD,
+    enabled=REPLICATION_ENABLED
+)
+
+# Layer 5 cache-aside policy (also records into hot_keys +
+# replication log).
 cache_service = CacheService(
     cache=distributed_cache,
     database=database,
-    hot_keys=hot_keys
+    hot_keys=hot_keys,
+    replication=replication
 )
 
 # Layer 6.3 - warm-up service: triggers on RECOVERING, retries on
@@ -72,6 +88,19 @@ warmup = CacheWarmup(
 )
 
 warmup.install()
+
+# Layer 7.3 - replication sync triggers on RECOVERING and retries
+# on each health pass, exactly like warm-up.
+replication.install()
+
+# Layer 6.4 + 7.3 - the recovery gate requires BOTH warm-up done
+# AND replication sync done before a node may leave RECOVERING.
+# Set last so it composes both halves.
+node_manager.set_recovery_gate(
+    lambda node: (
+        warmup.recovery_ready(node) and replication.sync_ready(node)
+    )
+)
 
 
 def configure_cluster(
@@ -96,6 +125,7 @@ def configure_cluster(
     """
 
     global node_manager, distributed_cache, cache_service, hot_keys, warmup
+    global replication
 
     node_manager = NodeManager(
         nodes=nodes,
@@ -117,10 +147,20 @@ def configure_cluster(
 
     hot_keys = HotKeyManager(max_keys=HOTKEY_MAX_KEYS)
 
+    replication = ReplicationManager(
+        node_manager=node_manager,
+        distributed_cache=distributed_cache,
+        database=database,
+        log_size=REPLICATION_LOG_SIZE,
+        snapshot_threshold=SYNC_SNAPSHOT_THRESHOLD,
+        enabled=REPLICATION_ENABLED
+    )
+
     cache_service = CacheService(
         cache=distributed_cache,
         database=database,
-        hot_keys=hot_keys
+        hot_keys=hot_keys,
+        replication=replication
     )
 
     warmup = CacheWarmup(
@@ -135,6 +175,13 @@ def configure_cluster(
     )
 
     warmup.install()
+    replication.install()
+
+    node_manager.set_recovery_gate(
+        lambda node: (
+            warmup.recovery_ready(node) and replication.sync_ready(node)
+        )
+    )
 
     # Sync the names back into the router.router shim so that tests
     # that do `router_module.configure_cluster(...)` followed by
@@ -146,3 +193,4 @@ def configure_cluster(
         router_module.cache_service = cache_service
         router_module.hot_keys = hot_keys
         router_module.warmup = warmup
+        router_module.replication = replication

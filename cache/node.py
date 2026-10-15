@@ -9,6 +9,7 @@ class Node:
         - key
         - value
         - expiration timestamp
+        - replication sequence (Layer 7.3: cluster-wide write order)
         - pointers to previous and next nodes
 
     The prev/next pointers are used by the doubly linked
@@ -19,11 +20,16 @@ class Node:
         self,
         key: str,
         value: Any,
-        expires_at: Optional[float] = None
+        expires_at: Optional[float] = None,
+        sequence: Optional[int] = None
     ):
         self.key = key
         self.value = value
         self.expires_at = expires_at
+
+        # Layer 7.3 - the router-assigned sequence of the write that
+        # produced this entry. None = unversioned (warm-up bootstrap).
+        self.sequence = sequence
 
         self.prev: Optional["Node"] = None
         self.next: Optional["Node"] = None
@@ -45,6 +51,7 @@ class Node:
             f"Node("
             f"key={self.key!r}, "
             f"value={self.value!r}, "
-            f"expires_at={self.expires_at!r}"
+            f"expires_at={self.expires_at!r}, "
+            f"sequence={self.sequence!r}"
             f")"
         )

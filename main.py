@@ -153,6 +153,86 @@ def delete_value(key: str):
 
 
 # ---------------------------------------------------------
+# INTERNAL REPLICATION (Layer 7.2/7.3)
+#
+# The router fans writes out to the primary + replicas through
+# these endpoints. They are deliberately separate from the
+# client /cache API: a replication write is a local apply with a
+# router-assigned sequence and MUST NOT trigger further fan-out.
+# Since cache nodes never talk to each other, replication loops
+# are structurally impossible - this separation is protocol
+# hygiene plus the place version metadata lives.
+# ---------------------------------------------------------
+
+class ReplicationEntry(BaseModel):
+
+    value: Any
+
+    ttl: Optional[int] = Field(default=None, gt=0)
+
+    sequence: Optional[int] = Field(default=None, ge=0)
+
+
+@app.put("/internal/replicate/{key}")
+def internal_replicate(key: str, entry: ReplicationEntry):
+    """Apply one replicated write locally (no fan-out)."""
+
+    cache.set(
+        key,
+        entry.value,
+        ttl=entry.ttl,
+        sequence=entry.sequence
+    )
+
+    statistics.record_set()
+
+    return {
+        "status": "stored",
+        "key": key,
+        "sequence": entry.sequence
+    }
+
+
+@app.delete("/internal/replicate/{key}")
+def internal_delete(key: str):
+    """Apply one replicated delete locally (no fan-out)."""
+
+    statistics.record_delete()
+
+    cache.delete(key)
+
+    # A missing key is not an error here: replication deletes are
+    # idempotent and a replica may already be clean.
+    return {
+        "status": "deleted",
+        "key": key
+    }
+
+
+@app.get("/internal/entry/{key}")
+def internal_entry(key: str):
+    """Versioned read: value + replication sequence."""
+
+    value, sequence = cache.get_entry(key)
+
+    if value is None:
+
+        return {
+            "key": key,
+            "exists": False,
+            "value": None,
+            "sequence": None
+        }
+
+    return {
+        "key": key,
+        "exists": True,
+        "value": value,
+        "sequence": sequence
+    }
+
+
+# ---------------------------------------------------------
 # EXISTS
 # ---------------------------------------------------------
 

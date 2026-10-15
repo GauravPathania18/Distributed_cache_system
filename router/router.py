@@ -10,6 +10,7 @@ from ._components import (
     cache_service,
     hot_keys,
     warmup,
+    replication,
     configure_cluster,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "cache_service",
     "hot_keys",
     "warmup",
+    "replication",
     "configure_cluster",
 ]

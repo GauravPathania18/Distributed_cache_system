@@ -248,6 +248,40 @@ class _CrudMixin:
         finally:
             connection.close()
 
+    def iter_keys(self, batch_size: int = 500):
+        """
+        Layer 7.3 - stream every key without loading them all.
+
+        Snapshot sync and re-replication walk the whole keyspace;
+        a generator keeps memory flat regardless of table size.
+        Yields keys in ORDER BY key order.
+        """
+
+        connection = self._get_connection()
+
+        try:
+
+            cursor = connection.execute(
+                "SELECT key FROM cache_data ORDER BY key"
+            )
+
+            while True:
+
+                rows = cursor.fetchmany(batch_size)
+
+                if not rows:
+                    return
+
+                for row in rows:
+                    yield row["key"]
+
+        except sqlite3.Error as error:
+            raise DatabaseUnavailableError(
+                f"database unavailable during iter_keys: {error}"
+            )
+        finally:
+            connection.close()
+
     def clear(self) -> None:
 
         connection = self._get_connection()

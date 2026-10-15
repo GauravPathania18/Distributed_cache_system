@@ -31,6 +31,14 @@ WARMUP_LIMIT = int(os.environ.get("WARMUP_LIMIT", "1000"))
 WARMUP_RATE_LIMIT = float(os.environ.get("WARMUP_RATE_LIMIT", "100"))
 HOTKEY_MAX_KEYS = int(os.environ.get("HOTKEY_MAX_KEYS", "10000"))
 
+# Layer 7.3 - replication log + sync
+REPLICATION_ENABLED = os.environ.get(
+    "REPLICATION_ENABLED", "on"
+).strip().lower() in ("1", "on", "true", "yes")
+
+REPLICATION_LOG_SIZE = int(os.environ.get("REPLICATION_LOG_SIZE", "10000"))
+SYNC_SNAPSHOT_THRESHOLD = int(os.environ.get("SYNC_SNAPSHOT_THRESHOLD", "1000"))
+
 DEFAULT_DB_PATH = os.environ.get("CACHE_DB_PATH", "data/cache.db")
 
 

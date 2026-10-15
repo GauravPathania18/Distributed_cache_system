@@ -57,12 +57,30 @@ class DistributedCache:
     # SET (replicate to primary + replicas)
     # --------------------------------------------------
 
-    def set(self, key: str, value, ttl=None):
+    def set(
+        self,
+        key: str,
+        value,
+        ttl=None,
+        sequence: int = None
+    ):
+        """
+        Fan one write out to the primary + replicas.
+
+        Uses the node's internal replication endpoint so the write
+        carries the router-assigned sequence (Layer 7.3) and is
+        applied as a local write - nodes never fan out themselves.
+        Best-effort: every node that acknowledges is returned; a
+        node that rejects or times out is simply skipped.
+        """
 
         body = {"value": value}
 
         if ttl is not None:
             body["ttl"] = ttl
+
+        if sequence is not None:
+            body["sequence"] = sequence
 
         successful_nodes = []
 
@@ -71,7 +89,7 @@ class DistributedCache:
             try:
 
                 response = self.session.put(
-                    f"{node}/cache/{key}",
+                    f"{node}/internal/replicate/{key}",
                     json=body,
                     timeout=self.timeout
                 )
@@ -90,7 +108,7 @@ class DistributedCache:
     # DELETE (invalidate primary + replicas)
     # --------------------------------------------------
 
-    def delete(self, key: str):
+    def delete(self, key: str, sequence: int = None):
 
         deleted_from = []
 
@@ -99,7 +117,7 @@ class DistributedCache:
             try:
 
                 response = self.session.delete(
-                    f"{node}/cache/{key}",
+                    f"{node}/internal/replicate/{key}",
                     timeout=self.timeout
                 )
 
@@ -115,17 +133,24 @@ class DistributedCache:
         return deleted_from
 
     # --------------------------------------------------
-    # DIRECT SINGLE-NODE WRITE (Layer 6.3 warm-up)
+    # DIRECT SINGLE-NODE WRITE (Layer 6.3 warm-up / 7.3 sync)
     # --------------------------------------------------
 
-    def write_to_node(self, node: str, key: str, value, ttl=None) -> bool:
+    def write_to_node(
+        self,
+        node: str,
+        key: str,
+        value,
+        ttl=None,
+        sequence: int = None
+    ) -> bool:
         """
         Write `key` to exactly `node`, bypassing ring placement.
 
         A RECOVERING node is gated out of the live ring, so normal
-        set() routing would never reach it - and warm-up has already
-        decided this key belongs there. Returns True when the node
-        acknowledged the write.
+        set() routing would never reach it - and warm-up/sync have
+        already decided this key belongs there. Returns True when
+        the node acknowledged the write.
         """
 
         body = {"value": value}
@@ -133,15 +158,43 @@ class DistributedCache:
         if ttl is not None:
             body["ttl"] = ttl
 
+        if sequence is not None:
+            body["sequence"] = sequence
+
         try:
 
             response = self.session.put(
-                f"{node}/cache/{key}",
+                f"{node}/internal/replicate/{key}",
                 json=body,
                 timeout=self.timeout
             )
 
             return response.status_code == 200
+
+        except requests.RequestException:
+
+            return False
+
+    # --------------------------------------------------
+    # DIRECT SINGLE-NODE DELETE (Layer 7.3 sync of deletes)
+    # --------------------------------------------------
+
+    def delete_from_node(self, node: str, key: str) -> bool:
+        """
+        Delete `key` from exactly `node` (no ring placement).
+
+        Used by replication-log replay to apply a logged DELETE
+        onto a catching-up replica. Missing key = success.
+        """
+
+        try:
+
+            response = self.session.delete(
+                f"{node}/internal/replicate/{key}",
+                timeout=self.timeout
+            )
+
+            return response.status_code in (200, 404)
 
         except requests.RequestException:
 

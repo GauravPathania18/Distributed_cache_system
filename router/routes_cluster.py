@@ -125,6 +125,45 @@ def circuit_breaker_status():
     return _components.cache_service.circuit_breaker_status()
 
 
+# ---------------------------------------------------------
+# LAYER 7.3/7.5 - REPLICATION STATUS + SYNC
+# ---------------------------------------------------------
+
+@app.get("/cluster/replication")
+def cluster_replication_status():
+    """
+    Layer 7.3/7.5 - replication log, per-node ack high-water marks
+    and the last observed failover.
+    """
+
+    return _components.replication.status()
+
+
+@app.post("/cluster/resync/{node:path}")
+def cluster_resync(node: str):
+    """
+    Layer 7.3 - synchronously bring one node's data current.
+
+    Picks the cheaper correct strategy itself: incremental log
+    replay when the node is only a little behind, full DB snapshot
+    when the gap is large or the log rolled over.
+    """
+
+    with _components.node_manager.lock:
+        known = node in _components.node_manager.nodes
+
+    if not known:
+
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown node: {node}"
+        )
+
+    result = _components.replication.sync_node(node)
+
+    return {"node": node, **result}
+
+
 @app.get("/health")
 def health():
 
