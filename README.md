@@ -9,7 +9,8 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 228 tests
+- **Web UI:** http://127.0.0.1:8000/ (vanilla HTML/JS, no build step)
+- **Tests:** pytest — 264 tests
 
 ---
 
@@ -67,6 +68,9 @@ layer that can be emptied and rebuilt at any time.
 | **7.4** | **Failure detection formalized** | **Done** |
 | **7.5** | **Automatic failover (recorded + history)** | **Done** |
 | **7.6** | **Re-replication & rebalancing** | **Done** |
+| **8.1** | **Cached search (query result sets as cache entries)** | **Done** |
+| **8.2** | **Router-side telemetry (DB load reduction metric)** | **Done** |
+| **8.3** | **Web UI — search, dashboard, inspector, cache lab** | **Done** |
 
 ### Layer 6.1 in one paragraph
 
@@ -105,6 +109,29 @@ the source of truth), and a database outage keeps the node in
 `RECOVERING` with retries every health pass — warm-up is an
 optimization, never a correctness blocker.
 
+### Layer 8 in one paragraph
+
+Everything so far has been plumbing; Layer 8 is what you see. A
+vanilla HTML/CSS/JS single-page app is served by the router itself
+at `/` (redirect) and `/ui` — no build step, no npm, no CORS. The
+**Search** view turns the cache into a shopping experience: keyword,
+category, price/rating/stock filters and sorting across products,
+users and orders. Every result set is written through the existing
+cache layer as a `q:` entry with a 300-second TTL, so the second
+identical query is answered from a node in ~0 ms. A banner on every
+result tells you whether it came from `⚡ CACHE` or `🗄 DATABASE`.
+The **Dashboard** view aggregates every node's hit rate (normalized
+to %), the router's own telemetry (`db_reads` vs `db_reads_avoided`),
+the circuit breaker, hot keys and the replication log. The
+**Inspector** reads any key straight from the cache layer and can
+browse a prefix — including the `q:` result sets themselves. The
+**Cache Lab** runs a fixed query N times and charts the cumulative
+cache hits against SQL queries, making the DB-load-reduction number
+visibly obvious (e.g. 20 runs → 1 SQL + 19 cache hits = 95%
+reduction). Telemetry is counted on real operations in
+`services/telemetry.py`, not on HTTP requests, so a single-flight
+coalesced read counts exactly one database hit.
+
 ---
 
 ## Quick start
@@ -134,6 +161,9 @@ uvicorn router.router:app --port 8000
 
 # Watch the cluster come up
 curl http://localhost:8000/cluster/status
+
+# Then open the web UI
+start http://127.0.0.1:8000/
 ```
 
 > Right after the router starts, nodes are gated
@@ -162,11 +192,12 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **228 passed** — 14 cache + 16 consistent hash + 8 router +
+Expected: **264 passed** — 14 cache + 16 consistent hash + 8 router +
 20 repository + 13 cache-service + 11 circuit-breaker + 5
 single-flight + 28 node lifecycle + 14 dataset import +
 15 statistics + 21 warm-up + 10 dataset generator +
-6 config + 13 terminal UI + 34 replication.
+6 config + 13 terminal UI + 34 replication +
+25 search + 7 telemetry + 4 dashboard.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).
