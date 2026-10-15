@@ -58,7 +58,8 @@ DCS/
 │   ├── circuit_breaker.py    <- CLOSED/OPEN/HALF-OPEN DB failure protection
 │   ├── distributed_cache.py  <- data-plane client + write_to_node
 │   ├── single_flight.py      <- request coalescing (leader/follower)
-│   └── warmup.py             <- Layer 6.3: CacheWarmup + rate limiter
+│   ├── warmup.py             <- Layer 6.3: CacheWarmup + rate limiter
+│   └── replication.py        <- Layer 7.3-7.6: sequence/log/sync/repair
 ├── tests/                <- test suite
 │   ├── conftest.py         <- points tests at a throwaway database
 │   ├── test_cache.py
@@ -74,7 +75,8 @@ DCS/
 │   ├── test_import_dataset.py
 │   ├── test_generate_dataset.py
 │   ├── test_config.py
-│   └── test_tui.py
+│   ├── test_tui.py
+│   └── test_replication.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
 ├── datasets/             <- generated sample datasets (gitignored)
@@ -1289,11 +1291,11 @@ curl http://localhost:8000/cache/user:42
 pytest -v
 ```
 
-Expected: **194 tests pass** — 14 cache + 16 consistent hash +
+Expected: **228 tests pass** — 14 cache + 16 consistent hash +
 8 router + 20 repository + 13 cache-service + 11 circuit-breaker +
 5 single-flight + 28 node lifecycle + 14 dataset import +
 15 statistics + 21 warm-up + 10 dataset generator +
-6 config + 13 terminal UI.
+6 config + 13 terminal UI + 34 replication.
 
 ---
 

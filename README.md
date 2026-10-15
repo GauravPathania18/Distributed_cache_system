@@ -9,7 +9,7 @@ recovery when the cluster restarts.
 - **Language / runtime:** Python 3.10+
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
-- **Tests:** pytest — 194 tests
+- **Tests:** pytest — 228 tests
 
 ---
 
@@ -61,12 +61,12 @@ layer that can be emptied and rebuilt at any time.
 | **6.1** | **Node lifecycle: STARTING → RECOVERING → READY → UNHEALTHY → FAILED** | **Done** |
 | **6.2** | **Cache statistics & hot-key tracking** | **Done** |
 | **6.3** | **Hot-key aggregation & cache warm-up (incl. the 6.4 rejoin gate)** | **Done** |
-| 7.1 | Replica selection (placement) | Next |
-| 7.2 | Replicated writes (primary → replicas) | Planned |
-| 7.3 | Replication log, versions & sync | Planned |
-| 7.4 | Failure detection formalized | Planned |
-| 7.5 | Automatic failover | Planned |
-| 7.6 | Re-replication & rebalancing | Planned |
+| **7.1** | **Replica selection (placement)** | **Done** |
+| **7.2** | **Replicated writes (primary → replicas, internal endpoint)** | **Done** |
+| **7.3** | **Replication log, sequence versions & sync** | **Done** |
+| **7.4** | **Failure detection formalized** | **Done** |
+| **7.5** | **Automatic failover (recorded + history)** | **Done** |
+| **7.6** | **Re-replication & rebalancing** | **Done** |
 
 ### Layer 6.1 in one paragraph
 
@@ -162,11 +162,11 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **194 passed** — 14 cache + 16 consistent hash + 8 router +
+Expected: **228 passed** — 14 cache + 16 consistent hash + 8 router +
 20 repository + 13 cache-service + 11 circuit-breaker + 5
 single-flight + 28 node lifecycle + 14 dataset import +
 15 statistics + 21 warm-up + 10 dataset generator +
-6 config + 13 terminal UI.
+6 config + 13 terminal UI + 34 replication.
 
 Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
 `python demo_router.py` (Layer 4/5).

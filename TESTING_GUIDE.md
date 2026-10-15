@@ -5,7 +5,7 @@ Audience: the development team (QA / demo prep / pre-submission checks).
 This is NOT end-user documentation — it tells you exactly which
 commands to run and what output proves each feature works.
 
-Estimated full pass: 45–60 minutes (most of it waiting for
+Estimated full pass: 50–65 minutes (most of it waiting for
 deliberate fault-injection timers). Quick smoke path at the end:
 ~8 minutes.
 
@@ -89,7 +89,7 @@ Fastest signal that nothing regressed. No servers needed.
 pytest -q
 ```
 
-Expected: **194 passed** in ~25s, no failures, no errors.
+Expected: **228 passed** in ~25s, no failures, no errors.
 
 Breakdown (for pinpointing a regression):
 
@@ -109,8 +109,9 @@ Breakdown (for pinpointing a regression):
 | Dataset generator | 10 | `pytest tests/test_generate_dataset.py -v` |
 | Node URL config | 6 | `pytest tests/test_config.py -v` |
 | Terminal UI logic | 13 | `pytest tests/test_tui.py -v` |
+| Replication (7.2-7.6) | 34 | `pytest tests/test_replication.py -v` |
 
-**Pass criteria:** 194 passed, 0 failed. Any other count means a
+**Pass criteria:** 228 passed, 0 failed. Any other count means a
 lost/added test — diff against this table before suspecting the code.
 
 **Data-safety check after the run** (proves tests are hermetic):
@@ -889,13 +890,101 @@ tests/test_generate_dataset.py -v` (24 tests).
 
 ---
 
-## 10. Master checklist
+## 10. Phase 9 — Replication & failover (Layer 7)
+
+Verifies the sequence-numbered write path, the replication log,
+manual sync and the recorded failover. With the 4-terminal cluster
+running (Phase 4):
+
+### 10.1 Replication status
+
+```powershell
+curl.exe http://127.0.0.1:8000/cluster/replication
+```
+
+Expected shape:
+
+```json
+{
+  "enabled": true,
+  "current_sequence": 0,
+  "log_size": 0,
+  "log_capacity": 10000,
+  "snapshot_threshold": 1000,
+  "nodes": { ... },
+  "last_failover": null,
+  "failovers": [],
+  "syncs": {}
+}
+```
+
+### 10.2 A write carries a sequence and is acknowledged
+
+```powershell
+curl.exe -X PUT "http://127.0.0.1:8000/cache/user:77" -H "Content-Type: application/json" -d "{\"value\":\"seq-check\",\"ttl\":60}"
+curl.exe http://127.0.0.1:8000/cluster/replication
+```
+
+Expected: `current_sequence` increments by 1 (1, 2, 3… as you issue
+writes) and every node listed in the PUT response shows
+`acked_sequence` equal to `current_sequence`, `behind: 0`.
+
+The value itself is versioned on the node:
+
+```powershell
+curl.exe "http://127.0.0.1:8001/internal/entry/user:77"
+```
+
+Expected: `{"key":"user:77","exists":true,"value":"seq-check","sequence":<n>}`
+
+### 10.3 Manual resync + 404
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/cluster/resync/http%3A%2F%2F127.0.0.1%3A8001"
+
+# Unknown node -> 404
+curl.exe -X POST "http://127.0.0.1:8000/cluster/resync/http%3A%2F%2F9999"
+```
+
+Expected: first returns `"state":"done"` with `"mode"` either
+`incremental` (small gap, log replay) or `snapshot` (never acked /
+large gap, DB pull); the unknown node returns HTTP 404.
+
+### 10.4 Kill a node — failover is recorded
+
+1. `Ctrl+C` the terminal running node 8002. Wait for `[NODE FAILED]`.
+
+```powershell
+curl.exe http://127.0.0.1:8000/cluster/replication
+curl.exe http://127.0.0.1:8000/cluster/status
+```
+
+Expected: `last_failover.node` is `http://127.0.0.1:8002`,
+`failovers` has one entry (and grows on each failure, capped at 50),
+`/cluster/status` shows `active: 2/3`.
+
+Re-replication runs automatically in the background: the keys the
+dead node carried are rewritten onto their new owners so redundancy
+returns to the configured replication factor. The automated suite
+proves this precisely
+(`tests/test_replication.py::test_repair_restores_ownership_after_failure`).
+
+2. Restart it: `python main.py --port 8002 --capacity 100` — it
+rejoins gated (RECOVERING) as in Phase 7.
+
+Pass criteria: sequence increments per write → acked on the writing
+nodes → resync reports `done`, unknown node 404 → kill 8002 records
+`last_failover` and `failovers` history.
+
+---
+
+## 11. Master checklist
 
 Copy this table into the session notes and tick every row.
 
 | # | Feature | Phase | Pass criteria |
 |---|---|---|---|
-| 1 | Test suite green | 0 | 194 passed |
+| 1 | Test suite green | 0 | 228 passed |
 | 2 | Tests are hermetic | 0 | DB rows still 3000 after pytest |
 | 3 | Layer 1 demo | 1 | `demo.py` completes |
 | 4 | Consistent hash demo | 1 | `demo_hash.py` prints ring + mapping |
@@ -939,16 +1028,22 @@ Copy this table into the session notes and tick every row.
 | 42 | Import dry-run | 8 | validates, writes nothing |
 | 43 | Import full | 8 | rows: 3000, keys `o-000001…` |
 | 44 | Imported data served | 8 | cache-aside works on user:42 |
+| 45 | /cluster/replication status | 9 | sequence, nodes, empty failovers |
+| 46 | Write bumps sequence + acks | 9 | acked == current, behind 0 |
+| 47 | Node entry carries sequence | 9 | `/internal/entry` shows sequence |
+| 48 | Manual resync + 404 | 9 | done; unknown node 404 |
+| 49 | Failover recorded on kill | 9 | last_failover + history, 2/3 |
+| 50 | Replication unit tests | 0 | 34 replication tests pass |
 
-Result: ___/44 passed  |  Date: ______  |  Tester: ______
+Result: ___/50 passed  |  Date: ______  |  Tester: ______
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `pytest`: 195+ or <194 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
+| `pytest`: 229+ or <228 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
 | Port already in use | leftover process from a crashed session | `Get-NetTCPConnection -LocalPort 8000 -State Listen` → note `OwningProcess` → `Stop-Process -Id <pid> -F` |
 | TUI stuck at `waiting for 3 node(s)` | a node window failed to start | check the three node windows for tracebacks; `Ctrl+C` the TUI and restart |
 | PUT returns 503 right after boot | gated startup — nodes still `starting/recovering` | wait for `/cluster/status` to list them as `ready` (~5s) — expected behavior |
@@ -963,7 +1058,7 @@ Result: ___/44 passed  |  Date: ______  |  Tester: ______
 
 ---
 
-## 12. Cleanup
+## 13. Cleanup
 
 End of session — all of it takes <30s:
 
@@ -996,7 +1091,7 @@ taskkill /F /IM python.exe /FI "WINDOWTITLE eq *main.py*"
 
 For a fast "is it basically alive?" check between larger changes:
 
-1. `pytest -q` → 194 passed (Phase 0)
+1. `pytest -q` → 228 passed (Phase 0)
 2. `python tui.py` → `active: 3/3` (Phase 3.1)
 3. TUI `3` → `user:42` twice → `database` then `cache`
 4. TUI `6` → `user:42` → `CONSISTENT`
