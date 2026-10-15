@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCS — Distributed Cache Search</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">DCS</span>
+    <span class="tagline">Distributed Cache &mdash; search that pays for itself</span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button data-view="search"    class="tab active">Search</button>
+    <button data-view="dashboard" class="tab">Cache Dashboard</button>
+    <button data-view="inspector" class="tab">Key Inspector</button>
+    <button data-view="lab"       class="tab">Cache Lab</button>
+  </nav>
+  <div class="cluster-pill" id="clusterPill" title="Live node states">
+    <span class="dot" id="clusterDot"></span>
+    <span id="clusterText">connecting&hellip;</span>
+  </div>
+</header>
+
+<main>
+
+<!-- ================= SEARCH ================= -->
+<section id="view-search" class="view active">
+  <div class="search-hero">
+    <div class="entity-switch" id="entitySwitch"></div>
+    <form class="search-bar" id="searchForm">
+      <input type="search" id="q" placeholder="Search products&hellip;" autocomplete="off">
+      <button type="submit" class="btn primary">Search</button>
+      <button type="button" class="btn ghost" id="clearBtn">Clear</button>
+    </form>
+  </div>
+
+  <div class="search-layout">
+    <aside class="facets" id="facets"></aside>
+
+    <div class="results-col">
+      <div class="cache-status" id="cacheStatus"></div>
+      <div class="results-meta" id="resultsMeta"></div>
+      <div class="results-grid" id="results"></div>
+      <div class="pager" id="pager"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= DASHBOARD ================= -->
+<section id="view-dashboard" class="view">
+  <div class="stat-cards" id="statCards"></div>
+  <div class="dash-grid">
+    <div class="panel">
+      <h3>Cache tier hit rate (all nodes, lifetime)</h3>
+      <div id="hitRateBars"></div>
+    </div>
+    <div class="panel">
+      <h3>Reads &mdash; where they were served</h3>
+      <div id="sourceDonut" class="donut-wrap"></div>
+    </div>
+    <div class="panel wide">
+      <h3>Hottest keys (live)</h3>
+      <table class="table" id="hotKeysTable"></table>
+    </div>
+    <div class="panel">
+      <h3>Cluster nodes</h3>
+      <div id="nodeStates"></div>
+    </div>
+    <div class="panel">
+      <h3>Circuit breaker &amp; replication</h3>
+      <div id="breakerRepl"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= INSPECTOR ================= -->
+<section id="view-inspector" class="view">
+  <div class="panel">
+    <h3>Single-key lookup &mdash; see what the cache layer saves</h3>
+    <form class="search-bar" id="inspectForm">
+      <input type="text" id="inspectKey" placeholder="e.g. product:p-000001 or user:42" autocomplete="off">
+      <button type="submit" class="btn primary">Lookup</button>
+      <button type="button" class="btn danger" id="inspectDelete">Delete key</button>
+    </form>
+    <div class="inspect-compare" id="inspectCompare"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Browse keys by prefix <span class="muted">(uncached &mdash; always live)</span></h3>
+    <form class="search-bar" id="browseForm">
+      <input type="text" id="browsePrefix" placeholder="prefix, e.g. product:" value="product:">
+      <input type="number" id="browseLimit" value="25" min="1" max="500" class="narrow">
+      <button type="submit" class="btn primary">Browse</button>
+    </form>
+    <div id="browseOut"></div>
+  </div>
+</section>
+
+<!-- ================= CACHE LAB ================= -->
+<section id="view-lab" class="view">
+  <div class="panel">
+    <h3>Cache Lab &mdash; prove the database load drops</h3>
+    <p class="muted">
+      Fire the same search N times. The first run touches SQLite; every
+      repeat is served from the cache cluster. Watch the two counters
+      diverge &mdash; that gap <em>is</em> the load this system took off the database.
+    </p>
+    <form class="search-bar" id="labForm">
+      <input type="text" id="labQuery" value="electronics" placeholder="query">
+      <input type="number" id="labCount" value="40" min="1" max="500" class="narrow" title="repetitions">
+      <input type="number" id="labDelay" value="25" min="0" max="1000" class="narrow" title="delay ms between requests">
+      <button type="submit" class="btn primary" id="labRun">Run</button>
+      <button type="button" class="btn ghost" id="labReset">Reset counters</button>
+    </form>
+    <div class="lab-stats" id="labStats"></div>
+    <div id="labChart"></div>
+    <div class="lab-feed" id="labFeed"></div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <span>Layer 8 &mdash; every unique query is a cache entry, written through the
+  same write-through path as any other key (DB row + fan-out + replication).</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
