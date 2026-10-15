@@ -42,24 +42,31 @@ DCS/
 │   ├── node_state.py        <- NodeState enum + transition table
 │   ├── node_lifecycle.py    <- STARTING/RECOVERING/READY/... logic
 │   └── node_activation.py   <- legacy Layer 4 wrappers
-├── router/               <- Layers 4-5: replication-aware + cache-aside router
+├── router/               <- Layers 4-5 + 8: replication-aware + cache-aside router
 │   ├── __init__.py
 │   ├── app.py / config.py / models.py
 │   ├── routes_cache.py / routes_cluster.py / routes_db.py
+│   ├── routes_search.py / routes_dashboard.py / routes_static.py  <- Layer 8
 │   ├── _components.py       <- shared database / node_manager / services
 │   └── router.py            <- public re-export shim
 ├── database/             <- Layer 5: SQLite source of truth
 │   ├── __init__.py
 │   ├── exceptions.py         <- DatabaseUnavailableError
 │   └── repository.py
-├── services/             <- Layer 5 + 6.3: cache-aside orchestration
+├── services/             <- Layer 5 + 6.3 + 7 + 8: orchestration
 │   ├── __init__.py
 │   ├── cache_service.py      <- cache-aside policy + stampede protection
 │   ├── circuit_breaker.py    <- CLOSED/OPEN/HALF-OPEN DB failure protection
 │   ├── distributed_cache.py  <- data-plane client + write_to_node
 │   ├── single_flight.py      <- request coalescing (leader/follower)
 │   ├── warmup.py             <- Layer 6.3: CacheWarmup + rate limiter
-│   └── replication.py        <- Layer 7.3-7.6: sequence/log/sync/repair
+│   ├── replication.py        <- Layer 7.3-7.6: sequence/log/sync/repair
+│   ├── search.py             <- Layer 8.1: keyword/facet search over cache
+│   └── telemetry.py          <- Layer 8.2: DB-load-reduction counters
+├── frontend/             <- Layer 8.3: vanilla SPA served by the router
+│   ├── index.html            <- four tabs: Search/Dashboard/Inspector/Lab
+│   ├── style.css
+│   └── app.js
 ├── tests/                <- test suite
 │   ├── conftest.py         <- points tests at a throwaway database
 │   ├── test_cache.py
@@ -76,7 +83,10 @@ DCS/
 │   ├── test_generate_dataset.py
 │   ├── test_config.py
 │   ├── test_tui.py
-│   └── test_replication.py
+│   ├── test_replication.py
+│   ├── test_search.py
+│   ├── test_telemetry.py
+│   └── test_dashboard.py
 ├── data/                 <- generated SQLite DB (gitignored)
 │   └── cache.db
 ├── datasets/             <- generated sample datasets (gitignored)
@@ -1285,17 +1295,110 @@ curl http://localhost:8000/cache/user:42
 
 ---
 
+## Layer 8 — Web UI & Cached Search
+
+Everything below assumes the Layer 4 setup is running (3 nodes on
+8001-8003, router on 8000) with the dataset loaded.
+
+### Open the web UI
+
+The router serves a vanilla HTML/CSS/JS single-page app — no build
+step, no npm. It is mounted at `/ui` and `/` redirects there.
+
+```powershell
+start http://127.0.0.1:8000/
+```
+
+Four tabs:
+
+| Tab | What it does |
+|-----|--------------|
+| **Search** | Keyword + facet search over products / users / orders. |
+| **Dashboard** | Cluster hit rates, telemetry, hot keys, replication log. |
+| **Inspector** | Read any key from the cache layer vs the database. |
+| **Cache Lab** | Run one query N times and watch DB load drop. |
+
+### Search endpoints
+
+```powershell
+# Entities the search layer understands
+curl http://127.0.0.1:8000/search/entities
+
+# Keyword search — first run hits the database, the repeat is cached
+curl "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc&page_size=8"
+curl "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc&page_size=8"
+
+# Faceted filters
+curl "http://127.0.0.1:8000/search/products?category=electronics&price_min=100&price_max=400&rating_min=4&instock=true"
+
+# Other entities
+curl "http://127.0.0.1:8000/search/users?city=Mumbai&active=true"
+curl "http://127.0.0.1:8000/search/orders?status=delivered&sort=total&dir=desc"
+
+# Autocomplete suggestions (cached separately)
+curl "http://127.0.0.1:8000/search/products/suggest?field=category&q=ele"
+
+# Browse what the search layer has cached (the q: result sets)
+curl "http://127.0.0.1:8000/browse/prefix?prefix=q:&limit=10"
+```
+
+Every search response carries `source` (`database` | `cache`),
+`cache_key`, `took_ms` and `db_took_ms`. The UI shows this as a
+banner on each result set.
+
+### Telemetry (DB load reduction)
+
+Counters live in `services/telemetry.py` and are incremented on
+**real operations**, not on HTTP requests — a single-flight coalesced
+read counts exactly one database hit.
+
+```powershell
+# Current counters
+curl http://127.0.0.1:8000/dashboard/aggregate | python -m json.tool
+
+# Reset before a demo
+curl -X POST http://127.0.0.1:8000/dashboard/telemetry/reset
+```
+
+### The Cache Lab demo
+
+1. Open `http://127.0.0.1:8000/` → **Cache Lab** tab.
+2. Pick an entity + query, set iterations to 20, press **Run**.
+3. The chart plots cumulative cache hits vs SQL queries.
+
+Expected shape: **1 database run, 19 cache hits → 95% DB load
+reduction**, with the SQL count flat-lining after the first run.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SEARCH_TTL` | `300` | Seconds a `q:` result set stays in cache. |
+| `SEARCH_PAGE_SIZE_DEFAULT` | `20` | Default page size. |
+| `SEARCH_PAGE_SIZE_MAX` | `100` | Hard cap — anything larger is clamped. |
+
+### Layer 8 tests
+
+```powershell
+pytest tests/test_search.py tests/test_telemetry.py tests/test_dashboard.py -v
+```
+
+36 tests: 25 search + 7 telemetry + 4 dashboard.
+
+---
+
 ## Full test run
 
 ```powershell
 pytest -v
 ```
 
-Expected: **228 tests pass** — 14 cache + 16 consistent hash +
+Expected: **264 tests pass** — 14 cache + 16 consistent hash +
 8 router + 20 repository + 13 cache-service + 11 circuit-breaker +
 5 single-flight + 28 node lifecycle + 14 dataset import +
 15 statistics + 21 warm-up + 10 dataset generator +
-6 config + 13 terminal UI + 34 replication.
+6 config + 13 terminal UI + 34 replication +
+25 search + 7 telemetry + 4 dashboard.
 
 ---
 
