@@ -5,7 +5,7 @@ Audience: the development team (QA / demo prep / pre-submission checks).
 This is NOT end-user documentation — it tells you exactly which
 commands to run and what output proves each feature works.
 
-Estimated full pass: 50–65 minutes (most of it waiting for
+Estimated full pass: 55–70 minutes (most of it waiting for
 deliberate fault-injection timers). Quick smoke path at the end:
 ~8 minutes.
 
@@ -89,7 +89,7 @@ Fastest signal that nothing regressed. No servers needed.
 pytest -q
 ```
 
-Expected: **228 passed** in ~25s, no failures, no errors.
+Expected: **264 passed** in ~30s, no failures, no errors.
 
 Breakdown (for pinpointing a regression):
 
@@ -110,8 +110,11 @@ Breakdown (for pinpointing a regression):
 | Node URL config | 6 | `pytest tests/test_config.py -v` |
 | Terminal UI logic | 13 | `pytest tests/test_tui.py -v` |
 | Replication (7.2-7.6) | 34 | `pytest tests/test_replication.py -v` |
+| Cached search (8.1) | 25 | `pytest tests/test_search.py -v` |
+| Telemetry / DB-load metric (8.2) | 7 | `pytest tests/test_telemetry.py -v` |
+| Dashboard + web UI (8.3) | 4 | `pytest tests/test_dashboard.py -v` |
 
-**Pass criteria:** 228 passed, 0 failed. Any other count means a
+**Pass criteria:** 264 passed, 0 failed. Any other count means a
 lost/added test — diff against this table before suspecting the code.
 
 **Data-safety check after the run** (proves tests are hermetic):
@@ -978,13 +981,93 @@ nodes → resync reports `done`, unknown node 404 → kill 8002 records
 
 ---
 
-## 11. Master checklist
+## 11. Phase 10 — Web UI & search caching (Layer 8)
+
+Verifies the vanilla-JS web UI served by the router and the
+cached-search path that is Layer 8's headline claim. With the
+4-terminal cluster running (Phase 4) and the dataset loaded
+(Phase 8):
+
+### 11.1 The UI is served by the router
+
+```powershell
+curl.exe -I http://127.0.0.1:8000/
+curl.exe -s http://127.0.0.1:8000/ui | Select-String "<title>"
+```
+
+Expected: `/` answers **307** and redirects to `/ui`; `/ui` answers
+**200** with the SPA HTML. `/ui/style.css` and `/ui/app.js` also
+answer 200. There is no build step — the files under `frontend/`
+are served as-is.
+
+### 11.2 Search runs SQL once, then serves from cache
+
+```powershell
+curl.exe "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc"
+curl.exe "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc"
+```
+
+Expected: the **first** response carries `"source":"database"` and
+a non-zero `took_ms`; the **repeat** carries `"source":"cache"`,
+a `"node"` URL and `took_ms` near zero. Both share the same
+`cache_key` (starting `q:products:`). The UI shows this as a
+`🗄 DATABASE` → `⚡ CACHE` banner flip on the same query.
+
+### 11.3 Facets, sorting and the other entities
+
+```powershell
+curl.exe "http://127.0.0.1:8000/search/products?category=electronics&price_min=100&price_max=400&rating_min=4&instock=true"
+curl.exe "http://127.0.0.1:8000/search/users?city=Mumbai&active=true"
+curl.exe "http://127.0.0.1:8000/search/orders?status=delivered&sort=total&dir=desc"
+```
+
+Expected: each returns 200 with a `total` that only counts matching
+rows; every item in `items` satisfies every filter. An unknown
+entity (`/search/aliens`) returns **422**, and an injected sort
+(`sort=price;DROP`) is silently rejected by the whitelist (falls
+back to the default sort, nothing breaks).
+
+### 11.4 Telemetry proves the load reduction
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/dashboard/telemetry/reset
+# ... run the same search ~10 times ...
+curl.exe -s http://127.0.0.1:8000/dashboard/aggregate
+```
+
+Expected inside `telemetry`: `search_database` stays at **1**,
+`search_cache` climbs to **9**, and `db_load_reduction_pct` reads
+**90.0**. The counters count real operations — a single-flight
+coalesced read is exactly one database hit, not one per request.
+
+### 11.5 The UI end-to-end
+
+Open `http://127.0.0.1:8000/` and walk the four tabs:
+
+1. **Search** — run a query twice; watch the source banner flip
+   amber → green. Toggle a facet; the chips update.
+2. **Dashboard** — every node's hit rate is 0–100, the telemetry
+   panel matches the curl numbers, hot keys are listed.
+3. **Inspector** — enter `user:42`; cache and DB values agree.
+   Browse the prefix `q:` to see the cached result sets themselves.
+4. **Cache Lab** — pick a query, iterations = 20, press **Run**.
+   The cumulative chart shows 1 SQL run then a flat line, with
+   `95.0%` (or thereabouts) reduction displayed.
+
+Pass criteria: UI served at `/ui`, first search `database` then
+`cache`, facets filter correctly, telemetry shows `search_cache`
+climbing while `search_database` stays at 1, and the Cache Lab
+chart visibly plateaus.
+
+---
+
+## 12. Master checklist
 
 Copy this table into the session notes and tick every row.
 
 | # | Feature | Phase | Pass criteria |
 |---|---|---|---|
-| 1 | Test suite green | 0 | 228 passed |
+| 1 | Test suite green | 0 | 264 passed |
 | 2 | Tests are hermetic | 0 | DB rows still 3000 after pytest |
 | 3 | Layer 1 demo | 1 | `demo.py` completes |
 | 4 | Consistent hash demo | 1 | `demo_hash.py` prints ring + mapping |
@@ -1034,16 +1117,22 @@ Copy this table into the session notes and tick every row.
 | 48 | Manual resync + 404 | 9 | done; unknown node 404 |
 | 49 | Failover recorded on kill | 9 | last_failover + history, 2/3 |
 | 50 | Replication unit tests | 0 | 34 replication tests pass |
+| 51 | UI served at /ui | 10 | `/` 307 redirect, `/ui` 200 HTML |
+| 52 | Search SQL then cache | 10 | 1st `database`, repeat `cache` |
+| 53 | Facets + entity filters | 10 | total only counts matching rows |
+| 54 | Unknown entity / bad sort | 10 | 422 / silent fallback, no crash |
+| 55 | Telemetry load reduction | 10 | `search_database` stays 1 |
+| 56 | Cache Lab demo | 10 | chart plateaus, ~95% reduction |
 
-Result: ___/50 passed  |  Date: ______  |  Tester: ______
+Result: ___/56 passed  |  Date: ______  |  Tester: ______
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `pytest`: 229+ or <228 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
+| `pytest`: 265+ or <264 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
 | Port already in use | leftover process from a crashed session | `Get-NetTCPConnection -LocalPort 8000 -State Listen` → note `OwningProcess` → `Stop-Process -Id <pid> -F` |
 | TUI stuck at `waiting for 3 node(s)` | a node window failed to start | check the three node windows for tracebacks; `Ctrl+C` the TUI and restart |
 | PUT returns 503 right after boot | gated startup — nodes still `starting/recovering` | wait for `/cluster/status` to list them as `ready` (~5s) — expected behavior |
@@ -1058,7 +1147,7 @@ Result: ___/50 passed  |  Date: ______  |  Tester: ______
 
 ---
 
-## 13. Cleanup
+## 14. Cleanup
 
 End of session — all of it takes <30s:
 
@@ -1091,12 +1180,14 @@ taskkill /F /IM python.exe /FI "WINDOWTITLE eq *main.py*"
 
 For a fast "is it basically alive?" check between larger changes:
 
-1. `pytest -q` → 228 passed (Phase 0)
+1. `pytest -q` → 264 passed (Phase 0)
 2. `python tui.py` → `active: 3/3` (Phase 3.1)
 3. TUI `3` → `user:42` twice → `database` then `cache`
 4. TUI `6` → `user:42` → `CONSISTENT`
 5. TUI `8` → `SELECT COUNT(*) FROM cache_data` → `3000`
 6. TUI `0` → ports free
+7. `start http://127.0.0.1:8000/` → UI loads; search twice → banner flips
+   (Phase 10)
 
-If those six pass, the core (cluster + cache-aside + DB + TUI)
-is healthy; run the full guide before a release or demo.
+If those seven pass, the core (cluster + cache-aside + DB + TUI +
+web UI) is healthy; run the full guide before a release or demo.
