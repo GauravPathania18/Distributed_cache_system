@@ -39,6 +39,17 @@ REPLICATION_ENABLED = os.environ.get(
 REPLICATION_LOG_SIZE = int(os.environ.get("REPLICATION_LOG_SIZE", "10000"))
 SYNC_SNAPSHOT_THRESHOLD = int(os.environ.get("SYNC_SNAPSHOT_THRESHOLD", "1000"))
 
+# Layer 8 - cached search + web UI
+SEARCH_TTL = int(os.environ.get("SEARCH_TTL", "300"))
+SEARCH_PAGE_SIZE_DEFAULT = int(os.environ.get("SEARCH_PAGE_SIZE", "20"))
+SEARCH_PAGE_SIZE_MAX = int(os.environ.get("SEARCH_PAGE_SIZE_MAX", "100"))
+
+FRONTEND_DIR = os.environ.get(
+    "FRONTEND_DIR", os.path.join(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    ), "frontend")
+)
+
 DEFAULT_DB_PATH = os.environ.get("CACHE_DB_PATH", "data/cache.db")
 
 

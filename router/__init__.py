@@ -15,10 +15,13 @@ _EXPORTS = {
     "database": ("._components", "database"),
     "cache_service": ("._components", "cache_service"),
     "replication": ("._components", "replication"),
+    "telemetry": ("._components", "telemetry"),
+    "search_service": ("._components", "search_service"),
 }
 
 __all__ = [
-    "app", "configure_cluster", "database", "cache_service", "replication"
+    "app", "configure_cluster", "database", "cache_service",
+    "replication", "telemetry", "search_service",
 ]
 
 

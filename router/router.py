@@ -11,6 +11,8 @@ from ._components import (
     hot_keys,
     warmup,
     replication,
+    telemetry,
+    search_service,
     configure_cluster,
 )
 
@@ -18,6 +20,11 @@ from ._components import (
 from . import routes_cache  # noqa: F401
 from . import routes_db  # noqa: F401
 from . import routes_cluster  # noqa: F401
+from . import routes_search  # noqa: F401
+from . import routes_dashboard  # noqa: F401
+
+# Static last: its mount is registered after every API route.
+from . import routes_static  # noqa: F401
 
 __all__ = [
     "app",
@@ -28,5 +35,7 @@ __all__ = [
     "hot_keys",
     "warmup",
     "replication",
+    "telemetry",
+    "search_service",
     "configure_cluster",
 ]

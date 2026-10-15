@@ -4,6 +4,7 @@ from cache.hot_keys import HotKeyManager
 from database.exceptions import DatabaseUnavailableError
 from services.circuit_breaker import CircuitBreaker
 from services.single_flight import SingleFlight
+from services.telemetry import RequestTelemetry
 
 
 class CacheService:
@@ -41,7 +42,8 @@ class CacheService:
         single_flight: SingleFlight = None,
         circuit_breaker: CircuitBreaker = None,
         hot_keys: HotKeyManager = None,
-        replication=None
+        replication=None,
+        telemetry: RequestTelemetry = None
     ):
 
         self.cache = cache
@@ -58,6 +60,12 @@ class CacheService:
         # Layer 7.3 - router-side replication coordinator. Optional
         # so existing constructors/tests keep working without it.
         self.replication = replication
+
+        # Layer 8 - cache-vs-database read accounting. Optional for
+        # the same reason.
+        self.telemetry = (
+            telemetry if telemetry is not None else RequestTelemetry()
+        )
 
     # --------------------------------------------------
     # GET (cache-aside)
@@ -76,6 +84,8 @@ class CacheService:
         value, node = self.cache.get(key)
 
         if value is not None:
+
+            self.telemetry.record_get("cache")
 
             return {
                 "value": value,
@@ -98,6 +108,8 @@ class CacheService:
 
         if value is not None:
 
+            self.telemetry.record_get("cache")
+
             return {
                 "value": value,
                 "source": "cache",
@@ -114,10 +126,14 @@ class CacheService:
 
         if db_value is None:
 
+            self.telemetry.record_get("miss")
+
             return None
 
         # 3. Populate the cache with the database result.
         self.cache.set(key, db_value)
+
+        self.telemetry.record_get("database")
 
         return {
             "value": db_value,
@@ -154,6 +170,8 @@ class CacheService:
             for node in nodes:
                 self.replication.ack(node, sequence)
 
+        self.telemetry.record_set()
+
         return {
             "key": key,
             "stored_in_database": True,
@@ -183,6 +201,8 @@ class CacheService:
 
             for node in nodes:
                 self.replication.ack(node, sequence)
+
+        self.telemetry.record_delete()
 
         return {
             "key": key,

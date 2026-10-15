@@ -7,6 +7,8 @@ from database.repository import DatabaseRepository
 from services.cache_service import CacheService
 from services.distributed_cache import DistributedCache
 from services.replication import ReplicationManager
+from services.search import SearchService
+from services.telemetry import RequestTelemetry
 from services.warmup import CacheWarmup
 
 from .config import (
@@ -25,6 +27,9 @@ from .config import (
     REPLICATION_ENABLED,
     REPLICATION_LOG_SIZE,
     SYNC_SNAPSHOT_THRESHOLD,
+    SEARCH_TTL,
+    SEARCH_PAGE_SIZE_DEFAULT,
+    SEARCH_PAGE_SIZE_MAX,
     nodes_from_env,
 )
 
@@ -65,13 +70,30 @@ replication = ReplicationManager(
     enabled=REPLICATION_ENABLED
 )
 
+# Layer 8 - cache-vs-database read accounting.
+telemetry = RequestTelemetry()
+
 # Layer 5 cache-aside policy (also records into hot_keys +
-# replication log).
+# replication log + telemetry).
 cache_service = CacheService(
     cache=distributed_cache,
     database=database,
     hot_keys=hot_keys,
-    replication=replication
+    replication=replication,
+    telemetry=telemetry
+)
+
+# Layer 8 - cached search: every unique query is a cache entry.
+search_service = SearchService(
+    cache_service=cache_service,
+    distributed_cache=distributed_cache,
+    single_flight=cache_service.single_flight,
+    circuit_breaker=cache_service.circuit_breaker,
+    database=database,
+    telemetry=telemetry,
+    ttl=SEARCH_TTL,
+    page_size_default=SEARCH_PAGE_SIZE_DEFAULT,
+    page_size_max=SEARCH_PAGE_SIZE_MAX
 )
 
 # Layer 6.3 - warm-up service: triggers on RECOVERING, retries on
@@ -125,7 +147,7 @@ def configure_cluster(
     """
 
     global node_manager, distributed_cache, cache_service, hot_keys, warmup
-    global replication
+    global replication, telemetry, search_service
 
     node_manager = NodeManager(
         nodes=nodes,
@@ -156,11 +178,26 @@ def configure_cluster(
         enabled=REPLICATION_ENABLED
     )
 
+    telemetry = RequestTelemetry()
+
     cache_service = CacheService(
         cache=distributed_cache,
         database=database,
         hot_keys=hot_keys,
-        replication=replication
+        replication=replication,
+        telemetry=telemetry
+    )
+
+    search_service = SearchService(
+        cache_service=cache_service,
+        distributed_cache=distributed_cache,
+        single_flight=cache_service.single_flight,
+        circuit_breaker=cache_service.circuit_breaker,
+        database=database,
+        telemetry=telemetry,
+        ttl=SEARCH_TTL,
+        page_size_default=SEARCH_PAGE_SIZE_DEFAULT,
+        page_size_max=SEARCH_PAGE_SIZE_MAX
     )
 
     warmup = CacheWarmup(
@@ -194,3 +231,5 @@ def configure_cluster(
         router_module.hot_keys = hot_keys
         router_module.warmup = warmup
         router_module.replication = replication
+        router_module.telemetry = telemetry
+        router_module.search_service = search_service
