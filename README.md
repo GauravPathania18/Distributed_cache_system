@@ -185,6 +185,8 @@ python import_dataset.py --file users.csv --prefix user:
 
 Full command reference, curl examples and live fault-tolerance
 walkthroughs live in [`commands.md`](commands.md).
+For the internal file-by-file implementation and import reference, see
+[`PROJECT_GUIDE.md`](PROJECT_GUIDE.md).
 
 ---
 
