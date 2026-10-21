@@ -10,7 +10,7 @@ recovery when the cluster restarts.
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
 - **Web UI:** http://127.0.0.1:8000/ (vanilla HTML/JS, no build step)
-- **Tests:** pytest — 303 tests
+- **Tests:** pytest — 386 tests
 
 ---
 
@@ -72,6 +72,9 @@ layer that can be emptied and rebuilt at any time.
 | **8.1** | **Cached search (query result sets as cache entries)** | **Done** |
 | **8.2** | **Router-side telemetry (DB load reduction metric)** | **Done** |
 | **8.3** | **Web UI — search, dashboard, inspector, cache lab** | **Done** |
+| **9.1** | **Cluster control — spawn / scale / stop real node processes from the UI** | **Done** |
+| **9.2** | **Dataset admin — entities as isolated databases, managed over the API** | **Done** |
+| **9.3** | **Deletion split (evict vs. database delete) + 6-tab UI rework** | **Done** |
 
 ### Layer 6.1 in one paragraph
 
@@ -166,6 +169,30 @@ reduction). Telemetry is counted on real operations in
 `services/telemetry.py`, not on HTTP requests, so a single-flight
 coalesced read counts exactly one database hit.
 
+### Layer 9 in one paragraph
+
+Layer 9 makes the cluster *operable* from that UI. The **Cluster**
+tab talks to `/cluster/nodes`: scaling up spawns real `main.py`
+processes from a port pool (`NODE_PORT_BASE..+MAX_NODES-1`), scaling
+down gracefully stops them and deregisters them, and every node card
+offers start / stop / restart with live state, PID and cache stats —
+"3 nodes" means three *running* processes, not three tombstones (the
+router's bootstrapped members are started too, and anything that
+already answers is adopted, never spawned twice). The **Datasets**
+tab creates a new entity as its own isolated SQLite file
+(`data/datasets/<name>.db`) with a sniffed schema, adds entries as
+JSON rows (key derived from the declared `key_column` → `id` → a
+sequence number), and deletes rows or whole datasets — every mutation
+purges the affected `q:`/`s:` search caches on disk *and* in the
+nodes, drops matching replication-log entries and re-syncs the
+stats, so a stale search page can never outlive its data. Finally
+the deletion path is split in two: `DELETE /cache/{key}` only **evicts**
+the node copies (the database row survives — 404 when no node held
+it), while `DELETE /db/{key}` **deletes** the row everywhere
+(database + node copies + search caches). The Inspector shows both
+buttons side by side, and the **Lab** adds a node-failure drill and
+an eviction burst next to the search/point-read storms.
+
 ---
 
 ## Quick start
@@ -206,6 +233,13 @@ start http://127.0.0.1:8000/
 > PUTs return 503 until the nodes are `ready`; wait for
 > `/cluster/status` to list them under `active_nodes`.
 
+**Easiest path (no extra terminals):** start only the router —
+`uvicorn router.router:app --port 8000` — open
+http://127.0.0.1:8000/, go to the **Cluster** tab and press
+**+ node** (or *Scale*). The router spawns `main.py` processes itself
+and gates them through warm-up like any other boot. **− node** stops
+them again; the per-card buttons start/stop/restart single nodes.
+
 Configuration (environment variables):
 
 | Variable | Default | Meaning |
@@ -223,6 +257,65 @@ Configuration (environment variables):
 | `SEED_FILL_RATIO` | `0.6` | Fraction of a node's own capacity seeding may claim — the rest stays free for live traffic |
 | `SEED_PER_DATASET` | `250` | Candidate rows pulled per dataset (the pool is then filtered to what each node owns) |
 | `SEED_FALLBACK_CAPACITY` | `100` | Capacity assumed for a node that does not answer `/stats` |
+| `MAX_NODES` | `8` | Size of the node port pool the UI may spawn into |
+| `NODE_PORT_BASE` | `8001` | First port of that pool (`8001…8008` by default) |
+| `NODE_CAPACITY` | `100` | Cache capacity given to nodes spawned by the router |
+| `NODE_START_TIMEOUT` | `10` | Seconds a scale/start request waits for a fresh node to answer `/health` |
+
+---
+
+## HTTP API
+
+All endpoints are served by the router (`:8000`). Cache & database:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/cache/{key}` | Read: node copies first, then the database |
+| PUT | `/cache/{key}` | Write-through to owning nodes + DB row; `nodes: []` → 200 with a `warning` (nothing to replicate to) |
+| DELETE | `/cache/{key}` | **Evict only** — drops the node copies, keeps the DB row (`404` if no node held it) |
+| GET | `/db/{key}` | Read the database row directly |
+| DELETE | `/db/{key}` | **Delete everywhere** — DB row + node copies + matching `q:`/`s:` search caches |
+
+Cluster control (Layer 9 — these spawn/stop real processes):
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/cluster/nodes` | Membership + pool: per-node `state`, `process` (`owned`/`attached`/`stopped`), `pid`, `stats`, plus `total`/`active`/`max_nodes` |
+| POST | `/cluster/nodes` | `{"target": 0..MAX_NODES}` — scale: grow spawns from the pool, shrink stops and deregisters the highest ports; equal target starts any dead members |
+| POST | `/cluster/nodes/{port}/start` | Spawn & register a single pool port (400 outside the pool) |
+| POST | `/cluster/nodes/{port}/stop` | Graceful `/internal/shutdown`, then deregister |
+| POST | `/cluster/nodes/{port}/restart` | Stop + start the same port |
+
+Dataset administration (each entity = one isolated SQLite file):
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/datasets` | List entities (name, rows, schema, db path) |
+| POST | `/datasets` | `{"name": ..., "key_column": ...}` — create the entity (slugified name, file materialized) |
+| GET | `/datasets/{name}` | One entity's metadata |
+| DELETE | `/datasets/{name}` | Delete the entity everywhere: node copies by prefix, search caches, replication log, registry row |
+| GET | `/datasets/{name}/entries` | Browse rows (`?limit`/`?offset`) |
+| POST | `/datasets/{name}/entries` | `{"value": {...}}` — upsert one row; key derived from `key_column` → `id` → sequence; purges search caches + re-syncs stats |
+| DELETE | `/datasets/{name}/entries?key=...` | Delete one row (DB row + node copies + search-cache purge) |
+
+Search, dashboard and cluster introspection (`/search/*`,
+`/dashboard/*`, `/cluster/status`, `/cluster/hot-keys`,
+`/cluster/warmup`, `/cluster/replication`, `/circuit-breaker/status`,
+`/health`, …) are unchanged from Layer 8 and listed with curl
+examples in [`commands.md`](commands.md).
+
+---
+
+## Web UI — the 6 tabs
+
+| Tab | What it is for |
+|---|---|
+| **Search** | Keyword/facet/range search over every dataset, with `⚡ CACHE` vs `🗄 DATABASE` banners and an entity picker for the Lab storms |
+| **Dashboard** | Node hit rates, router DB-load-reduction telemetry, circuit breaker, hot keys, replication log |
+| **Cluster** | Scale ±/set the cluster, per-node cards with state, process (owned/attached/stopped), PID, stats and start/stop/restart buttons; auto-refreshes every 3 s |
+| **Datasets** | Create an entity (new isolated DB), browse its entries, add a JSON row, delete single rows or the whole dataset |
+| **Inspector** | Inspect any key and browse a prefix — with the split **Evict from cache** / **Delete from database** buttons and a verdict line |
+| **Lab** | Search storm (entity selectable), point-read storm, node-failure drill (kill a node mid-run) and eviction burst — each with a live verdict |
 
 ---
 
@@ -232,12 +325,13 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **343 passed** — 39 search + 35 replication +
-29 dataset import + 28 node lifecycle + 28 warm-up + 20 repository +
-19 registry + 18 seeding + 16 consistent hash + 15 statistics +
-15 multi-dataset repository + 14 cache + 13 cache-service +
-13 terminal UI + 11 circuit-breaker + 8 router + 7 telemetry +
-6 config + 5 single-flight + 4 dashboard.
+Expected: **386 passed** — 39 search + 37 replication +
+29 dataset import + 28 node lifecycle + 28 warm-up + 21 registry +
+20 repository + 18 multi-dataset repository + 18 seeding + 16 cache +
+16 consistent hash + 15 statistics + 13 cache-service +
+13 terminal UI + 12 process manager + 12 dataset routes +
+11 circuit-breaker + 9 cluster-control routes + 9 router +
+7 telemetry + 6 config + 5 single-flight + 4 dashboard.
 
 ### Bringing your own data
 
