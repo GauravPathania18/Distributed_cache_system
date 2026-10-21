@@ -32,6 +32,8 @@ Thumbs.db
 # Layer 5 - SQLite database files
 data/
 *.db
+*.db-wal
+*.db-shm
 
 # Drop-folder datasets (imported into data/datasets/*.db at runtime)
 datasets/

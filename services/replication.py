@@ -80,6 +80,32 @@ class ReplicationManager:
         self._installed = False
 
     # --------------------------------------------------
+    # REPLICABLE KEY SPACE
+    # --------------------------------------------------
+
+    def _replicable_store(self):
+        """
+        The store whose keys belong in cache nodes.
+
+        Cache nodes hold what the ROUTER writes through the cache
+        layer: search result sets (`q:`/`s:`) and any manually cached
+        scratch keys. Those all live in the system store.
+
+        Imported dataset rows do NOT: they are immutable, live in
+        their own SQLite files, and are read on demand by search.
+        Before the multi-dataset refactor the database *was* just the
+        system store, so iterating it was correct; now
+        `MultiDatasetRepository.iter_keys()` also walks every dataset
+        (~29k rows here), which would be pushed into 200-capacity
+        nodes on every snapshot - evicting everything and taking
+        ~80 minutes. Scoping to the system store restores the
+        intended behaviour. A plain DatabaseRepository (tests) has no
+        `.system`, so it is returned unchanged.
+        """
+
+        return getattr(self.database, "system", self.database)
+
+    # --------------------------------------------------
     # SEQUENCE + LOG + ACK (Layer 7.3 core)
     # --------------------------------------------------
 
@@ -470,12 +496,14 @@ class ReplicationManager:
 
         loaded = 0
 
-        for key in self.database.iter_keys():
+        store = self._replicable_store()
+
+        for key in store.iter_keys():
 
             if view.get_node(key) != node:
                 continue
 
-            value = self.database.get(key)
+            value = store.get(key)
 
             if value is None:
                 continue
@@ -522,12 +550,14 @@ class ReplicationManager:
 
         try:
 
-            for key in self.database.iter_keys():
+            store = self._replicable_store()
+
+            for key in store.iter_keys():
 
                 if limit is not None and total >= limit:
                     break
 
-                value = self.database.get(key)
+                value = store.get(key)
 
                 if value is None:
                     continue

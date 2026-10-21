@@ -24,6 +24,15 @@ class _ConnectionMixin:
 
         try:
 
+            # WAL lets the router's per-request reads proceed while a
+            # background thread (health monitor / warm-up / search
+            # write-through) writes. The default rollback journal
+            # takes an exclusive lock for every commit, which under
+            # that concurrency surfaces as "database is locked" on
+            # Windows. `timeout` in connect() already bounds how long
+            # a genuinely contended write waits (busy_timeout).
+            connection.execute("PRAGMA journal_mode=WAL")
+
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cache_data (
