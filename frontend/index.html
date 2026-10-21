@@ -15,9 +15,11 @@
   </div>
   <nav class="tabs" id="tabs">
     <button data-view="search"    class="tab active">Search</button>
-    <button data-view="dashboard" class="tab">Cache Dashboard</button>
-    <button data-view="inspector" class="tab">Key Inspector</button>
-    <button data-view="lab"       class="tab">Cache Lab</button>
+    <button data-view="dashboard" class="tab">Dashboard</button>
+    <button data-view="cluster"   class="tab">Cluster</button>
+    <button data-view="datasets"  class="tab">Datasets</button>
+    <button data-view="inspector" class="tab">Inspector</button>
+    <button data-view="lab"       class="tab">Lab</button>
   </nav>
   <div class="cluster-pill" id="clusterPill" title="Live node states">
     <span class="dot" id="clusterDot"></span>
@@ -77,6 +79,44 @@
   </div>
 </section>
 
+<!-- ================= CLUSTER ================= -->
+<section id="view-cluster" class="view">
+  <div class="panel">
+    <h3>Cluster sizing <span class="muted">&mdash; real node processes, spawned and stopped by the router</span></h3>
+    <div class="scale-row">
+      <span class="muted" id="scaleInfo">loading&hellip;</span>
+      <div class="scale-controls">
+        <button type="button" class="btn ghost" id="scaleDown" title="remove the highest-port node">&minus; node</button>
+        <input type="number" id="scaleTarget" min="0" max="8" value="1" class="narrow" title="target node count">
+        <button type="button" class="btn primary" id="scaleSet">Scale</button>
+        <button type="button" class="btn ghost" id="scaleUp" title="spawn the next pool port">+ node</button>
+      </div>
+    </div>
+    <div id="clusterNotice"></div>
+  </div>
+
+  <div class="node-cards" id="nodeCards"></div>
+</section>
+
+<!-- ================= DATASETS ================= -->
+<section id="view-datasets" class="view">
+  <div class="panel">
+    <h3>Datasets <span class="muted">&mdash; each one is an isolated SQLite space with its own key prefix</span></h3>
+    <form class="inline-form" id="datasetCreateForm">
+      <input type="text" id="dsName" class="wide" placeholder="dataset name (e.g. invoices)" autocomplete="off">
+      <input type="text" id="dsKeyColumn" placeholder="key column (optional, e.g. id)" autocomplete="off">
+      <button type="submit" class="btn primary">Create dataset</button>
+    </form>
+    <div id="dsNotice"></div>
+    <div class="dataset-list" id="datasetList"></div>
+  </div>
+
+  <div class="panel">
+    <h3 id="dsDetailTitle">Entries</h3>
+    <div id="dsDetail"></div>
+  </div>
+</section>
+
 <!-- ================= INSPECTOR ================= -->
 <section id="view-inspector" class="view">
   <div class="panel">
@@ -84,8 +124,17 @@
     <form class="search-bar" id="inspectForm">
       <input type="text" id="inspectKey" placeholder="dataset key, e.g. users:42" autocomplete="off">
       <button type="submit" class="btn primary">Lookup</button>
-      <button type="button" class="btn danger" id="inspectDelete">Delete key</button>
     </form>
+
+    <div class="verdict" id="inspectVerdict"></div>
+
+    <div class="btn-row">
+      <button type="button" class="btn warn" id="inspectEvict"
+        title="DELETE /cache — drop every node copy, keep the database row">Evict from cache</button>
+      <button type="button" class="btn danger" id="inspectDelete"
+        title="DELETE /db — remove the database row and cascade the eviction">Delete from database</button>
+    </div>
+
     <div class="inspect-compare" id="inspectCompare"></div>
   </div>
 
@@ -102,14 +151,16 @@
 
 <!-- ================= CACHE LAB ================= -->
 <section id="view-lab" class="view">
+
   <div class="panel">
-    <h3>Cache Lab &mdash; prove the database load drops</h3>
+    <h3>Lab 1 &mdash; search storm: prove the database load drops</h3>
     <p class="muted">
       Fire the same search N times. The first run touches SQLite; every
       repeat is served from the cache cluster. Watch the two counters
       diverge &mdash; that gap <em>is</em> the load this system took off the database.
     </p>
     <form class="search-bar" id="labForm">
+      <select id="labEntity" title="dataset to search"></select>
       <input type="text" id="labQuery" value="" placeholder="keyword (blank = all rows)">
       <input type="number" id="labCount" value="40" min="1" max="500" class="narrow" title="repetitions">
       <input type="number" id="labDelay" value="25" min="0" max="1000" class="narrow" title="delay ms between requests">
@@ -120,15 +171,75 @@
     <div id="labChart"></div>
     <div class="lab-feed" id="labFeed"></div>
   </div>
+
+  <div class="panel">
+    <h3>Lab 2 &mdash; point-read storm with per-iteration eviction</h3>
+    <p class="muted">
+      Read one key N times. Without eviction every read after the first is a
+      pure cache hit; with "evict every iteration" each read pays a database
+      load &mdash; and the row must survive all of it (evict &ne; delete).
+    </p>
+    <form class="search-bar" id="prForm">
+      <input type="text" id="prKey" placeholder="key, e.g. users:1" autocomplete="off">
+      <input type="number" id="prCount" value="12" min="1" max="200" class="narrow" title="iterations">
+      <label class="toggle"><input type="checkbox" id="prEvict"> evict every iteration</label>
+      <button type="submit" class="btn primary" id="prRun">Run</button>
+    </form>
+    <div class="lab-stats" id="prStats"></div>
+    <div class="verdict" id="prVerdict"></div>
+    <div class="lab-feed" id="prFeed"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Lab 3 &mdash; node failure drill</h3>
+    <p class="muted">
+      Stop a node and keep reading: the RF=2 replica (or the database) answers
+      instead. Start it again and watch it rejoin through
+      STARTING &rarr; warm-up &rarr; READY.
+    </p>
+    <form class="search-bar" id="drillForm">
+      <select id="drillNode" title="node to stop/start"></select>
+      <input type="text" id="drillKey" placeholder="key to read, e.g. users:1" autocomplete="off">
+      <input type="number" id="drillCount" value="8" min="1" max="50" class="narrow" title="reads per phase">
+      <button type="submit" class="btn primary" id="drillRun">Run drill</button>
+    </form>
+    <div class="btn-row">
+      <button type="button" class="btn danger" id="drillStop" title="POST /cluster/nodes/{port}/stop">Stop selected node</button>
+      <button type="button" class="btn" id="drillStart" title="POST /cluster/nodes/{port}/start">Start selected node</button>
+    </div>
+    <div class="verdict" id="drillVerdict"></div>
+    <div class="lab-feed" id="drillFeed"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Lab 4 &mdash; eviction burst</h3>
+    <p class="muted">
+      Write K fresh keys, evict them all from the cache, then read them back:
+      every value reloads from its surviving database row. Compare with
+      "delete from database" in the Inspector &mdash; that one leaves nothing to reload.
+    </p>
+    <form class="search-bar" id="burstForm">
+      <input type="text" id="burstPrefix" value="lab:burst:" class="narrow" style="flex:0 0 150px; text-align:left" title="key prefix">
+      <input type="number" id="burstCount" value="15" min="1" max="100" class="narrow" title="keys">
+      <button type="submit" class="btn primary" id="burstRun">Run burst</button>
+    </form>
+    <div class="lab-stats" id="burstStats"></div>
+    <div class="verdict" id="burstVerdict"></div>
+  </div>
+
 </section>
 
 </main>
 
 <footer class="foot">
-  <span>Layer 8 &mdash; every unique query is a cache entry, written through the
-  same write-through path as any other key (DB row + fan-out + replication).</span>
+  <span>Layer 9 &mdash; the cluster and its datasets are fully manageable from this UI:
+  scale nodes, create datasets, add and delete entries, evict or delete keys.</span>
 </footer>
 
 <script src="app.js"></script>
+<script src="views/cluster.js"></script>
+<script src="views/datasets.js"></script>
+<script src="views/inspector.js"></script>
+<script src="views/lab.js"></script>
 </body>
 </html>

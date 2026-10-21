@@ -1,6 +1,11 @@
 /* =========================================================
    DCS web UI - vanilla JS single-page app
    No framework, no build step. Talks to the router API only.
+
+   Structure: this file holds the shared utilities, the tab/view
+   registry and the Search + Dashboard views. The other four views
+   live in views/*.js and register themselves through
+   registerView(name, {show, hide}).
    ========================================================= */
 
 "use strict";
@@ -58,6 +63,15 @@ function debounce(fn, ms) {
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* Shared feedback line: a .verdict div + kind (ok | warn | err). */
+function setVerdict(box, msg, kind) {
+  box.className = "verdict " + (kind || "ok");
+  box.textContent = msg || "";
+  if (!msg) box.className = "verdict";
+}
+
 /* ---------------------------------------------------------
    State
    --------------------------------------------------------- */
@@ -68,23 +82,40 @@ const state = {
   entities: {},               // from /search/entities (dataset registry)
   query: {},                  // per-entity query state, built from metadata
   lastResult: null,
-  dashTimer: null,
-  lab: { running: false, results: [], cacheHits: 0, dbRuns: 0 },
 };
 
 /* ---------------------------------------------------------
-   Tab routing
+   View registry (tabs call showView; views register hooks)
    --------------------------------------------------------- */
 
+const VIEWS = {};
+
+function registerView(name, hooks = {}) {
+  VIEWS[name] = hooks;
+}
+
 function showView(name) {
+  const prev = VIEWS[state.view];
+  if (prev && prev.hide) prev.hide();
+
   state.view = name;
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
 
-  if (state.dashTimer) { clearInterval(state.dashTimer); state.dashTimer = null; }
-  if (name === "dashboard") { refreshDashboard(); state.dashTimer = setInterval(refreshDashboard, 3000); }
-  if (name === "search" && !state.lastResult) runSearch();
+  const hooks = VIEWS[name];
+  if (hooks && hooks.show) hooks.show();
 }
+
+registerView("search", {
+  show() { if (!state.lastResult) runSearch(); },
+});
+
+registerView("dashboard", {
+  show() { refreshDashboard(); state.dashTimer = setInterval(refreshDashboard, 3000); },
+  hide() { if (state.dashTimer) { clearInterval(state.dashTimer); state.dashTimer = null; } },
+});
+
+state.dashTimer = null;
 
 /* ---------------------------------------------------------
    Cluster pill (top-right)
@@ -104,7 +135,32 @@ async function refreshClusterPill() {
 }
 
 /* ---------------------------------------------------------
-   SEARCH VIEW
+    ENTITY METADATA (shared by Search, Lab, Datasets)
+   --------------------------------------------------------- */
+
+async function reloadEntities() {
+  try {
+    const meta = await api("/search/entities");
+    state.entities = meta.entities || {};
+  } catch (_) {
+    state.entities = {};
+  }
+
+  const names = Object.keys(state.entities);
+
+  // Drop the selection when its dataset disappeared.
+  if (!names.includes(state.entity)) state.entity = names[0] || null;
+
+  names.forEach(ensureQuery);
+
+  renderEntitySwitch();
+  renderFacets();
+
+  return state.entities;
+}
+
+/* ---------------------------------------------------------
+    SEARCH VIEW
    --------------------------------------------------------- */
 
 const ENTITY_ICON  = { products: "🛍️", users: "👤", orders: "📦" };
@@ -258,9 +314,9 @@ function renderEmptyDatasets() {
   $("#pager").innerHTML = "";
   grid.innerHTML = "";
   grid.appendChild(el("div", { class: "empty" }, [
-    el("div", {}, "No datasets imported yet."),
+    el("div", {}, "No datasets yet."),
     el("div", { class: "muted", style: "margin-top:6px" },
-      "Drop a file (CSV / TSV / JSON / JSONL / Parquet / Excel / Zip) into the datasets/ folder and restart python tui.py — or import right now:"),
+      "Create one from the Datasets tab (a few clicks), or import a file:"),
     el("pre", { class: "json" }, "python import_dataset.py --file datasets/your_file.csv\npython import_dataset.py --seed"),
   ]));
 }
@@ -405,7 +461,7 @@ function renderPager(r) {
 }
 
 /* ---------------------------------------------------------
-   DASHBOARD VIEW
+    DASHBOARD VIEW
    --------------------------------------------------------- */
 
 async function refreshDashboard() {
@@ -437,7 +493,7 @@ function renderStatCards(d) {
   box.appendChild(card("SQL queries issued", (t.db_reads ?? 0).toLocaleString(),
     `${(t.search_database ?? 0)} from search · ${t.gets_database ?? 0} point reads`));
   box.appendChild(card("Reads avoided", (t.db_reads_avoided ?? 0).toLocaleString(),
-    `${(t.search_cache ?? 0)} search · ${t.gets_cache ?? 0} point`, "accent"));
+    `${t.search_cache ?? 0} search · ${t.gets_cache ?? 0} point`, "accent"));
   box.appendChild(card("Replication sequence", d.replication?.current_sequence ?? 0,
     `${d.replication?.log_size ?? 0} log entries`));
   box.appendChild(card("Cache tier hit rate", `${a.hit_rate_pct ?? 0}%`,
@@ -509,6 +565,9 @@ function renderNodeStates(d) {
       el("span", { class: "state-pill state-" + st }, st),
     ]));
   }
+  if (!Object.keys(states).length) {
+    box.appendChild(el("div", { class: "muted" }, "no nodes — scale up in the Cluster tab"));
+  }
 }
 
 function renderBreakerRepl(d) {
@@ -531,198 +590,7 @@ function renderBreakerRepl(d) {
 }
 
 /* ---------------------------------------------------------
-   INSPECTOR VIEW
-   --------------------------------------------------------- */
-
-function inspectKey(key) {
-  $("#inspectKey").value = key;
-  showView("inspector");
-  runInspect();
-}
-
-async function runInspect() {
-  const key = $("#inspectKey").value.trim();
-  const box = $("#inspectCompare");
-  box.innerHTML = "";
-  if (!key) return;
-
-  const enc = encodeURIComponent(key);
-
-  const card = (title, promise) => {
-    const c = el("div", { class: "compare-card" }, [el("h4", {}, title), el("div", { class: "spinner" }, "loading…")]);
-    box.appendChild(c);
-    return promise.then((data) => {
-      c.innerHTML = "";
-      c.appendChild(el("h4", {}, title));
-      c.appendChild(el("pre", { class: "json" }, JSON.stringify(data, null, 2)));
-    }).catch((e) => {
-      c.innerHTML = "";
-      c.appendChild(el("h4", {}, title));
-      c.appendChild(el("div", { class: "error-box" }, e.message));
-    });
-  };
-
-  card(`GET /cache/${key}  (via cache layer)`, api(`/cache/${enc}`));
-  card(`GET /db/${key}  (bypasses cache)`, api(`/db/${enc}`));
-}
-
-async function runBrowse() {
-  const prefix = $("#browsePrefix").value.trim();
-  const limit = $("#browseLimit").value || 25;
-  const out = $("#browseOut");
-  out.innerHTML = `<div class="spinner">loading…</div>`;
-  try {
-    const r = await api(`/browse/prefix?prefix=${encodeURIComponent(prefix)}&limit=${limit}`);
-    out.innerHTML = `<table class="table"><tr><th>Key</th><th>Value size (bytes)</th></tr>` +
-      (r.keys.length ? r.keys.map((k) =>
-        `<tr><td>${esc(k.key)}</td><td>${k.size}</td></tr>`).join("")
-        : `<tr><td colspan="2" class="muted">no keys match</td></tr>`) + `</table>` +
-      (r.truncated ? `<div class="muted">truncated at ${r.limit} — raise the limit for more</div>` : "");
-  } catch (e) {
-    out.innerHTML = `<div class="error-box">${esc(e.message)}</div>`;
-  }
-}
-
-/* ---------------------------------------------------------
-   CACHE LAB VIEW
-   --------------------------------------------------------- */
-
-async function runLab(event) {
-  event.preventDefault();
-  if (state.lab.running) return;
-
-  const entity = state.entity;
-  const meta = state.entities[entity];
-
-  if (!entity || !meta) {
-    alert("No dataset imported yet — import one via tui.py menu 'd' or import_dataset.py first.");
-    return;
-  }
-
-  const query = $("#labQuery").value.trim();
-  const count = Math.max(1, Math.min(500, +$("#labCount").value || 40));
-  const delay = Math.max(0, Math.min(1000, +$("#labDelay").value || 0));
-  const btn = $("#labRun");
-
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  params.set("sort", meta.default_sort || "");
-  params.set("dir", meta.default_dir || "asc");
-  params.set("page_size", "5");
-
-  state.lab.running = true;
-  state.lab.results = [];
-  state.lab.cacheHits = 0;
-  state.lab.dbRuns = 0;
-  btn.disabled = true;
-  btn.textContent = "Running…";
-  $("#labFeed").innerHTML = "";
-
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  for (let i = 1; i <= count; i++) {
-    const started = performance.now();
-    try {
-      const r = await api(`/search/${encodeURIComponent(entity)}?${params}`);
-      const ms = performance.now() - started;
-      const hit = r.source === "cache";
-      if (hit) state.lab.cacheHits++; else state.lab.dbRuns++;
-      state.lab.results.push({ i, hit, ms, source: r.source });
-      appendLabLine(i, r.source, ms);
-      renderLabStats(count);
-      renderLabChart();
-    } catch (e) {
-      appendLabLine(i, "error", 0, e.message);
-      break;
-    }
-    if (delay) await sleep(delay);
-  }
-
-  state.lab.running = false;
-  btn.disabled = false;
-  btn.textContent = "Run";
-}
-
-function appendLabLine(i, source, ms, err) {
-  const feed = $("#labFeed");
-  const line = el("div", { class: "lab-line" }, [
-    el("span", { class: "n" }, `#${i}`),
-    el("span", { class: "src " + source }, err ? "ERROR" : source.toUpperCase()),
-    el("span", {}, err || `served in ${ms.toFixed(1)} ms`),
-    el("span", { class: "ms" }, ""),
-  ]);
-  feed.appendChild(line);
-  feed.scrollTop = feed.scrollHeight;
-}
-
-function renderLabStats(count) {
-  const { cacheHits, dbRuns, results } = state.lab;
-  const total = cacheHits + dbRuns || 1;
-  const pct = ((cacheHits / total) * 100).toFixed(1);
-  const avgCache = avg(results.filter((r) => r.hit).map((r) => r.ms));
-  const avgDb = avg(results.filter((r) => !r.hit).map((r) => r.ms));
-  const box = $("#labStats");
-  box.innerHTML = "";
-  const card = (label, value, sub, cls) => el("div", { class: "stat " + (cls || "") }, [
-    el("div", { class: "label" }, label),
-    el("div", { class: "value" }, value),
-    el("div", { class: "sub" }, sub || ""),
-  ]);
-  box.appendChild(card("Cache hits", cacheHits, "served with 0 SQL", "good"));
-  box.appendChild(card("SQL queries", dbRuns, "database actually touched"));
-  box.appendChild(card("Load reduction", `${pct}%`, "of all requests", "accent"));
-  box.appendChild(card("Avg cache", avgCache == null ? "—" : `${avgCache.toFixed(1)} ms`, "per cached request"));
-  box.appendChild(card("Avg database", avgDb == null ? "—" : `${avgDb.toFixed(1)} ms`, "per SQL request"));
-
-  function avg(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null; }
-}
-
-function renderLabChart() {
-  const { results } = state.lab;
-  const box = $("#labChart");
-  if (!results.length) { box.innerHTML = ""; return; }
-
-  const W = 640, H = 180, pad = 28;
-  const maxN = results.length;
-  const plotW = W - pad * 2, plotH = H - pad * 2;
-  const x = (n) => pad + (maxN <= 1 ? plotW / 2 : ((n - 1) / (maxN - 1)) * plotW);
-  const y = (v) => H - pad - (v / maxN) * plotH;
-
-  let cacheLine = "", dbLine = "";
-  let c = 0, d = 0;
-  results.forEach((r, idx) => {
-    if (r.hit) c++; else d++;
-    cacheLine += `${idx === 0 ? "M" : "L"}${x(idx + 1).toFixed(1)},${y(c).toFixed(1)} `;
-    dbLine += `${idx === 0 ? "M" : "L"}${x(idx + 1).toFixed(1)},${y(d).toFixed(1)} `;
-  });
-
-  box.innerHTML = `
-  <svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px">
-    <line x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${H - pad}" stroke="#2d3548"/>
-    <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${H - pad}" stroke="#2d3548"/>
-    <text x="${pad}" y="${H - 8}" fill="#8b98a9" font-size="10">request #1</text>
-    <text x="${W - pad}" y="${H - 8}" fill="#8b98a9" font-size="10" text-anchor="end">#${maxN}</text>
-    <text x="${pad - 6}" y="${pad + 4}" fill="#8b98a9" font-size="10" text-anchor="end">${maxN}</text>
-    <text x="${pad - 6}" y="${H - pad + 4}" fill="#8b98a9" font-size="10" text-anchor="end">0</text>
-    <path d="${cacheLine}" fill="none" stroke="#2ea043" stroke-width="2.5"/>
-    <path d="${dbLine}" fill="none" stroke="#d29922" stroke-width="2.5"/>
-  </svg>
-  <div class="legend" style="display:flex;gap:18px;justify-content:center;margin-top:6px">
-    <span style="color:#2ea043">■ cumulative cache hits (${c})</span>
-    <span style="color:#d29922">■ cumulative SQL queries (${d})</span>
-  </div>`;
-}
-
-async function resetLabCounters() {
-  try { await api("/dashboard/telemetry/reset", { method: "POST" }); } catch (_) {}
-  state.lab = { running: false, results: [], cacheHits: 0, dbRuns: 0 };
-  $("#labStats").innerHTML = "";
-  $("#labChart").innerHTML = "";
-  $("#labFeed").innerHTML = "";
-}
-
-/* ---------------------------------------------------------
-   Init
+   Init (views/*.js have registered themselves by now)
    --------------------------------------------------------- */
 
 async function init() {
@@ -758,43 +626,13 @@ async function init() {
     runSearch();
   }, 400));
 
-  // Inspector
-  $("#inspectForm").addEventListener("submit", (e) => { e.preventDefault(); runInspect(); });
-  $("#inspectDelete").addEventListener("click", async () => {
-    const key = $("#inspectKey").value.trim();
-    if (!key) return;
-    if (!confirm(`Delete "${key}" from the database and all cache nodes?`)) return;
-    try { await api(`/cache/${encodeURIComponent(key)}`, { method: "DELETE" }); runInspect(); }
-    catch (e) { alert("Delete failed: " + e.message); }
-  });
-  $("#browseForm").addEventListener("submit", (e) => { e.preventDefault(); runBrowse(); });
+  // Entity metadata (one entity per dataset), then paint.
+  await reloadEntities();
 
-  // Lab
-  $("#labForm").addEventListener("submit", runLab);
-  $("#labReset").addEventListener("click", resetLabCounters);
-
-  // Load entity metadata (one entity per imported dataset), then paint
-  try {
-    const meta = await api("/search/entities");
-    state.entities = meta.entities || {};
-  } catch (_) {
-    state.entities = {};
-  }
-
-  const names = Object.keys(state.entities);
-  state.entity = names[0] || null;
-  names.forEach(ensureQuery);
-
-  renderEntitySwitch();
-  renderFacets();
   refreshClusterPill();
   setInterval(refreshClusterPill, 5000);
 
-  if (state.entity) {
-    runSearch();
-  } else {
-    renderEmptyDatasets();
-  }
+  showView("search");
 }
 
 document.addEventListener("DOMContentLoaded", init);

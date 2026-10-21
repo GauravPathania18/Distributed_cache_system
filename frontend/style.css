@@ -314,3 +314,97 @@ pre.json { font-family: var(--mono); font-size: 12px; background: var(--bg); pad
   .search-layout, .dash-grid, .inspect-compare { grid-template-columns: 1fr; }
   .facets { position: static; }
 }
+
+/* =========================================================
+   Layer 9 - cluster control, dataset admin, deletion split
+   ========================================================= */
+
+/* ---------- cluster view ---------- */
+
+.scale-row {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 14px; flex-wrap: wrap;
+}
+.scale-controls { display: flex; gap: 8px; align-items: center; }
+
+.node-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 14px;
+}
+.node-card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px;
+  display: flex; flex-direction: column;
+}
+.node-card .card-top { align-items: center; margin-bottom: 10px; }
+.node-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 12px; }
+
+.proc-chip {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  font-family: var(--mono); border: 1px solid var(--line);
+}
+.proc-owned    { color: var(--green); border-color: rgba(46,160,67,.4);  background: var(--green-bg); }
+.proc-attached { color: var(--accent); border-color: rgba(79,157,255,.4); background: rgba(79,157,255,.12); }
+.proc-stopped  { color: var(--red);   border-color: rgba(248,81,73,.4);  background: var(--red-bg); }
+
+/* ---------- datasets view ---------- */
+
+.inline-form { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.inline-form input, .inline-form select {
+  background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  padding: 10px 12px; border-radius: 10px; font-size: 13px;
+}
+.inline-form input:focus { outline: none; border-color: var(--accent); }
+.inline-form input.wide { flex: 1 1 220px; }
+
+.dataset-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+.dataset-card {
+  background: var(--bg-soft); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px; cursor: pointer;
+  transition: border-color .12s ease, transform .12s ease;
+}
+.dataset-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+.dataset-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.ds-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+.entries-table td.val {
+  max-width: 420px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--muted);
+}
+
+textarea.json-input {
+  width: 100%; min-height: 64px; font-family: var(--mono); font-size: 12px;
+  background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: 8px; padding: 10px; resize: vertical;
+}
+textarea.json-input:focus { outline: none; border-color: var(--accent); }
+
+/* ---------- deletion split + feedback ---------- */
+
+.btn-row { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+.btn.warn { background: var(--amber-bg); border-color: var(--amber); color: var(--amber); }
+
+.verdict { display: none; font-size: 12px; padding: 9px 13px; border-radius: 8px; margin: 10px 0; }
+.verdict.ok   { display: block; background: var(--green-bg); color: var(--green); border: 1px solid rgba(46,160,67,.4); }
+.verdict.warn { display: block; background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(210,153,34,.4); }
+.verdict.err  { display: block; background: var(--red-bg);   color: var(--red);   border: 1px solid rgba(248,81,73,.4); }
+
+/* ---------- lab additions ---------- */
+
+.search-bar select {
+  background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  padding: 10px 12px; border-radius: 10px; font-size: 13px; max-width: 220px;
+}
+.search-bar select:focus { outline: none; border-color: var(--accent); }
+.search-bar .toggle { flex: 0 0 auto; }
+
+.lab-line .src.muted  { color: var(--muted); font-weight: 500; }
+.lab-line .src.error  { color: var(--red); }
+
+@media (max-width: 900px) {
+  .node-cards, .dataset-list { grid-template-columns: 1fr; }
+  .scale-row { flex-direction: column; align-items: stretch; }
+}
