@@ -168,6 +168,28 @@ class ReplicationManager:
         with self._lock:
             self._status.pop(node, None)
 
+    def drop_prefix(self, prefix: str) -> int:
+        """
+        Remove every logged op whose key starts with `prefix`.
+
+        Layer 9 - used after a prefix flush (dataset delete, search
+        cache purge): replaying those entries later would resurrect
+        rows the flush just deleted. Returns entries dropped.
+        """
+
+        with self._lock:
+
+            kept = [
+                entry for entry in self._log
+                if not entry["key"].startswith(prefix)
+            ]
+
+            dropped = len(self._log) - len(kept)
+
+            self._log = deque(kept, maxlen=self._log.maxlen)
+
+            return dropped
+
     def entries_since(self, after_sequence: int) -> list:
         """
         Log entries with sequence > `after_sequence`, oldest first.

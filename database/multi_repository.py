@@ -163,6 +163,10 @@ class MultiDatasetRepository:
     def delete(self, key) -> bool:
         return self._repo_for_key(key).delete(key)
 
+    def delete_prefix(self, prefix: str) -> int:
+        """Delete every key under `prefix` in the store that owns it."""
+        return self.repo_for(prefix).delete_prefix(prefix)
+
     def exists(self, key) -> bool:
         return self._repo_for_key(key).exists(key)
 

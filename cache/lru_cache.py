@@ -305,6 +305,34 @@ class LRUCache(_LinkedListOps, _CacheStats):
 
             return True
 
+    def delete_prefix(self, prefix: str) -> int:
+        """
+        Delete every key that starts with `prefix`.
+
+        Layer 9 - dataset deletion / search-cache purge fan-out: one
+        node call drops a whole dataset's cached rows at once.
+        Returns the number of entries removed.
+
+        O(n) - prefix scans cannot use the hash map directly.
+        """
+
+        with self.lock:
+
+            matching = [
+                key for key in self.cache
+                if key.startswith(prefix)
+            ]
+
+            for key in matching:
+
+                node = self.cache[key]
+
+                self._remove_node(node)
+
+                del self.cache[key]
+
+            return len(matching)
+
     def exists(self, key: str) -> bool:
         """
         Check whether a valid entry exists.

@@ -215,6 +215,44 @@ class _CrudMixin:
         finally:
             connection.close()
 
+    def delete_prefix(self, prefix: str) -> int:
+        """
+        Delete every key that starts with `prefix`; return the
+        number of rows removed (Layer 9 - search-cache purge and
+        dataset-wide cleanup). '%' and '_' in the prefix are
+        matched literally, not as SQL wildcards.
+        """
+
+        connection = self._get_connection()
+
+        try:
+
+            escaped = (
+                prefix
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+
+            cursor = connection.execute(
+                """
+                DELETE FROM cache_data
+                WHERE key LIKE ? ESCAPE '\\'
+                """,
+                (escaped + "%",)
+            )
+
+            connection.commit()
+
+            return max(cursor.rowcount, 0)
+
+        except sqlite3.Error as error:
+            raise DatabaseUnavailableError(
+                f"database unavailable during delete_prefix({prefix!r}): {error}"
+            )
+        finally:
+            connection.close()
+
     def exists(self, key: str) -> bool:
 
         connection = self._get_connection()

@@ -301,6 +301,12 @@ class CacheWarmup:
                 for node, entry in self._status.items()
             }
 
+    def forget(self, node: str) -> None:
+        """Drop a node's warm-up record (Layer 9 scale-down/stop)."""
+
+        with self._lock:
+            self._status.pop(node, None)
+
     def _entry(self, state, attempts=0, **extra) -> dict:
 
         entry = {

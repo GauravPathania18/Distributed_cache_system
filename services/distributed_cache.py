@@ -133,6 +133,46 @@ class DistributedCache:
         return deleted_from
 
     # --------------------------------------------------
+    # PREFIX FLUSH (Layer 9 - dataset delete / search purge)
+    # --------------------------------------------------
+
+    def flush_prefix(self, prefix: str) -> dict:
+        """
+        Drop every key under `prefix` on every KNOWN node.
+
+        Prefix keys still live on the nodes that own them in the
+        ring, but a gated or just-deregistered node can hold stale
+        copies too - so this fans out to all known nodes instead of
+        asking the ring. Best-effort: returns {node: removed_count}
+        for the nodes that answered.
+        """
+
+        from urllib.parse import quote
+
+        flushed = {}
+
+        with self.node_manager.lock:
+            nodes = sorted(self.node_manager.nodes)
+
+        for node in nodes:
+
+            try:
+
+                response = self.session.delete(
+                    f"{node}/internal/prefix/{quote(prefix, safe='')}",
+                    timeout=self.timeout
+                )
+
+                if response.status_code == 200:
+                    flushed[node] = response.json().get("removed", 0)
+
+            except requests.RequestException:
+
+                continue
+
+        return flushed
+
+    # --------------------------------------------------
     # DIRECT SINGLE-NODE WRITE (Layer 6.3 warm-up / 7.3 sync)
     # --------------------------------------------------
 
