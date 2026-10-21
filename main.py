@@ -1,4 +1,8 @@
 import argparse
+import atexit
+import os
+import signal
+import threading
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
@@ -44,6 +48,11 @@ cache = LRUCache(
     capacity=DEFAULT_CAPACITY,
     on_eviction=statistics.record_eviction
 )
+
+# Set in __main__: the uvicorn server this process runs, so the
+# shutdown endpoint below can ask it to exit gracefully. None when
+# the app is embedded (tests, a parent server).
+_server: Optional[uvicorn.Server] = None
 
 
 # ---------------------------------------------------------
@@ -233,6 +242,54 @@ def internal_entry(key: str):
 
 
 # ---------------------------------------------------------
+# INTERNAL PREFIX FLUSH (Layer 9 - dataset delete / purge)
+#
+# One call drops every key under a prefix (a whole dataset's
+# cached rows, or one entity's cached search results) on THIS
+# node. Local apply only - the router fans out per node, nodes
+# never talk to each other.
+# ---------------------------------------------------------
+
+@app.delete("/internal/prefix/{prefix:path}")
+def internal_flush_prefix(prefix: str):
+
+    removed = cache.delete_prefix(prefix)
+
+    for _ in range(removed):
+        statistics.record_delete()
+
+    return {
+        "status": "flushed",
+        "prefix": prefix,
+        "removed": removed
+    }
+
+
+# ---------------------------------------------------------
+# INTERNAL SHUTDOWN (web UI stop for nodes we do not own)
+#
+# The router may need to stop a node a different process started
+# (the TUI). Asking politely beats killing: uvicorn finishes
+# in-flight requests and runs its lifespan hooks.
+# ---------------------------------------------------------
+
+@app.post("/internal/shutdown")
+def internal_shutdown():
+    """Ask this process's server to exit gracefully."""
+
+    if _server is None:
+
+        raise HTTPException(
+            status_code=503,
+            detail="Shutdown is only available on a running node process"
+        )
+
+    _server.should_exit = True
+
+    return {"status": "shutting down"}
+
+
+# ---------------------------------------------------------
 # EXISTS
 # ---------------------------------------------------------
 
@@ -306,8 +363,41 @@ if __name__ == "__main__":
         on_eviction=statistics.record_eviction
     )
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=args.port
+    # PID file: lets a process that did NOT spawn us (the web UI's
+    # Cluster control) find and stop this node later. Removed on any
+    # clean exit.
+    pid_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data", "pids", f"node-{args.port}.pid"
     )
+
+    os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+
+    with open(pid_path, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+    def _remove_pid_file():
+        try:
+            os.remove(pid_path)
+        except OSError:
+            pass
+
+    atexit.register(_remove_pid_file)
+
+    # Run uvicorn on a background thread: the main thread keeps the
+    # signal handlers and exposes the server object to
+    # /internal/shutdown, so another process can stop us gracefully.
+    _server = uvicorn.Server(
+        uvicorn.Config(app, host="0.0.0.0", port=args.port)
+    )
+
+    def _graceful_exit(signum, frame):
+        if _server is not None:
+            _server.should_exit = True
+
+    signal.signal(signal.SIGINT, _graceful_exit)
+    signal.signal(signal.SIGTERM, _graceful_exit)
+
+    _thread = threading.Thread(target=_server.run, daemon=True)
+    _thread.start()
+    _thread.join()

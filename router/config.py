@@ -54,6 +54,18 @@ SEED_PER_DATASET = int(os.environ.get("SEED_PER_DATASET", "250"))
 # Capacity assumed for a node that does not answer /stats.
 SEED_FALLBACK_CAPACITY = int(os.environ.get("SEED_FALLBACK_CAPACITY", "100"))
 
+# Layer 9 - cluster control from the web UI: the node port pool the
+# router may spawn nodes from (scale up/down, start/stop/restart).
+# DEFAULT_NODES already covers NODE_PORT_BASE..+2; the rest of the
+# pool is capacity the UI can grow into.
+MAX_NODES = int(os.environ.get("MAX_NODES", "8"))
+NODE_PORT_BASE = int(os.environ.get("NODE_PORT_BASE", "8001"))
+NODE_CAPACITY = int(os.environ.get("NODE_CAPACITY", "100"))
+
+# How long a scale/start request waits for freshly spawned nodes to
+# answer /health before reporting them as still starting.
+NODE_START_TIMEOUT = float(os.environ.get("NODE_START_TIMEOUT", "10"))
+
 # Layer 7.3 - replication log + sync
 REPLICATION_ENABLED = os.environ.get(
     "REPLICATION_ENABLED", "on"

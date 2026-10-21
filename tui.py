@@ -171,18 +171,15 @@ def _detail(data):
 # ---------------------------------------------------------
 
 def project_python() -> str:
-    """Prefer the project venv so the windows run the right deps."""
+    """Prefer the project venv so the windows run the right deps.
 
-    candidates = [
-        os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
-        os.path.join(ROOT, ".venv", "bin", "python"),
-    ]
+    Single source of truth lives in services/process_manager.py -
+    the web UI's Cluster control spawns through the same helper.
+    """
 
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
+    from services.process_manager import project_python as _python
 
-    return sys.executable
+    return _python()
 
 
 def spawn(label: str, command: list) -> dict:
