@@ -151,8 +151,9 @@ class NodeManager:
         a distinct slice, so the cluster's unique coverage is
         N x the per-node budget instead of 1 x it.
 
-        Nodes are only ever ADDED (register_node), never removed,
-        so the declared set cannot contain phantoms.
+        Nodes are added with register_node and removed with
+        deregister_node (scale-down), so the declared set always
+        mirrors current membership - never stale phantoms.
         """
 
         with self.lock:
@@ -346,6 +347,36 @@ class NodeManager:
         from .node_lifecycle import register
 
         register(self, node, initial_state)
+
+    def deregister_node(self, node: str) -> bool:
+        """
+        Remove a node from the cluster entirely (Layer 9 scale-down
+        or explicit stop from the web UI).
+
+        The inverse of register_node(): no lifecycle event is fired -
+        there is no "removed" state - the node simply stops existing,
+        and stops receiving traffic immediately (ring + active set
+        drop it under the lock).  Callers own the side bookkeeping
+        (replication acks, warm-up status, the OS process).
+
+        Returns True when the node was known.
+        """
+
+        with self.lock:
+
+            if node not in self.nodes:
+                return False
+
+            self.nodes.discard(node)
+            self.active_nodes.discard(node)
+            self.node_states.pop(node, None)
+            self.failure_counts.pop(node, None)
+            self.recovery_counts.pop(node, None)
+            self.ring.remove_node(node)
+
+        print(f"[NODE REMOVED] {node}")
+
+        return True
 
     def get_node_state(self, node: str) -> str:
         """Return the lifecycle state of a single node."""
