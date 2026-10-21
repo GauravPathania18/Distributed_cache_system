@@ -15,6 +15,16 @@ _DIR_WHITELIST = ("asc", "desc")
 _DEFAULT_PAGE_SIZE = 20
 _MAX_PAGE_SIZE = 100
 
+# Query params every entity accepts regardless of its schema.
+_RESERVED_PARAMS = ("q", "page", "page_size", "sort", "dir")
+
+# Column-name hints for a sensible default sort (all descending).
+_DEFAULT_SORT_HINTS = (
+    "rating", "score", "review", "price", "cost", "vote", "sales",
+    "revenue", "amount", "total", "rank", "year", "budget", "income",
+    "profit", "count", "popularity", "duration",
+)
+
 
 def _safe(value) -> str:
     """
@@ -32,143 +42,205 @@ def _safe(value) -> str:
     return _SAFE.sub("", text)
 
 
+def prettify(name: str) -> str:
+    """Dataset name -> display label ("netflix_titles" -> "Netflix Titles")."""
+
+    text = str(name).replace("_", " ").replace("-", " ")
+
+    return " ".join(word.capitalize() for word in text.split())
+
+
 # ---------------------------------------------------------
-# ENTITY REGISTRY
+# ENTITY BUILDING (schema-driven - nothing is hardcoded)
 # ---------------------------------------------------------
 
-# `fields` maps an output column name to the SQL expression that
-# produces it. `filters` maps an accepted query-parameter name to a
-# dict with:
-#     field - the field name (looked up in `fields`)
-#     kind  - "enum" | "range" | "min" | "bool"
-#     min_param / max_param - query params for a "range"
-#     test  - SQL boolean for a "bool" filter
-# `sorts` is the ORDER BY whitelist: a sort name may only be one of
-# these keys, which is why the column can be interpolated safely.
+def _param_name(column: str, used: set) -> str:
 
-ENTITIES = {
-    "products": {
-        "prefix": "product:",
-        "id_expr": "substr(key, 9)",
-        "fields": {
-            "name": "json_extract(value,'$.name')",
-            "price": "json_extract(value,'$.price')",
-            "category": "json_extract(value,'$.category')",
-            "stock": "json_extract(value,'$.stock')",
-            "rating": "json_extract(value,'$.rating')",
-        },
-        "text": ["name"],
-        "filters": {
-            "category": {"field": "category", "kind": "enum"},
-            "price": {
-                "field": "price",
-                "kind": "range",
-                "min_param": "pmin",
-                "max_param": "pmax",
-            },
-            "rating": {"field": "rating", "kind": "min"},
-            "instock": {
-                "field": "stock",
-                "kind": "bool",
-                "test": "json_extract(value,'$.stock') > 0",
-            },
-        },
-        "sorts": {
-            "rating": "rating",
-            "price": "price",
-            "name": "name",
-            "stock": "stock",
-        },
-        "default_sort": "rating",
-        "default_dir": "desc",
-        "suggest": ["category"],
-    },
-    "users": {
-        "prefix": "user:",
-        "id_expr": "substr(key, 6)",
-        "fields": {
-            "name": "json_extract(value,'$.name')",
-            "email": "json_extract(value,'$.email')",
-            "age": "json_extract(value,'$.age')",
-            "city": "json_extract(value,'$.city')",
-            "signup_date": "json_extract(value,'$.signup_date')",
-            "active": "json_extract(value,'$.active')",
-            "score": "json_extract(value,'$.score')",
-        },
-        "text": ["name", "city"],
-        "filters": {
-            "city": {"field": "city", "kind": "enum"},
-            "age": {
-                "field": "age",
-                "kind": "range",
-                "min_param": "amin",
-                "max_param": "amax",
-            },
-            "score": {
-                "field": "score",
-                "kind": "range",
-                "min_param": "smin",
-                "max_param": "smax",
-            },
-            "active": {
-                "field": "active",
-                "kind": "bool",
-                "test": "json_extract(value,'$.active') IN (1, 'true')",
-            },
-        },
-        "sorts": {
-            "score": "score",
-            "age": "age",
-            "name": "name",
-            "signup_date": "signup_date",
-        },
-        "default_sort": "score",
-        "default_dir": "desc",
-        "suggest": ["city"],
-    },
-    "orders": {
-        "prefix": "order:",
-        "id_expr": "substr(key, 7)",
-        "fields": {
-            "user_id": "json_extract(value,'$.user_id')",
-            "item": "json_extract(value,'$.item')",
-            "quantity": "json_extract(value,'$.quantity')",
-            "total": "json_extract(value,'$.total')",
-            "status": "json_extract(value,'$.status')",
-            "created_at": "json_extract(value,'$.created_at')",
-        },
-        "text": ["item"],
-        "filters": {
-            "status": {"field": "status", "kind": "enum"},
-            "total": {
-                "field": "total",
-                "kind": "range",
-                "min_param": "tmin",
-                "max_param": "tmax",
-            },
-            "quantity": {
-                "field": "quantity",
-                "kind": "range",
-                "min_param": "qmin",
-                "max_param": "qmax",
-            },
-        },
-        "sorts": {
-            "total": "total",
-            "quantity": "quantity",
-            "created_at": "created_at",
-            "item": "item",
-        },
-        "default_sort": "created_at",
-        "default_dir": "desc",
-        "suggest": ["status", "item"],
-    },
-}
+    base = re.sub(r"[^a-z0-9]+", "_", column.lower()).strip("_") or "field"
+
+    if base in _RESERVED_PARAMS:
+        base += "_f"
+
+    candidate = base
+    counter = 2
+
+    while candidate in used:
+        candidate = f"{base}_{counter}"
+        counter += 1
+
+    used.add(candidate)
+
+    return candidate
+
+
+def _range_params(column: str, used: set) -> tuple:
+
+    base = re.sub(r"[^a-z0-9]+", "_", column.lower()).strip("_") or "field"
+
+    if base in _RESERVED_PARAMS:
+        base += "_f"
+
+    low, high = f"{base}_min", f"{base}_max"
+    counter = 2
+
+    while low in used or high in used:
+        low, high = f"{base}_{counter}_min", f"{base}_{counter}_max"
+        counter += 1
+
+    used.add(low)
+    used.add(high)
+
+    return low, high
+
+
+def _default_sort(sorts: dict, schema: dict) -> tuple:
+    """(sort key, direction) for a freshly built entity.
+
+    `sorts` maps the accepted (lower-cased) sort key to its raw
+    column; the returned default must be one of those keys because
+    _normalize() lower-cases incoming sort params before matching.
+    """
+
+    for hint in _DEFAULT_SORT_HINTS:
+        for key, column in sorts.items():
+            if (hint in column.lower()
+                    and schema[column]["type"] in ("number", "date")):
+                return key, "desc"
+
+    for key, column in sorts.items():
+        if schema[column]["type"] == "number":
+            return key, "desc"
+
+    return next(iter(sorts)), "asc"
+
+
+def build_entities(entries: dict) -> dict:
+    """Registry entries -> search specs generated from their schemas.
+
+    Each entry becomes one entity whose filters/sorts/keyword fields
+    are derived from the detected column types:
+
+        string with few values -> enum facet (chips)
+        number                 -> min/max range
+        date                   -> from/to text range
+        bool                   -> toggle
+        other strings          -> keyword search + autocomplete
+
+    `fields` maps an output column name to the SQL expression that
+    produces it; `sorts` is the ORDER BY whitelist, which is why the
+    column can be interpolated safely.
+    """
+
+    out = {}
+
+    for name in sorted(entries):
+
+        entry = entries[name]
+
+        schema = entry.get("schema") or {}
+
+        prefix = entry.get("prefix") or f"{name}:"
+
+        fields = {}
+
+        for column in schema:
+            # JSON path expressions cannot carry quotes; such
+            # columns stay in the value but are not queryable.
+            if '"' in column or "\\" in column:
+                continue
+            fields[column] = f"json_extract(value, '$.\"{column}\"')"
+
+        if not fields:
+            continue
+
+        id_expr = f"substr(key, {len(prefix) + 1})"
+
+        text = [
+            column for column in fields
+            if schema[column]["type"] == "string"
+        ][:8]
+
+        used = set()
+        filters = {}
+
+        for column in fields:
+
+            if len(filters) >= 12:
+                break
+
+            meta = schema[column]
+            dtype = meta.get("type") or "string"
+            values = meta.get("values")
+            expr = fields[column]
+
+            if dtype == "string" and values:
+
+                param = _param_name(column, used)
+
+                filters[param] = {
+                    "field": column,
+                    "kind": "enum",
+                    "values": values,
+                }
+
+            elif dtype in ("number", "date"):
+
+                low, high = _range_params(column, used)
+
+                filters[low] = {
+                    "field": column,
+                    "kind": "range",
+                    "min_param": low,
+                    "max_param": high,
+                    "dtype": dtype,
+                }
+
+            elif dtype == "bool":
+
+                param = _param_name(column, used)
+
+                filters[param] = {
+                    "field": column,
+                    "kind": "bool",
+                    "test": f"({expr} = 1 OR lower({expr}) = 'true')",
+                }
+
+        # Sort keys are lower-cased + uniquified versions of the
+        # column name: _normalize() lower-cases the incoming sort
+        # param, so "Aggregate rating" must be reachable as
+        # "aggregate_rating" (columns stay raw in `sorts`' values).
+        sort_used = set()
+        sorts = {
+            _param_name(column, sort_used): column for column in fields
+        }
+
+        default_sort, default_dir = _default_sort(sorts, schema)
+
+        suggest = [
+            column for column in fields
+            if schema[column]["type"] == "string"
+        ][:6]
+
+        out[name] = {
+            "prefix": prefix,
+            "id_expr": id_expr,
+            "fields": fields,
+            "schema": schema,
+            "text": text,
+            "filters": filters,
+            "sorts": sorts,
+            "default_sort": default_sort,
+            "default_dir": default_dir,
+            "suggest": suggest,
+            "label": prettify(name),
+        }
+
+    return out
 
 
 class SearchService:
     """
-    Layer 8 - cached search over the cache_data table.
+    Layer 8 - cached search over the cache_data table(s).
 
     A search is not a special case bolted beside the cache: it IS a
     cache entry. Every unique combination of
@@ -189,6 +261,12 @@ class SearchService:
     Identical concurrent searches collapse to a single SQL query via
     the same SingleFlight that protects point-key reads.
 
+    Entities come from the dataset registry (one entity per imported
+    dataset, filters generated from its schema) or - in tests - from
+    an explicit `entities` dict. SQL runs against the physical file
+    that owns the entity's prefix (via MultiDatasetRepository.repo_for)
+    or against the plain repository the service was given.
+
     Reads go straight to DistributedCache (NOT CacheService.get)
     because CacheService's miss path performs a point lookup by
     exact key, which cannot run SQL. Writes reuse CacheService.set
@@ -205,7 +283,9 @@ class SearchService:
         telemetry,
         ttl: int = 300,
         page_size_default: int = _DEFAULT_PAGE_SIZE,
-        page_size_max: int = _MAX_PAGE_SIZE
+        page_size_max: int = _MAX_PAGE_SIZE,
+        entities: dict = None,
+        registry=None
     ):
 
         self.cache_service = cache_service
@@ -219,6 +299,11 @@ class SearchService:
         self.page_size_default = page_size_default
         self.page_size_max = page_size_max
 
+        self._static_entities = entities
+        self.registry = registry
+
+        self._entity_cache = {"revision": None, "specs": {}}
+
     # --------------------------------------------------
     # PUBLIC API
     # --------------------------------------------------
@@ -228,22 +313,47 @@ class SearchService:
 
         out = {}
 
-        for name, spec in ENTITIES.items():
+        for name, spec in self._spec_map().items():
+
+            schema = spec.get("schema") or {}
+
+            columns = list(spec.get("fields") or {})
+
+            filters = {}
+
+            for param, details in spec["filters"].items():
+
+                item = {
+                    "kind": details["kind"],
+                    "field": details["field"],
+                }
+
+                if details["kind"] == "range":
+                    item["min_param"] = details["min_param"]
+                    item["max_param"] = details["max_param"]
+                    item["dtype"] = details.get("dtype", "number")
+
+                elif details["kind"] == "enum":
+                    item["values"] = details.get("values") or []
+
+                filters[param] = item
+
+            fields_meta = {}
+
+            for column in columns:
+                if schema:
+                    fields_meta[column] = (
+                        schema.get(column, {}).get("type") or "string"
+                    )
+                else:
+                    fields_meta[column] = "string"
 
             out[name] = {
                 "prefix": spec["prefix"],
-                "filters": {
-                    param: {
-                        "kind": details["kind"],
-                        "field": details["field"],
-                        **(
-                            {"min_param": details["min_param"],
-                             "max_param": details["max_param"]}
-                            if details["kind"] == "range" else {}
-                        ),
-                    }
-                    for param, details in spec["filters"].items()
-                },
+                "label": spec.get("label") or prettify(name),
+                "columns": columns,
+                "fields": fields_meta,
+                "filters": filters,
                 "sorts": list(spec["sorts"]),
                 "default_sort": spec["default_sort"],
                 "default_dir": spec["default_dir"],
@@ -360,6 +470,8 @@ class SearchService:
                 "took_ms": self._ms(time.monotonic() - started),
             }
 
+        repo = self._repo(spec["prefix"])
+
         sql = (
             f"SELECT DISTINCT {expr} AS v FROM cache_data "
             f"WHERE key LIKE ? AND {expr} IS NOT NULL"
@@ -375,7 +487,7 @@ class SearchService:
         sql += " ORDER BY v LIMIT 15"
 
         result = self.circuit_breaker.call(
-            self.database.query, sql, tuple(args), 15
+            repo.query, sql, tuple(args), 15
         )
 
         values = [row[0] for row in result["rows"]]
@@ -402,6 +514,10 @@ class SearchService:
         """
         Key listing for the inspector. Deliberately NOT cached: an
         inspector that shows a stale key list is worse than useless.
+
+        With the multi-dataset store the listing merges every
+        repository that can hold matching keys (all of them when no
+        prefix is given).
         """
 
         limit = max(1, min(int(limit or 50), 500))
@@ -418,18 +534,31 @@ class SearchService:
         sql += " ORDER BY key LIMIT ?"
         args.append(limit)
 
-        result = self.circuit_breaker.call(
-            self.database.query, sql, tuple(args), limit
-        )
+        merged = {}
+        truncated = False
 
-        headers = result["headers"]
+        for repo in self._repos(prefix):
+
+            result = self.circuit_breaker.call(
+                repo.query, sql, tuple(args), limit
+            )
+
+            if result["truncated"]:
+                truncated = True
+
+            for row in result["rows"]:
+                merged[row[0]] = row[1]
+
+        keys = sorted(merged.items())
+
+        truncated = truncated or len(keys) > limit
 
         return {
             "prefix": prefix,
             "limit": limit,
-            "truncated": result["truncated"],
+            "truncated": truncated,
             "keys": [
-                dict(zip(headers, row)) for row in result["rows"]
+                {"key": key, "size": size} for key, size in keys[:limit]
             ],
         }
 
@@ -442,12 +571,14 @@ class SearchService:
 
         db_started = time.monotonic()
 
+        repo = self._repo(spec["prefix"])
+
         where, args = self._where(spec, normal)
 
         count_sql = f"SELECT COUNT(*) AS n FROM cache_data WHERE {where}"
 
         counted = self.circuit_breaker.call(
-            self.database.query, count_sql, tuple(args), 1
+            repo.query, count_sql, tuple(args), 1
         )
 
         total = counted["rows"][0][0] if counted["rows"] else 0
@@ -457,8 +588,13 @@ class SearchService:
 
         order = self._order(spec, normal)
 
+        # Aliases are quoted: real-world columns carry spaces and
+        # mixed case ("Restaurant Name"), which are invalid as bare
+        # SQL identifiers. Quoting keeps the JSON/header key equal to
+        # the raw column name (SQLite strips the quotes in the result
+        # description), so the UI still reads it verbatim.
         select = ", ".join(
-            [f"{expr} AS {name}" for name, expr in spec["fields"].items()]
+            [f'{expr} AS "{name}"' for name, expr in spec["fields"].items()]
         )
 
         page_sql = (
@@ -469,7 +605,7 @@ class SearchService:
         page_args = args + [page_size, (page - 1) * page_size]
 
         fetched = self.circuit_breaker.call(
-            self.database.query, page_sql, tuple(page_args), page_size
+            repo.query, page_sql, tuple(page_args), page_size
         )
 
         headers = fetched["headers"]
@@ -499,18 +635,22 @@ class SearchService:
         clauses = ["key LIKE ?"]
         args = [spec["prefix"] + "%"]
 
+        text_options = [
+            f"lower({spec['fields'][field]}) LIKE ?"
+            for field in spec["text"]
+            if field in spec["fields"]
+        ]
+
+        if not text_options:
+            text_options = [f"lower({spec['id_expr']}) LIKE ?"]
+
         # Keyword: every whitespace-separated term must match at
         # least one text field (AND across terms, OR across fields).
         for term in [t for t in normal["q"].split() if t]:
 
-            options = [
-                f"lower({spec['fields'][field]}) LIKE ?"
-                for field in spec["text"]
-            ]
+            clauses.append("(" + " OR ".join(text_options) + ")")
 
-            clauses.append("(" + " OR ".join(options) + ")")
-
-            args.extend([f"%{term.lower()}%"] * len(options))
+            args.extend([f"%{term.lower()}%"] * len(text_options))
 
         for param, details in spec["filters"].items():
 
@@ -571,18 +711,54 @@ class SearchService:
         return f"ORDER BY {expr} {direction}"
 
     # --------------------------------------------------
-    # NORMALIZATION + KEYS
+    # ENTITY RESOLUTION
     # --------------------------------------------------
+
+    def _spec_map(self) -> dict:
+        """Effective entity specs: explicit dict, else the registry."""
+
+        if self._static_entities is not None:
+            return self._static_entities
+
+        if self.registry is None:
+            return {}
+
+        revision = self.registry.revision()
+
+        if self._entity_cache["revision"] != revision:
+
+            self._entity_cache = {
+                "revision": revision,
+                "specs": build_entities(self.registry.entries()),
+            }
+
+        return self._entity_cache["specs"]
+
+    def _repo(self, prefix: str):
+        """Repository that physically owns `prefix` keys."""
+
+        resolver = getattr(self.database, "repo_for", None)
+
+        return resolver(prefix) if resolver else self.database
+
+    def _repos(self, prefix: str = "") -> list:
+        """Repositories that can hold keys matching `prefix`."""
+
+        resolver = getattr(self.database, "repos_matching", None)
+
+        return resolver(prefix) if resolver else [self.database]
 
     def _spec(self, entity: str) -> dict:
 
-        spec = ENTITIES.get(entity)
+        specs = self._spec_map()
+
+        spec = specs.get(entity)
 
         if spec is None:
 
             raise ValueError(
                 f"unknown entity: {entity} "
-                f"(expected one of {sorted(ENTITIES)})"
+                f"(expected one of {sorted(specs)})"
             )
 
         spec = dict(spec)
@@ -622,8 +798,15 @@ class SearchService:
 
             if kind == "range":
 
-                low = self._number(raw.get(details["min_param"]))
-                high = self._number(raw.get(details["max_param"]))
+                if details.get("dtype", "number") == "number":
+
+                    low = self._number(raw.get(details["min_param"]))
+                    high = self._number(raw.get(details["max_param"]))
+
+                else:
+
+                    low = self._text(raw.get(details["min_param"]))
+                    high = self._text(raw.get(details["max_param"]))
 
                 filters[details["min_param"]] = low
                 filters[details["max_param"]] = high
@@ -709,6 +892,14 @@ class SearchService:
         except (TypeError, ValueError):
 
             return None
+
+    @staticmethod
+    def _text(value):
+
+        if value in (None, ""):
+            return None
+
+        return str(value).strip() or None
 
     @staticmethod
     def _truthy(value) -> bool:

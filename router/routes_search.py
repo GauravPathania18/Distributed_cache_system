@@ -1,6 +1,6 @@
 from fastapi import HTTPException, Request
 
-from database.exceptions import DatabaseUnavailableError
+from database.exceptions import DatabaseQueryError, DatabaseUnavailableError
 
 from .app import app
 from . import _components
@@ -42,6 +42,12 @@ def search_entity(entity: str, request: Request):
 
         raise HTTPException(status_code=422, detail=str(error))
 
+    except DatabaseQueryError as error:
+
+        # The generated SQL was rejected by SQLite - a bug worth
+        # surfacing verbatim, not a fake outage.
+        raise HTTPException(status_code=500, detail=str(error))
+
     except DatabaseUnavailableError:
 
         raise HTTPException(
@@ -63,6 +69,10 @@ def search_suggest(entity: str, field: str, q: str = ""):
     except ValueError as error:
 
         raise HTTPException(status_code=422, detail=str(error))
+
+    except DatabaseQueryError as error:
+
+        raise HTTPException(status_code=500, detail=str(error))
 
     except DatabaseUnavailableError:
 
@@ -86,6 +96,10 @@ def browse_prefix(prefix: str = "", limit: int = 50):
     try:
 
         return _components.search_service.browse(prefix, limit)
+
+    except DatabaseQueryError as error:
+
+        raise HTTPException(status_code=500, detail=str(error))
 
     except DatabaseUnavailableError:
 

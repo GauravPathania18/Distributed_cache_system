@@ -1,29 +1,54 @@
 """
-Import an external dataset (CSV / TSV / JSON / JSONL) into the
-SQLite source of truth.
+Import one external dataset file into its own SQLite database.
 
 Kaggle, OpenML, data.gov, ... all hand you a file. This script
-turns each record into a cache_data row:
+turns each record into one cache_data row inside a per-dataset
+SQLite file and registers the result:
 
-    key   = --prefix + <value of the key column>
+    key   = <name>:<key column value>   (auto-detected column)
     value = the rest of the record, as JSON
+
+    data/datasets/<name>.db   the dataset's own physical file
+    data/registry.json        the manifest the router and TUI read
+
+One file -> one database -> one searchable entity. No hardcoding
+anywhere: the schema is sniffed from the data and drives the
+search filters/sorts in the web UI.
+
+Supported formats: CSV, TSV, JSON, JSONL, Parquet, Excel (xlsx)
+and Zip (a zip containing any of those).
 
 Examples:
 
-    python import_dataset.py --file users.csv --key-column id --prefix user:
-    python import_dataset.py --file products.json --key-column sku --limit 1000
-    python import_dataset.py --file logs.jsonl --key-column request_id --dry-run
-    python import_dataset.py --file users.csv --clear
+    python import_dataset.py --file datasets/netflix_titles.csv
+    python import_dataset.py --file data.xlsx --key-column sku --limit 5000
+    python import_dataset.py --file users.csv --name people --reimport
+    python import_dataset.py --seed           # import datasets/ drop folder
+    python import_dataset.py --list
+    python import_dataset.py --delete netflix_titles
+    python import_dataset.py --file big.csv --dry-run
 """
 
 import argparse
 import csv
+import io
+import itertools
 import json
 import os
 import sys
 import time
+import zipfile
 
 from database.exceptions import DatabaseUnavailableError
+from database.registry import (
+    DatasetRegistry,
+    SAMPLE_ROWS,
+    coerce,
+    detect_key_column,
+    detect_schema,
+    safe_key,
+    slugify,
+)
 from database.repository import DatabaseRepository
 
 
@@ -32,9 +57,15 @@ BATCH_SIZE = 500
 FORMAT_BY_EXTENSION = {
     ".csv": "csv",
     ".tsv": "tsv",
+    ".tab": "tsv",
     ".json": "json",
     ".jsonl": "jsonl",
     ".ndjson": "jsonl",
+    ".parquet": "parquet",
+    ".pq": "parquet",
+    ".xlsx": "excel",
+    ".xlsm": "excel",
+    ".zip": "zip",
 }
 
 
@@ -42,70 +73,39 @@ FORMAT_BY_EXTENSION = {
 # CLI
 # ---------------------------------------------------------
 
-def parse_args():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Load a CSV/JSON/JSONL dataset into data/cache.db"
+        description="Import a CSV/TSV/JSON/JSONL/Parquet/Excel/Zip "
+                    "dataset into its own SQLite file"
     )
 
-    parser.add_argument(
-        "--file",
-        required=True,
-        help="Path to the dataset file"
-    )
+    parser.add_argument("--file", default=None, help="Path to the dataset file")
+    parser.add_argument("--name", default=None,
+                        help="Dataset name (default: file name slug)")
+    parser.add_argument("--prefix", default=None,
+                        help="Key prefix (default: '<name>:')")
+    parser.add_argument("--key-column", default=None,
+                        help="Column used for cache keys (default: auto)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Import at most N records")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Parse and report without writing anything")
+    parser.add_argument("--reimport", action="store_true",
+                        help="Replace an already-registered dataset")
+    parser.add_argument("--seed", action="store_true",
+                        help="Import every unregistered file in the drop folder")
+    parser.add_argument("--list", action="store_true", dest="list_datasets",
+                        help="List registered datasets")
+    parser.add_argument("--delete", metavar="NAME", default=None,
+                        help="Unregister a dataset and delete its file")
+    parser.add_argument("--drop-dir", default=None,
+                        help="Drop folder for --seed (default: datasets/)")
 
-    parser.add_argument(
-        "--key-column",
-        default=None,
-        help="Column used to build the cache key "
-             "(default: 'id' if present, else the first column)"
-    )
+    return parser
 
-    parser.add_argument(
-        "--prefix",
-        default="",
-        help="Prefix prepended to every key, e.g. 'user:'"
-    )
 
-    parser.add_argument(
-        "--value-columns",
-        default=None,
-        help="Comma-separated subset of columns to store "
-             "(default: every column except the key column)"
-    )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Import at most N records"
-    )
-
-    parser.add_argument(
-        "--db",
-        default=os.environ.get("CACHE_DB_PATH", "data/cache.db"),
-        help="SQLite path (default: CACHE_DB_PATH or data/cache.db)"
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=BATCH_SIZE,
-        help=f"Rows per transaction (default: {BATCH_SIZE})"
-    )
-
-    parser.add_argument(
-        "--clear",
-        action="store_true",
-        help="Delete all existing rows before importing"
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Parse and validate the file without writing anything"
-    )
-
-    return parser.parse_args()
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 # ---------------------------------------------------------
@@ -113,320 +113,573 @@ def parse_args():
 # ---------------------------------------------------------
 
 def detect_format(path: str) -> str:
+    """File name -> format name (raises ValueError when unknown)."""
 
-    extension = os.path.splitext(path)[1].lower()
+    extension = os.path.splitext(str(path))[1].lower()
 
     file_format = FORMAT_BY_EXTENSION.get(extension)
 
     if file_format is None:
-
         supported = ", ".join(sorted(FORMAT_BY_EXTENSION))
-
-        sys.exit(
-            f"Unsupported file type '{extension}'. "
-            f"Supported: {supported}"
+        raise ValueError(
+            f"unsupported file type {extension!r} (supported: {supported})"
         )
 
     return file_format
 
 
-def read_rows(path: str, file_format: str):
-    """Yield one dict per record."""
+def _read_delimited(handle, delimiter: str):
+    yield from csv.DictReader(handle, delimiter=delimiter)
 
-    if not os.path.exists(path):
-        sys.exit(f"File not found: {path}")
+
+def _read_json(handle):
+    data = json.load(handle)
+
+    if isinstance(data, dict):
+        data = [data]
+
+    if not isinstance(data, list):
+        raise ValueError(
+            "JSON file must contain a list of records "
+            "(or a single record object)"
+        )
+
+    yield from data
+
+
+def _read_jsonl(handle):
+    for line_number, line in enumerate(handle, start=1):
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid JSON on line {line_number}: {error}")
+
+
+def _read_pandas(source, file_format: str):
+    """Parquet / Excel records via pandas (lazy import)."""
+
+    try:
+        import pandas as pd
+    except ImportError:
+        raise ValueError(
+            "reading Parquet/Excel needs pandas "
+            "(pip install -r requirements.txt)"
+        )
+
+    try:
+
+        if file_format == "parquet":
+            try:
+                import pyarrow  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "reading Parquet needs pyarrow "
+                    "(pip install -r requirements.txt)"
+                )
+            frame = pd.read_parquet(source)
+        else:
+            try:
+                import openpyxl  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "reading Excel needs openpyxl "
+                    "(pip install -r requirements.txt)"
+                )
+            frame = pd.read_excel(source)
+
+    except ImportError as error:
+        raise ValueError(f"missing engine for {file_format}: {error}")
+
+    for record in frame.to_dict("records"):
+        yield {str(column): value for column, value in record.items()}
+
+
+def _zip_member(path: str) -> str:
+    """First supported data file inside a zip archive."""
+
+    with zipfile.ZipFile(path) as archive:
+
+        for name in archive.namelist():
+
+            if name.endswith("/") or name.startswith("__MACOSX/"):
+                continue
+
+            if os.path.basename(name).startswith("."):
+                continue
+
+            extension = os.path.splitext(name)[1].lower()
+
+            if extension in FORMAT_BY_EXTENSION and extension != ".zip":
+                return name
+
+    raise ValueError("no supported data file found inside the zip archive")
+
+
+def read_rows(path: str, file_format: str = None):
+    """Yield one dict per record, for every supported format."""
+
+    if not os.path.isfile(path):
+        raise ValueError(f"file not found: {path}")
+
+    file_format = file_format or detect_format(path)
+
+    if file_format == "zip":
+
+        with zipfile.ZipFile(path) as archive:
+
+            member = _zip_member(path)
+            inner_format = detect_format(member)
+
+            with archive.open(member) as raw:
+
+                if inner_format in ("csv", "tsv"):
+                    text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+                    yield from _read_delimited(
+                        text, "\t" if inner_format == "tsv" else ","
+                    )
+                elif inner_format == "json":
+                    text = io.TextIOWrapper(raw, encoding="utf-8")
+                    yield from _read_json(text)
+                elif inner_format == "jsonl":
+                    text = io.TextIOWrapper(raw, encoding="utf-8")
+                    yield from _read_jsonl(text)
+                else:
+                    yield from _read_pandas(io.BytesIO(raw.read()), inner_format)
+
+        return
 
     if file_format in ("csv", "tsv"):
-
-        delimiter = "\t" if file_format == "tsv" else ","
-
         with open(path, newline="", encoding="utf-8-sig") as handle:
-            yield from csv.DictReader(handle, delimiter=delimiter)
-
-    elif file_format == "json":
-
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-
-        if isinstance(data, dict):
-            data = [data]
-
-        if not isinstance(data, list):
-            sys.exit(
-                "JSON file must contain a list of records "
-                "(or a single record object)"
+            yield from _read_delimited(
+                handle, "\t" if file_format == "tsv" else ","
             )
 
-        yield from data
-
-    else:  # jsonl
-
+    elif file_format == "json":
         with open(path, encoding="utf-8") as handle:
+            yield from _read_json(handle)
 
-            for line_number, line in enumerate(handle, start=1):
+    elif file_format == "jsonl":
+        with open(path, encoding="utf-8") as handle:
+            yield from _read_jsonl(handle)
 
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                try:
-                    yield json.loads(line)
-
-                except json.JSONDecodeError as error:
-                    sys.exit(
-                        f"Invalid JSON on line {line_number}: {error}"
-                    )
-
-
-def coerce(value):
-    """CSV cells are always strings; turn plain numbers and booleans
-    into their real types."""
-
-    if not isinstance(value, str):
-        return value
-
-    stripped = value.strip()
-
-    if stripped in ("True", "true"):
-        return True
-
-    if stripped in ("False", "false"):
-        return False
-
-    try:
-        return int(stripped)
-    except ValueError:
-        pass
-
-    try:
-        return float(stripped)
-    except ValueError:
-        pass
-
-    return value
+    else:  # parquet / excel
+        yield from _read_pandas(path, file_format)
 
 
 # ---------------------------------------------------------
 # RECORD MAPPING
 # ---------------------------------------------------------
 
-def pick_key_column(columns, requested):
-
-    if requested:
-
-        if requested not in columns:
-            sys.exit(
-                f"Key column '{requested}' not found. "
-                f"Available columns: {', '.join(columns)}"
-            )
-
-        return requested
-
-    if "id" in columns:
-        return "id"
-
-    return columns[0]
-
-
-def entry_from_record(
-    record,
-    key_column,
-    prefix,
-    value_columns,
-    row_number
-):
-    """Turn one dataset record into a (key, value) pair."""
+def entry_from_record(record, key_column, prefix, row_number):
+    """One dataset record -> one (key, json-safe value) pair."""
 
     if not isinstance(record, dict):
-        sys.exit(
-            f"Record {row_number} is not an object "
+        raise ValueError(
+            f"record {row_number} is not an object "
             f"(got {type(record).__name__})"
         )
 
-    if key_column not in record:
-        sys.exit(
-            f"Record {row_number} has no '{key_column}' field. "
-            f"Available fields: {', '.join(map(str, record.keys()))}"
-        )
+    record = {str(column): value for column, value in record.items()}
 
-    raw_key = record[key_column]
+    if key_column is None:
 
-    if raw_key is None or str(raw_key) == "":
-        sys.exit(f"Record {row_number} has an empty '{key_column}'")
-
-    key = f"{prefix}{raw_key}"
-
-    if value_columns is not None:
-
-        missing = [column for column in value_columns
-                   if column not in record]
-
-        if missing:
-            sys.exit(
-                f"Record {row_number} is missing columns: "
-                f"{', '.join(missing)}"
-            )
-
-        fields = value_columns
+        key = f"{prefix}{row_number}"
+        fields = record.items()
 
     else:
+
+        if key_column not in record:
+            raise ValueError(
+                f"record {row_number} has no {key_column!r} field"
+            )
+
+        raw = record[key_column]
+
+        if raw in (None, "") or (
+            isinstance(raw, str) and not raw.strip()
+        ):
+            raise ValueError(
+                f"record {row_number} has an empty {key_column!r}"
+            )
+
+        fragment = safe_key(raw) or str(row_number)
+
+        key = f"{prefix}{fragment}"
+
+        # Sanitized keys ("The Matrix" -> "The+Matrix") keep the
+        # original column so no information is lost.
+        keep_key_column = fragment != str(raw).strip()
+
         fields = [
-            column for column in record
-            if column != key_column
+            (column, value) for column, value in record.items()
+            if column != key_column or keep_key_column
         ]
 
-    value = {
-        column: coerce(record[column])
-        for column in fields
-    }
+    value = {column: coerce(cell) for column, cell in fields}
 
     return key, value
-
-
-def iter_entries(args):
-    """Yield (key, value) pairs from the dataset file."""
-
-    file_format = detect_format(args.file)
-
-    records = read_rows(args.file, file_format)
-
-    value_columns = None
-
-    if args.value_columns:
-        value_columns = [
-            column.strip()
-            for column in args.value_columns.split(",")
-            if column.strip()
-        ]
-
-    for row_number, record in enumerate(records, start=1):
-
-        yield entry_from_record(
-            record,
-            args.resolved_key_column,
-            args.prefix,
-            value_columns,
-            row_number
-        )
-
-        if args.limit and row_number >= args.limit:
-            return
-
-
-def collect_columns(args):
-    """Peek at the first record to resolve the key column."""
-
-    file_format = detect_format(args.file)
-
-    first = next(iter(read_rows(args.file, file_format)), None)
-
-    if first is None:
-        sys.exit("The file contains no records")
-
-    if not isinstance(first, dict):
-        sys.exit(
-            f"The first record is not an object "
-            f"(got {type(first).__name__})"
-        )
-
-    return list(first.keys())
 
 
 # ---------------------------------------------------------
 # IMPORT
 # ---------------------------------------------------------
 
-def import_dataset(args):
+def import_file(
+    file,
+    name=None,
+    prefix=None,
+    key_column=None,
+    limit=None,
+    dry_run=False,
+    reimport=False,
+    registry: DatasetRegistry = None,
+    verbose=True,
+) -> dict:
+    """Import one file into its own SQLite file + registry entry.
+
+    Writes into a temporary database first and swaps it into place
+    on success, so a failed import never destroys an existing
+    dataset. Raises ValueError for user-level problems (missing
+    file, unknown format, bad key column, empty file).
+    """
 
     started = time.time()
 
-    columns = collect_columns(args)
+    registry = registry or DatasetRegistry()
 
-    args.resolved_key_column = pick_key_column(columns, args.key_column)
+    if not os.path.isfile(file):
+        raise ValueError(f"file not found: {file}")
 
-    print(f"File          : {args.file}")
-    print(f"Format        : {detect_format(args.file)}")
-    print(f"Columns       : {', '.join(columns)}")
-    print(f"Key column    : {args.resolved_key_column}"
-          f"{' (auto)' if not args.key_column else ''}")
-    if args.prefix:
-        print(f"Key prefix    : {args.prefix}")
-    print()
+    file_format = detect_format(file)
 
-    repository = DatabaseRepository(db_path=args.db)
+    dataset_name = slugify(name or file)
 
-    if args.clear and not args.dry_run:
-        repository.clear()
-        print("Cleared existing rows")
+    existing = registry.get(dataset_name)
 
-    seen_keys = set()
-    duplicates = 0
+    if existing is not None and not reimport and not dry_run:
+        raise ValueError(
+            f"dataset {dataset_name!r} is already registered - "
+            f"pass --reimport to replace it"
+        )
 
-    total = 0
+    sample = list(itertools.islice(read_rows(file, file_format), SAMPLE_ROWS))
+
+    if not sample:
+        raise ValueError("the file contains no records")
+
+    if not isinstance(sample[0], dict):
+        raise ValueError(
+            "the first record is not an object "
+            f"(got {type(sample[0]).__name__})"
+        )
+
+    columns = list(sample[0].keys())
+
+    resolved_key = detect_key_column(columns, sample, key_column)
+
+    resolved_prefix = f"{dataset_name}:" if prefix is None else prefix
+
+    if resolved_prefix.startswith(("q:", "s:")):
+        raise ValueError(
+            f"prefix {resolved_prefix!r} is reserved for search cache keys"
+        )
+
+    schema_sample = [
+        {
+            column: value for column, value in record.items()
+            if column != resolved_key
+        }
+        if isinstance(record, dict) else record
+        for record in sample
+    ]
+
+    schema = detect_schema(schema_sample)
+
+    summary = {
+        "file": os.path.abspath(file),
+        "format": file_format,
+        "name": dataset_name,
+        "prefix": resolved_prefix,
+        "key_column": resolved_key,
+        "columns": columns,
+        "schema": schema,
+        "rows": 0,
+        "duplicates": 0,
+        "db_path": (
+            existing["db_path"] if existing
+            else registry.dataset_db_path(dataset_name)
+        ),
+        "dry_run": dry_run,
+    }
+
+    if verbose:
+        _print_plan(summary)
+
+    if dry_run:
+        if verbose:
+            print("Dry run       : nothing was written")
+        return summary
+
+    stats = os.stat(file)
+
+    final_path = summary["db_path"]
+    temporary_path = final_path + ".import"
+
+    store = DatabaseRepository(db_path=temporary_path)
+
+    seen = set()
+    samples = []
     batch = []
 
     try:
 
-        for key, value in iter_entries(args):
+        for row_number, record in enumerate(
+            read_rows(file, file_format), start=1
+        ):
 
-            if key in seen_keys:
-                duplicates += 1
-
-            seen_keys.add(key)
-
-            batch.append((key, value))
-            total += 1
-
-            if len(batch) >= args.batch_size:
-
-                if not args.dry_run:
-                    repository.set_many(batch)
-
-                batch = []
-
-        if batch and not args.dry_run:
-            repository.set_many(batch)
-
-    except DatabaseUnavailableError as error:
-        sys.exit(f"Database error: {error}")
-
-    elapsed = time.time() - started
-
-    # -----------------------------------------------------
-    # SUMMARY
-    # -----------------------------------------------------
-
-    print(f"Records read  : {total}")
-
-    if duplicates:
-        print(f"Duplicate keys: {duplicates} (last value wins)")
-
-    if args.dry_run:
-        print("Dry run       : nothing was written")
-    else:
-        print(f"Rows written  : {total}")
-        print(f"Database      : {args.db}")
-
-    print(f"Elapsed       : {elapsed:.2f}s")
-
-    # Sample of what was imported.
-    if total:
-
-        samples = []
-
-        for key, _ in iter_entries(args):
-            samples.append(key)
-            if len(samples) == 3:
+            if limit is not None and row_number > limit:
                 break
 
-        print(f"Sample keys   : {', '.join(samples)}")
+            key, value = entry_from_record(
+                record, resolved_key, resolved_prefix, row_number
+            )
+
+            if key in seen:
+                summary["duplicates"] += 1
+
+            seen.add(key)
+
+            if len(samples) < 3:
+                samples.append(key)
+
+            batch.append((key, value))
+            summary["rows"] += 1
+
+            if len(batch) >= BATCH_SIZE:
+                store.set_many(batch)
+                batch = []
+
+        if batch:
+            store.set_many(batch)
+
+    except Exception:
+        _discard(temporary_path)
+        raise
+
+    os.replace(temporary_path, final_path)
+
+    summary["db_path"] = final_path
+
+    registry.register(
+        dataset_name,
+        prefix=resolved_prefix,
+        db_path=final_path,
+        source_file=os.path.abspath(file),
+        file_format=file_format,
+        key_column=resolved_key,
+        row_count=summary["rows"],
+        schema=schema,
+        source_size=stats.st_size,
+        source_mtime=stats.st_mtime,
+    )
+
+    summary["sample_keys"] = samples
+    summary["elapsed"] = round(time.time() - started, 2)
+
+    if verbose:
+        _print_result(summary)
+
+    return summary
+
+
+def _discard(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def seed_drop_folder(
+    drop_dir: str = None,
+    registry: DatasetRegistry = None,
+    limit=None,
+    verbose=False,
+) -> list:
+    """Import every unregistered (or changed) file in the drop folder.
+
+    This is what `tui.py` runs on boot: drop a Kaggle CSV into
+    datasets/ and the next start imports it once. Already-imported
+    files are skipped; a file whose size/mtime changed re-imports.
+    """
+
+    registry = registry or DatasetRegistry()
+
+    results = []
+
+    for path in registry.scan_drop_folder(drop_dir):
+
+        dataset_name = slugify(os.path.basename(path))
+
+        already_registered = registry.get(dataset_name) is not None
+
+        try:
+
+            record = import_file(
+                path,
+                name=dataset_name,
+                limit=limit,
+                reimport=already_registered,
+                registry=registry,
+                verbose=verbose,
+            )
+
+            record["status"] = (
+                "reimported" if already_registered else "imported"
+            )
+
+        except (ValueError, DatabaseUnavailableError) as error:
+
+            record = {
+                "file": path,
+                "name": dataset_name,
+                "status": "failed",
+                "error": str(error),
+                "rows": 0,
+            }
+
+        results.append(record)
+
+    return results
+
+
+# ---------------------------------------------------------
+# REPORTING
+# ---------------------------------------------------------
+
+def _print_plan(summary: dict) -> None:
+
+    key_note = "" if summary["key_column"] else " (row number)"
+
+    print(f"File          : {summary['file']}")
+    print(f"Format        : {summary['format']}")
+    print(f"Dataset       : {summary['name']}")
+    print(f"Columns       : {', '.join(summary['columns'])}")
+    print(f"Key column    : {summary['key_column'] or '-'}{key_note}")
+    print(f"Key prefix    : {summary['prefix']}")
+    print()
+
+
+def _print_result(summary: dict) -> None:
+
+    print(f"Records read  : {summary['rows']}")
+
+    if summary["duplicates"]:
+        print(f"Duplicate keys: {summary['duplicates']} (last value wins)")
+
+    print(f"Rows written  : {summary['rows']}")
+    print(f"Database      : {summary['db_path']}")
+    print(f"Elapsed       : {summary.get('elapsed', 0)}s")
+
+    if summary.get("sample_keys"):
+        print(f"Sample keys   : {', '.join(summary['sample_keys'])}")
+
+
+def list_datasets(registry: DatasetRegistry = None) -> list:
+    """One info dict per registered dataset (rows read live)."""
+
+    registry = registry or DatasetRegistry()
+
+    out = []
+
+    for name in registry.names():
+
+        entry = registry.get(name)
+
+        rows = 0
+        size = 0
+
+        try:
+            if os.path.exists(entry["db_path"]):
+                rows = DatabaseRepository(db_path=entry["db_path"]).count()
+                size = os.path.getsize(entry["db_path"])
+        except DatabaseUnavailableError:
+            pass
+
+        out.append({**entry, "rows_live": rows, "db_bytes": size})
+
+    return out
 
 
 # ---------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
 
-    import_dataset(parse_args())
+    parser = build_parser()
+
+    args = parser.parse_args(argv)
+
+    registry = DatasetRegistry(drop_dir=args.drop_dir)
+
+    try:
+
+        if args.list_datasets:
+            for entry in list_datasets(registry):
+                print(
+                    f"{entry['name']:<32} {entry['prefix']:<20} "
+                    f"rows={entry['rows_live']:<8} "
+                    f"key={entry['key_column'] or '(row #)':<16} "
+                    f"{os.path.basename(entry['source_file'] or '-')}"
+                )
+            return 0
+
+        if args.delete:
+            if registry.unregister(args.delete):
+                print(f"deleted dataset {args.delete!r}")
+                return 0
+            print(f"no dataset named {args.delete!r}")
+            return 1
+
+        if args.seed:
+            results = seed_drop_folder(
+                drop_dir=args.drop_dir,
+                registry=registry,
+                limit=args.limit,
+                verbose=True,
+            )
+            if not results:
+                print("drop folder is empty or fully imported")
+            failed = [r for r in results if r["status"] == "failed"]
+            return 1 if failed else 0
+
+        if args.file:
+            import_file(
+                args.file,
+                name=args.name,
+                prefix=args.prefix,
+                key_column=args.key_column,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                reimport=args.reimport,
+                registry=registry,
+                verbose=True,
+            )
+            return 0
+
+        parser.print_help()
+        return 1
+
+    except (ValueError, DatabaseUnavailableError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

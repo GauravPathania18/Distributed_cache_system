@@ -43,7 +43,7 @@ DCS is an educational Python implementation of a distributed cache with:
 - Node lifecycle states, periodic health checks, and gated recovery.
 - In-memory operation statistics, bounded hot-key tracking, and throttled
   cache warm-up before a recovering node re-enters the ring.
-- A terminal launcher/control panel, dataset generator/importer, and demos.
+- A terminal launcher/control panel and a file-based dataset importer.
 
 ### Request and recovery paths
 
@@ -277,15 +277,18 @@ and the recovery gate are satisfied.
   Lifecycle helpers are imported inside methods where needed to avoid
   circular initialization between the manager and the state-machine module.
 
-### 3.3 `database/` — SQLite repository
+### 3.3 `database/` — SQLite stores, dataset registry, and prefix routing
 
 #### [`database/__init__.py`](./database/__init__.py)
 
-- **Purpose/problem solved:** Exposes the repository as the package's public
-  storage API.
-- **Public symbols:** `DatabaseRepository`.
-- **Imports:** Relative import and `__all__` make the repository available
-  from the package namespace.
+- **Purpose/problem solved:** Exposes the storage API as the package's
+  public surface.
+- **Public symbols:** `DatabaseRepository` (one SQLite file),
+  `DatasetRegistry` (the `data/registry.json` manifest), and
+  `MultiDatasetRepository` (routes keys across the system and per-dataset
+  files).
+- **Imports:** Relative imports and `__all__` make the three classes
+  available from the package namespace.
 
 #### [`database/exceptions.py`](./database/exceptions.py)
 
@@ -330,6 +333,49 @@ and the recovery gate are satisfied.
   connection methods are supplied by `_ConnectionMixin` and `_CrudMixin`.
 - **Imports:** `Path` creates the parent directory; the mixins supply
   connection and query behavior.
+
+#### [`database/registry.py`](./database/registry.py)
+
+- **Purpose/problem solved:** Turns each imported dataset file into a
+  registered, physically separate SQLite database with a sniffed schema,
+  so nothing about searchable entities is hardcoded.
+- **Constants/functions:** `RESERVED_NAMES`/`RESERVED_PREFIXES` keep `q:`
+  and `s:` free for the search cache. `slugify()` derives a dataset name
+  from a file name; `safe_key()` makes key values URL-path safe;
+  `coerce()` types CSV strings; `detect_schema()` samples rows to classify
+  each column (string/number/date/bool, plus distinct-value lists for
+  low-cardinality strings that become enum facets); `detect_key_column()`
+  picks an explicit, id-style, or 100%-unique column (row-index fallback
+  otherwise).
+- **Class:** `DatasetRegistry` owns `data/registry.json` (paths derived
+  from `CACHE_DB_PATH` so tests stay hermetic). `register()` writes one
+  manifest entry plus a source-file fingerprint (size/mtime) for change
+  detection; `unregister()` removes the entry and deletes the dataset's
+  database file; `entries()`/`names()`/`get()` read the manifest with an
+  mtime-cached reload (`revision()` bumps across instances);
+  `scan_drop_folder()` lists new/changed files in the drop folder;
+  `prefix_for()`/`entry_for()` resolve a key to its dataset by longest
+  matching prefix.
+- **Imports:** `json` persists the manifest; `os`/`re` derive paths and
+  slug patterns; `time` stamps fingerprints; `pathlib.Path` touches files.
+
+#### [`database/multi_repository.py`](./database/multi_repository.py)
+
+- **Purpose/problem solved:** One interface over many SQLite files:
+  `data/cache.db` holds search-cache (`q:`/`s:`) and manual keys, and every
+  registered dataset keeps its own `data/datasets/<name>.db`.
+- **Class:** `MultiDatasetRepository` mirrors the `DatabaseRepository`
+  interface (`get`/`set`/`delete`/`exists`/`count`/`keys`/`iter_keys`/
+  `query`/`set_many`/`clear`) so every layer above works unchanged. Each
+  key is routed by its longest matching dataset prefix; unmatched keys
+  fall through to the system store. `repo_for()`, `repo_named()`,
+  `repos_matching()`, and `repos()` expose the individual stores for the
+  TUI and SQL console; `query()` infers the target store from `LIKE`
+  parameters. Registry changes are picked up live via a revision check,
+  and dataset files are created lazily on first touch.
+- **Imports:** `heapq`/`itertools` merge sorted key streams across stores;
+  `DatasetRegistry` supplies the routing table; `DatabaseRepository`
+  implements each individual store.
 
 ### 3.4 `services/` — cache policy and resilience primitives
 
@@ -456,11 +502,12 @@ and the recovery gate are satisfied.
 #### [`router/_components.py`](./router/_components.py)
 
 - **Purpose/problem solved:** Constructs and wires the router's shared
-  database, cluster manager, data-plane client, cache service, hot-key
-  manager, and warm-up service.
+  dataset registry, multi-dataset repository, cluster manager, data-plane
+  client, cache service, search service, hot-key manager, and warm-up
+  service.
 - **Symbols:** Module-level instances represent the production process.
-  `configure_cluster()` rebuilds cluster-dependent components for demos and
-  tests, and updates the compatibility shim's references.
+  `configure_cluster()` rebuilds cluster-dependent components for tests and
+  restarts, and updates the compatibility shim's references.
 - **Imports:** `sys` allows the shim reference update. The cache, cluster,
   database, and service imports supply the shared components; settings and
   `nodes_from_env()` supply their configuration.
@@ -514,7 +561,7 @@ and the recovery gate are satisfied.
 - **Imports:** `app` and the shared components are re-exported; the route
   modules are imported for their endpoint-registration side effects.
 
-### 3.6 Root-level Python files — entry points, demos, and data tools
+### 3.6 Root-level Python files — entry points and data tools
 
 #### [`main.py`](./main.py)
 
@@ -539,8 +586,10 @@ and the recovery gate are satisfied.
 - **Purpose/problem solved:** One-command local launcher and interactive
   operations panel for the router and cache nodes.
 - **Functions:** `node_port()`, `db_path()`, and `repository()` resolve local
-  endpoints/storage. `init_color()`, `paint()`, and `clear()` render the
-  terminal. `http()`/`_detail()` normalize API results.
+  endpoints/storage (`repository()` returns a `MultiDatasetRepository`).
+  `auto_seed()` imports new/changed files from the `datasets/` drop folder
+  before the cluster starts. `init_color()`, `paint()`, and `clear()` render
+  the terminal. `http()`/`_detail()` normalize API results.
   `project_python()`, `spawn()`, `is_alive()`, `alive_children()`,
   `ensure_running()`, `stop_all()`, and `_emergency_stop()` manage child
   processes while avoiding termination of services the UI did not start.
@@ -550,80 +599,48 @@ and the recovery gate are satisfied.
   `compute_verdict()` handle values and cache-vs-database consistency
   summaries. `action_status()`, `action_put()`, `action_get()`,
   `action_delete()`, `action_db_get()`, `action_resume()`,
-  `action_inspect()`, `action_list_keys()`, `action_sql()`, and
-  `action_stats()` implement menu operations. `main()` runs the menu and
-  arranges shutdown.
+  `action_inspect()`, `action_list_keys()`, `action_sql()`,
+  `action_stats()`, and `action_datasets()` (list/import/delete datasets)
+  implement menu operations. `main()` runs the menu and arranges shutdown.
 - **Imports:** Standard-library `atexit`, `signal`, `subprocess`, `sys`, and
   `os` manage child processes, shutdown, paths, and terminal behavior;
   `json` formats and parses values; `time` implements wait/deadline logic;
   `quote` and `urlparse` encode keys and parse node URLs. `requests` performs
-  HTTP calls; `check_node` probes cache nodes; `DatabaseRepository` and
-  `DatabaseUnavailableError` support direct diagnostic reads; `nodes_from_env`
+  HTTP calls; `check_node` probes cache nodes; `DatasetRegistry` and
+  `MultiDatasetRepository` provide dataset-aware diagnostics (key listing
+  and the per-store SQL console); `slugify`, `import_file`,
+  `list_datasets`, and `seed_drop_folder` implement dataset management;
+  `DatabaseUnavailableError` classifies read failures; `nodes_from_env`
   uses the router's configured node set.
 - **Engineering note:** The SQL console is intentionally described here as
   an inspection tool, but the repository query guard should not be treated
   as a security boundary; see §5.
 
-#### [`demo.py`](./demo.py)
-
-- **Purpose/problem solved:** Demonstrates the base cache behavior without
-  starting a server.
-- **Functions:** `main()` runs LRU ordering, reads, eviction, TTL expiry,
-  deletion, existence, and statistics examples.
-- **Imports:** `time` pauses for the TTL demonstration; `LRUCache` is the
-  implementation being demonstrated.
-
-#### [`demo_hash.py`](./demo_hash.py)
-
-- **Purpose/problem solved:** Shows key placement on a consistent-hash ring
-  without requiring any running services.
-- **Functions:** `main()` builds a three-node ring and prints placement for
-  sample user/product keys.
-- **Imports:** `ConsistentHashRing` is the data structure under demonstration.
-
-#### [`demo_router.py`](./demo_router.py)
-
-- **Purpose/problem solved:** Intended as a quick HTTP demonstration of
-  router PUT/GET placement for sample keys.
-- **Functions:** `main()` sends sample PUTs and GETs to the router and prints
-  node/value results.
-- **Imports:** `requests` sends HTTP calls.
-- **Caveat:** The script expects response fields (`node` on PUT and
-  `data.value` on GET) that do not match the current `routes_cache.py`
-  response shapes (`nodes` on PUT and `value` on GET). Update this demo before
-  relying on it as a working smoke test.
-
-#### [`generate_dataset.py`](./generate_dataset.py)
-
-- **Purpose/problem solved:** Creates deterministic sample CSV, JSON, and
-  JSONL data for exercising dataset import and cache-aside behavior.
-- **Functions/data:** `make_user()`, `make_product()`, and `make_order()`
-  build records. `KINDS` and `WRITERS` map data types to formats and output
-  paths. `write_csv()`, `write_json()`, and `write_jsonl()` persist records.
-  `generate()` validates and creates one dataset. `parse_args()` and
-  `main()` provide the CLI.
-- **Imports:** `argparse` defines CLI options; `csv`/`json` serialize records;
-  `os` creates directories/joins paths; `random` generates data using a
-  reproducible per-kind seed.
-
 #### [`import_dataset.py`](./import_dataset.py)
 
-- **Purpose/problem solved:** Loads external records into SQLite as
-  `key → JSON value` entries, avoiding manual data conversion and individual
-  database writes.
-- **Functions/constants:** `parse_args()` declares file/key/prefix/column/
-  limit/database/batch/clear/dry-run options. `detect_format()` selects a
-  reader. `read_rows()` handles CSV, TSV, JSON, JSONL, and NDJSON.
-  `coerce()` infers numeric/boolean CSV values. `pick_key_column()` resolves
-  an explicit key column or defaults to `id`/the first column.
-  `entry_from_record()` validates and maps a record; `iter_entries()` streams
-  mapped key/value pairs; `collect_columns()` inspects the first record.
-  `import_dataset()` processes batches, identifies duplicate keys, writes
-  unless in dry-run mode, and reports a summary.
-- **Imports:** `argparse` handles CLI; `csv`, `json`, and `os` read input
-  formats and paths; `sys` reports invalid input/CLI errors; `time` measures
-  elapsed import time. `DatabaseUnavailableError` and
-  `DatabaseRepository` provide batched persistence.
+- **Purpose/problem solved:** Imports one external data file (Kaggle,
+  OpenML, data.gov, ...) into its own SQLite database and registers it,
+  so every file becomes one searchable entity with no hardcoded schema.
+- **Functions/constants:** `build_parser()`/`parse_args()`/`main()` expose
+  the CLI: `--file`, `--name`, `--prefix`, `--key-column`, `--limit`,
+  `--dry-run`, `--reimport`, `--seed` (import the drop folder),
+  `--drop-dir`, `--list`, and `--delete`. `detect_format()` maps extensions
+  (CSV, TSV, JSON, JSONL/NDJSON, Parquet, Excel, Zip) to a reader;
+  `read_rows()` streams records (unzipping Zip containers and delegating
+  Parquet/Excel to pandas); `entry_from_record()` splits a record into
+  `<prefix><key-column value>` and the remaining columns as a JSON value
+  (sanitized keys keep their column; row numbers are the fallback);
+  `import_file()` sniffs the key column and schema through the registry,
+  writes rows with `set_many()` into a temporary `.import` file and swaps
+  it in with `os.replace` so a failed import never destroys existing data,
+  then registers or re-imports the dataset. `seed_drop_folder()` imports
+  every new or changed file in the drop folder and returns per-file
+  `imported`/`reimported`/`failed` records (used by `tui.py` on boot).
+  `list_datasets()` reports live row counts and database sizes.
+- **Imports:** `argparse`/`sys` provide CLI and error reporting; `csv`,
+  `json`, `zipfile`, and `os` read inputs and manage paths; `time` measures
+  elapsed import time. `DatasetRegistry` owns the manifest; the repository
+  classes provide batched persistence.
 
 ### 3.7 Project metadata and documentation
 
@@ -631,7 +648,8 @@ and the recovery gate are satisfied.
 
 - **Purpose/problem solved:** Keeps local runtime artifacts out of Git:
   virtual environments, Python bytecode, test/coverage output, IDE/OS files,
-  logs, SQLite data, generated datasets, and research PDFs.
+  logs, SQLite data (system store, `data/datasets/*.db`, registry), user
+  dataset files in the `datasets/` drop folder, and research PDFs.
 - **Imports:** Not applicable.
 
 #### [`requirements.txt`](./requirements.txt)
@@ -646,18 +664,18 @@ and the recovery gate are satisfied.
 #### [`README.md`](./README.md)
 
 - **Purpose/problem solved:** Gives the project overview, architecture,
-  layer roadmap, quick start, configuration, and top-level testing/demo
+  layer roadmap, quick start, configuration, and top-level testing/import
   commands.
-- **Important content:** Describes the source-of-truth/cache relationship and
-  development roadmap. Some statements (including the test count) are not
-  verifiable from tracked tests in this checkout.
+- **Important content:** Describes the source-of-truth/cache relationship,
+  the dataset import flow (drop folder → per-dataset SQLite → registry),
+  and the development roadmap.
 - **Imports:** Not applicable.
 
 #### [`commands.md`](./commands.md)
 
 - **Purpose/problem solved:** Detailed operator/developer command reference:
   environment setup, terminal UI, layer-specific endpoints, fault-tolerance
-  walkthroughs, warm-up, dataset generation/import, and test commands.
+  walkthroughs, warm-up, dataset import, and test commands.
 - **Important content:** Contains setup and examples; it is not executable
   application logic. Cross-check these commands against the current code
   before treating them as operational guarantees.
@@ -682,7 +700,7 @@ and the recovery gate are satisfied.
 | Setting | Default in code | Purpose |
 |---|---|---|
 | `CACHE_NODES` | Three `127.0.0.1` URLs on ports 8001–8003 | Router node membership |
-| `CACHE_DB_PATH` | `data/cache.db` | SQLite source-of-truth file |
+| `CACHE_DB_PATH` | `data/cache.db` | System SQLite store; the registry (`data/registry.json`) and per-dataset files (`data/datasets/*.db`) derive from its directory |
 | `RECOVERY_THRESHOLD` | `2` | Consecutive healthy checks before readiness |
 | `CLUSTER_BOOTSTRAP_STATE` | `starting` | Initial state for configured nodes |
 | `WARMUP_ENABLED` | enabled | Enables recovery warm-up/readiness gate |
@@ -748,12 +766,10 @@ These notes describe observed code behavior, not future design intent:
    opened read-only does not match this implementation. Do not expose this
    query helper to untrusted callers.
 7. **Documented tests are not present in the tracked tree.** `README.md` and
-   `commands.md` cite 194 pytest tests, but `.gitignore` excludes `tests/`
+   `commands.md` cite 303 pytest tests, but `.gitignore` excludes `tests/`
    and `git ls-files` currently contains no test sources. Restore/track the
    intended test suite before using those counts as a release gate.
-8. **Router demo response schema is stale.** `demo_router.py` expects output
-   fields that current cache routes do not return; see its file entry above.
-9. **Planned roadmap is not implemented by this inventory.** README items
+8. **Planned roadmap is not implemented by this inventory.** README items
    after Layer 6.3 (replica placement evolution, write replication log/version
    sync, formal failure detection, automatic failover, and re-replication/
    rebalancing) are listed as planned/next, not current capabilities.
@@ -779,5 +795,6 @@ These notes describe observed code behavior, not future design intent:
    [`cache/hot_keys.py`](./cache/hot_keys.py) for recovery warm-up.
 6. [`router/_components.py`](./router/_components.py) and the route modules
    for application wiring and HTTP contracts.
-7. [`main.py`](./main.py), [`tui.py`](./tui.py), and the data/demo scripts for
-   local execution and tooling.
+7. [`main.py`](./main.py), [`tui.py`](./tui.py), and
+   [`import_dataset.py`](./import_dataset.py) for local execution and
+   tooling.

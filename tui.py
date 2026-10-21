@@ -8,13 +8,19 @@ console window, waits for the cluster to come up, then presents an
 interactive menu for cluster control and for querying the cache and
 the SQLite source of truth side by side.
 
+On boot the drop folder (datasets/) is auto-seeded: every file that
+is not registered yet - or whose content changed - is imported into
+its own data/datasets/<name>.db, once. Already-imported files are
+skipped, so data persists until the db/registry files are deleted.
+
 Menu highlights:
 
+    d  Datasets - list / import / delete dataset files
     6  Key inspector - reads EVERY node directly plus the database
        and tells you whether the cache is consistent, stale, cold
        or holding a key the database does not have.
-    7  List database keys / prefixes
-    8  Run arbitrary read-only SQL against the source of truth
+    7  List keys / prefixes across every dataset store
+    8  Run arbitrary read-only SQL against one store
 """
 
 import atexit
@@ -30,8 +36,13 @@ from urllib.parse import quote, urlparse
 import requests
 
 from cluster.health_monitor import check_node
-from database import DatabaseRepository
-from database.exceptions import DatabaseUnavailableError
+from database import DatasetRegistry, MultiDatasetRepository
+from database.exceptions import (
+    DatabaseQueryError,
+    DatabaseUnavailableError,
+)
+from database.registry import slugify
+from import_dataset import import_file, list_datasets, seed_drop_folder
 from router.config import nodes_from_env
 
 
@@ -70,8 +81,11 @@ def db_path() -> str:
     return os.path.normpath(os.path.join(ROOT, path))
 
 
-def repository() -> DatabaseRepository:
-    return DatabaseRepository(db_path=db_path())
+def repository() -> MultiDatasetRepository:
+    path = db_path()
+    return MultiDatasetRepository(
+        db_path=path, registry=DatasetRegistry(db_path=path)
+    )
 
 
 # ---------------------------------------------------------
@@ -306,11 +320,54 @@ def active_nodes() -> list:
     return status["data"].get("active_nodes", [])
 
 
+def auto_seed() -> list:
+    """Import unregistered files from the datasets/ drop folder.
+
+    Runs before the cluster starts, so a fresh Kaggle CSV dropped
+    into datasets/ is imported on the very next boot - once.
+    Already-imported files are skipped; changed files re-import.
+    Failures print but never block the launcher.
+    """
+
+    try:
+        results = seed_drop_folder(registry=DatasetRegistry(db_path=db_path()))
+    except Exception as error:
+        print(paint(f"  dataset auto-seed failed: {error}", RED))
+        print()
+        return []
+
+    for record in results:
+
+        status = record.get("status")
+
+        if status in ("imported", "reimported"):
+            print(
+                f"  {paint(status, GREEN)} "
+                f"{os.path.basename(record['file'])} -> "
+                f"{record['name']} ({record['rows']} rows)"
+            )
+        else:
+            print(
+                paint(
+                    f"  seed failed {os.path.basename(record.get('file', '?'))}"
+                    f": {record.get('error')}",
+                    RED
+                )
+            )
+
+    if results:
+        print()
+
+    return results
+
+
 def boot(children):
 
     clear()
     print(paint("DCS - Distributed Cache  |  one-command launcher", BOLD))
     print("=" * 58)
+
+    auto_seed()
 
     started = ensure_running(children)
 
@@ -423,10 +480,13 @@ def menu():
     5   DB get   read the source of truth through the router
     b   Start anything that is down
 
+  DATASETS
+    d   List / import / delete dataset files
+
   QUERY
     6   Key inspector: every node vs database   <==
-    7   List database keys / prefixes
-    8   Run SQL on the source of truth (read-only)
+    7   List keys across every dataset store
+    8   Run SQL on one store (read-only)
     9   Statistics, hot keys & warm-up
 
     0   Stop everything this UI started & exit
@@ -742,7 +802,7 @@ def _short(value, limit=140) -> str:
 
 def action_list_keys(children):
 
-    prefix = ask("Key prefix (blank = summary of every prefix)")
+    prefix = ask("Key prefix (blank = dataset + prefix summary)")
     limit_raw = ask("Limit (blank = 20)")
 
     try:
@@ -758,57 +818,69 @@ def action_list_keys(children):
 
         if prefix:
 
-            # substr() prefix match instead of LIKE: no wildcards to escape.
-            matching = store.query(
-                "SELECT key, length(value) AS size FROM cache_data "
-                "WHERE substr(key, 1, length(?)) = ? "
-                "ORDER BY key LIMIT ?",
-                (prefix, prefix, limit),
-                max_rows=limit
-            )
+            total = 0
+            collected = {}
 
-            total = store.query(
-                "SELECT COUNT(*) FROM cache_data "
-                "WHERE substr(key, 1, length(?)) = ?",
-                (prefix, prefix)
-            )["rows"][0][0]
+            # Match against every store that can hold the prefix -
+            # system keys and dataset keys alike.
+            for repo in store.repos_matching(prefix):
+
+                total += repo.query(
+                    "SELECT COUNT(*) FROM cache_data "
+                    "WHERE substr(key, 1, length(?)) = ?",
+                    (prefix, prefix)
+                )["rows"][0][0]
+
+                page = repo.query(
+                    "SELECT key, length(value) AS size FROM cache_data "
+                    "WHERE substr(key, 1, length(?)) = ? "
+                    "ORDER BY key LIMIT ?",
+                    (prefix, prefix, limit),
+                    max_rows=limit
+                )
+
+                for row in page["rows"]:
+                    collected[row[0]] = row[1]
+
+            keys = sorted(collected.items())[:limit]
 
             print()
             print(paint(f"  {total} key(s) matching {prefix!r}"
-                        f" - showing {len(matching['rows'])}", BOLD))
+                        f" - showing {len(keys)}", BOLD))
             print()
 
-            if matching["rows"]:
-                render_table(["key", "value bytes"], matching["rows"])
+            if keys:
+                render_table(
+                    ["key", "value bytes"], [list(key) for key in keys]
+                )
 
         else:
 
-            summary = store.query(
-                "SELECT CASE WHEN instr(key, ':') > 0 "
-                "THEN substr(key, 1, instr(key, ':')) "
-                "ELSE '(no prefix)' END AS prefix, COUNT(*) AS n "
-                "FROM cache_data GROUP BY prefix ORDER BY n DESC"
-            )
-
             print()
-            print(paint(f"  {store.count()} row(s) total", BOLD))
+            print(paint("  STORES", BOLD))
             print()
 
-            if summary["rows"]:
-                render_table(["prefix", "rows"], summary["rows"])
+            table = []
+
+            for label, repo in store.repos():
+
+                entry = store.registry.get(label) if label != "system" else None
+
+                table.append([
+                    label,
+                    (entry or {}).get("prefix") or "-",
+                    (entry or {}).get("key_column") or "-",
+                    str(repo.count()),
+                ])
+
+            render_table(["store", "prefix", "key column", "rows"], table)
 
             print()
-            print(paint(f"  first {limit} keys", BOLD))
+            print(paint(f"  first {limit} keys (merged, sorted)", BOLD))
             print()
 
-            sample = store.query(
-                "SELECT key FROM cache_data ORDER BY key LIMIT ?",
-                (limit,),
-                max_rows=limit
-            )
-
-            for row in sample["rows"]:
-                print(f"    {row[0]}")
+            for key in store.keys(limit):
+                print(f"    {key}")
 
     except (ValueError, DatabaseUnavailableError) as error:
         print(paint(f"  database error: {error}", RED))
@@ -816,10 +888,23 @@ def action_list_keys(children):
 
 def action_sql(children):
 
-    print(paint("  Read-only. Examples:", DIM))
+    store = repository()
+
+    options = [label for label, _ in store.repos()]
+
+    target = ask(f"Run against [{' | '.join(options)}] (blank = system)")
+    target = target or "system"
+
+    repo = store.repo_named(target)
+
+    if repo is None:
+        print(paint(f"  unknown store {target!r}", RED))
+        return
+
+    print(paint(f"  Read-only SQL on {target}. Examples:", DIM))
     print("    SELECT * FROM cache_data LIMIT 10;")
-    print("    SELECT key, json_extract(value,'$.city') FROM cache_data "
-          "WHERE key LIKE 'user:%' LIMIT 5;")
+    print("    SELECT key, length(value) AS size FROM cache_data "
+          "ORDER BY key LIMIT 10;")
     print()
 
     sql = ask("SQL")
@@ -827,8 +912,9 @@ def action_sql(children):
         return
 
     try:
-        result = repository().query(sql, max_rows=MAX_SQL_ROWS)
-    except (ValueError, DatabaseUnavailableError) as error:
+        result = repo.query(sql, max_rows=MAX_SQL_ROWS)
+    except (ValueError, DatabaseQueryError,
+            DatabaseUnavailableError) as error:
         print(paint(f"  {error}", RED))
         return
 
@@ -837,6 +923,85 @@ def action_sql(children):
 
     if result["truncated"]:
         print(paint(f"\n  showing first {MAX_SQL_ROWS} rows only", DIM))
+
+
+def action_datasets(children):
+
+    store = repository()
+
+    while True:
+
+        entries = list_datasets(store.registry)
+
+        print()
+        print(paint("  DATASETS", BOLD))
+        print("  " + "-" * 56)
+
+        if not entries:
+            print("  (none registered - drop a file into datasets/ "
+                  "and import it here or re-run tui.py)")
+        else:
+            render_table(
+                ["dataset", "prefix", "rows", "key column"],
+                [
+                    [
+                        entry["name"],
+                        entry["prefix"],
+                        str(entry["rows_live"]),
+                        entry["key_column"] or "(row #)",
+                    ]
+                    for entry in entries
+                ]
+            )
+
+        print()
+        print(f"  system store : {store.system.count()} row(s) "
+              f"(search cache + manual keys)")
+        print(f"  drop folder  : {store.registry.drop_dir}")
+
+        choice = ask("[i]mport file, [d]elete dataset, [b]ack").lower()
+
+        if choice in ("", "b", "q"):
+            return
+
+        if choice == "i":
+
+            path = ask("Path to dataset file (e.g. datasets/foo.csv)")
+            if not path:
+                continue
+
+            name = slugify(path)
+            reimport = store.registry.get(name) is not None
+
+            if reimport:
+                confirm = ask(
+                    f"{name} is registered - reimport? (y/N)"
+                ).lower()
+                if confirm not in ("y", "yes"):
+                    continue
+
+            try:
+                result = import_file(
+                    path, reimport=reimport, registry=store.registry,
+                    verbose=True
+                )
+                print(paint(f"  registered as {result['name']}", GREEN))
+            except (ValueError, DatabaseUnavailableError) as error:
+                print(paint(f"  import failed: {error}", RED))
+
+        elif choice == "d":
+
+            name = ask("Dataset name to delete")
+            if not name:
+                continue
+
+            if store.registry.unregister(name):
+                print(paint(f"  deleted {name} (db file removed)", GREEN))
+            else:
+                print(paint(f"  no dataset named {name!r}", RED))
+
+        else:
+            print(paint("  unknown option", RED))
 
 
 def action_stats(children):
@@ -905,6 +1070,7 @@ ACTIONS = {
     "8": action_sql,
     "9": action_stats,
     "b": action_resume,
+    "d": action_datasets,
 }
 
 

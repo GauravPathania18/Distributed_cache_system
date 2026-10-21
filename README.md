@@ -10,7 +10,7 @@ recovery when the cluster restarts.
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
 - **Web UI:** http://127.0.0.1:8000/ (vanilla HTML/JS, no build step)
-- **Tests:** pytest — 264 tests
+- **Tests:** pytest — 303 tests
 
 ---
 
@@ -114,9 +114,12 @@ optimization, never a correctness blocker.
 Everything so far has been plumbing; Layer 8 is what you see. A
 vanilla HTML/CSS/JS single-page app is served by the router itself
 at `/` (redirect) and `/ui` — no build step, no npm, no CORS. The
-**Search** view turns the cache into a shopping experience: keyword,
-category, price/rating/stock filters and sorting across products,
-users and orders. Every result set is written through the existing
+**Search** view turns the cache into a browsing experience: keyword
+search, facets, ranges and sorting across **every dataset you
+import** — filters and sorts are generated from each dataset's
+sniffed schema, so dropping `netflix_titles.csv` into `datasets/`
+immediately gives you type/rating chips and release-year ranges.
+Every result set is written through the existing
 cache layer as a `q:` entry with a 300-second TTL, so the second
 identical query is answered from a node in ~0 ms. A banner on every
 result tells you whether it came from `⚡ CACHE` or `🗄 DATABASE`.
@@ -142,7 +145,8 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 2. THE one command: opens the 3 nodes + router, each in its own
+# 2. THE one command: imports everything sitting in datasets/
+#    (once), opens the 3 nodes + router, each in its own
 #    visible console window, waits for the cluster, then shows an
 #    interactive control/query UI (option 0 stops everything)
 python tui.py
@@ -176,7 +180,7 @@ Configuration (environment variables):
 | Variable | Default | Meaning |
 |---|---|---|
 | `CACHE_NODES` | `http://127.0.0.1:8001,...:8003` | Comma-separated node URLs (or bare ports) |
-| `CACHE_DB_PATH` | `data/cache.db` | SQLite location |
+| `CACHE_DB_PATH` | `data/cache.db` | System SQLite location (registry `data/registry.json` + dataset files `data/datasets/*.db` derive from it) |
 | `RECOVERY_THRESHOLD` | `2` | Healthy checks required in `RECOVERING` before `READY` |
 | `CLUSTER_BOOTSTRAP_STATE` | `starting` | Initial state of declared nodes (`starting` / `ready`) |
 | `WARMUP_ENABLED` | `on` | Warm-up master switch (off = ungated READY) |
@@ -192,27 +196,35 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **264 passed** — 14 cache + 16 consistent hash + 8 router +
-20 repository + 13 cache-service + 11 circuit-breaker + 5
-single-flight + 28 node lifecycle + 14 dataset import +
-15 statistics + 21 warm-up + 10 dataset generator +
-6 config + 13 terminal UI + 34 replication +
-25 search + 7 telemetry + 4 dashboard.
+Expected: **303 passed** — 34 replication + 29 dataset import +
+28 node lifecycle + 25 search + 21 warm-up + 20 repository +
+19 registry + 16 consistent hash + 15 statistics +
+15 multi-dataset repository + 14 cache + 13 cache-service +
+13 terminal UI + 11 circuit-breaker + 8 router + 7 telemetry +
+6 config + 5 single-flight + 4 dashboard.
 
-Demos: `python demo.py` (Layer 1), `python demo_hash.py` (Layer 3),
-`python demo_router.py` (Layer 4/5).
+### Bringing your own data
 
-No dataset handy? Generate synthetic ones (deterministic, CSV/JSON/JSONL):
-
-```powershell
-python generate_dataset.py --kind all --count 1000
-```
-
-Have a dataset from Kaggle or elsewhere? Load it into the database:
+DCS ships with **no synthetic data**. Drop any real dataset file —
+CSV, TSV, JSON, JSONL, Parquet, Excel or a Zip containing one —
+into `datasets/`:
 
 ```powershell
-python import_dataset.py --file users.csv --prefix user:
+# Drop a file in, then either restart the TUI (it auto-seeds on boot)...
+python tui.py
+
+# ...or import explicitly:
+python import_dataset.py --file datasets/netflix_titles.csv
+python import_dataset.py --seed          # import everything in datasets/
+python import_dataset.py --list          # what's registered
 ```
+
+Each file becomes its **own SQLite database** (`data/datasets/<name>.db`)
+registered in `data/registry.json`. The key column is auto-detected
+(`id`, `show_id`, `Restaurant ID`, ... — or row numbers as a fallback),
+the schema is sniffed, and the search UI builds its filters and sorts
+from it. Nothing is hardcoded: one imported file = one searchable entity.
+Imported data persists until you delete the `data/` files.
 
 Full command reference, curl examples and live fault-tolerance
 walkthroughs live in [`commands.md`](commands.md).

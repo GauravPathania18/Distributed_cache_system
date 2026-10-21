@@ -3,7 +3,10 @@ import time
 
 from typing import Any, Callable
 
-from database.exceptions import DatabaseUnavailableError
+from database.exceptions import (
+    DatabaseQueryError,
+    DatabaseUnavailableError,
+)
 
 
 class CircuitBreaker:
@@ -80,6 +83,11 @@ class CircuitBreaker:
 
             return result
 
+        except DatabaseQueryError:
+            # A malformed statement is the caller's bug, not a storage
+            # failure. Passing it through untouched (and uncounted)
+            # keeps one bad query from opening the circuit.
+            raise
         except DatabaseUnavailableError:
             self._record_failure()
             raise

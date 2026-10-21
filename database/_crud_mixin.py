@@ -3,7 +3,43 @@ import sqlite3
 
 from typing import Any, Optional
 
-from .exceptions import DatabaseUnavailableError
+from .exceptions import DatabaseQueryError, DatabaseUnavailableError
+
+
+# SQLite reports both "you wrote bad SQL" and "the file is sick" as
+# OperationalError, so the message is the only thing that separates
+# them. These markers are the authoring mistakes - a statement that
+# fails this way will fail identically forever, so it is a bug in the
+# SQL we built, not an outage worth a 503 + retry.
+_QUERY_ERROR_MARKERS = (
+    "syntax error",
+    "incomplete input",
+    "no such column",
+    "no such table",
+    "ambiguous column name",
+    "no such function",
+    "misuse of aggregate",
+    "second argument to",
+    "wrong number of arguments",
+)
+
+
+def _classify(error: sqlite3.Error) -> Exception:
+    """Turn a raw sqlite3 error into the right domain exception.
+
+    Authoring mistakes -> DatabaseQueryError (the SQL is wrong).
+    Everything else    -> DatabaseUnavailableError (the storage is).
+    """
+
+    message = str(error).lower()
+
+    if any(marker in message for marker in _QUERY_ERROR_MARKERS):
+
+        return DatabaseQueryError(f"invalid query: {error}")
+
+    return DatabaseUnavailableError(
+        f"database unavailable during query: {error}"
+    )
 
 
 class _CrudMixin:
@@ -18,8 +54,8 @@ class _CrudMixin:
         Only single SELECT / WITH / PRAGMA / EXPLAIN statements are
         accepted, so this can back an interactive SQL console without
         any way to modify the source of truth. Raises ValueError for
-        rejected input and DatabaseUnavailableError for storage
-        failures.
+        rejected input, DatabaseQueryError for a malformed statement
+        and DatabaseUnavailableError for storage failures.
         """
 
         text = sql.strip().rstrip(";").strip()
@@ -46,9 +82,7 @@ class _CrudMixin:
             rows = cursor.fetchmany(max_rows + 1)
 
         except sqlite3.Error as error:
-            raise DatabaseUnavailableError(
-                f"database unavailable during query: {error}"
-            )
+            raise _classify(error) from error
         finally:
             connection.close()
 

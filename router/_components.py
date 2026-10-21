@@ -3,7 +3,7 @@ import sys
 from cache.hot_keys import HotKeyManager
 from cluster.node_manager import NodeManager
 from cluster.node_state import NodeState
-from database.repository import DatabaseRepository
+from database import DatasetRegistry, MultiDatasetRepository
 from services.cache_service import CacheService
 from services.distributed_cache import DistributedCache
 from services.replication import ReplicationManager
@@ -35,7 +35,12 @@ from .config import (
 
 
 # Source of truth. Shared by the whole router process.
-database = DatabaseRepository(db_path=DEFAULT_DB_PATH)
+# The registry mirrors data/registry.json (mtime-cached), so datasets
+# imported by the TUI / import_dataset.py become visible to search
+# without restarting the router.
+registry = DatasetRegistry(db_path=DEFAULT_DB_PATH)
+
+database = MultiDatasetRepository(db_path=DEFAULT_DB_PATH, registry=registry)
 
 # Production bootstrap gates nodes (STARTING -> RECOVERING -> READY)
 # so cold nodes never receive traffic before they prove healthy.
@@ -93,7 +98,8 @@ search_service = SearchService(
     telemetry=telemetry,
     ttl=SEARCH_TTL,
     page_size_default=SEARCH_PAGE_SIZE_DEFAULT,
-    page_size_max=SEARCH_PAGE_SIZE_MAX
+    page_size_max=SEARCH_PAGE_SIZE_MAX,
+    registry=registry
 )
 
 # Layer 6.3 - warm-up service: triggers on RECOVERING, retries on
@@ -197,7 +203,8 @@ def configure_cluster(
         telemetry=telemetry,
         ttl=SEARCH_TTL,
         page_size_default=SEARCH_PAGE_SIZE_DEFAULT,
-        page_size_max=SEARCH_PAGE_SIZE_MAX
+        page_size_max=SEARCH_PAGE_SIZE_MAX,
+        registry=registry
     )
 
     warmup = CacheWarmup(

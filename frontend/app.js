@@ -33,8 +33,11 @@ function esc(value) {
   ));
 }
 
-function money(v) { return v == null ? "—" : "₹" + Number(v).toFixed(2); }
-function num(v)   { return v == null ? "—" : v; }
+function fmtNum(v) {
+  if (v == null) return "—";
+  if (typeof v !== "number") return String(v);
+  return Number.isInteger(v) ? v.toLocaleString() : String(v);
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
@@ -61,13 +64,9 @@ function debounce(fn, ms) {
 
 const state = {
   view: "search",
-  entity: "products",
-  entities: {},              // from /search/entities
-  query: {
-    products: { q: "", category: "", pmin: "", pmax: "", rating: "", instock: false, sort: "rating", dir: "desc", page: 1, page_size: 12 },
-    users:    { q: "", city: "", amin: "", amax: "", smin: "", smax: "", active: false, sort: "score", dir: "desc", page: 1, page_size: 12 },
-    orders:   { q: "", status: "", tmin: "", tmax: "", qmin: "", qmax: "", sort: "created_at", dir: "desc", page: 1, page_size: 12 },
-  },
+  entity: null,               // current dataset entity (first by default)
+  entities: {},               // from /search/entities (dataset registry)
+  query: {},                  // per-entity query state, built from metadata
   lastResult: null,
   dashTimer: null,
   lab: { running: false, results: [], cacheHits: 0, dbRuns: 0 },
@@ -108,73 +107,120 @@ async function refreshClusterPill() {
    SEARCH VIEW
    --------------------------------------------------------- */
 
-const ENTITY_LABEL = { products: "Products", users: "Users", orders: "Orders" };
 const ENTITY_ICON  = { products: "🛍️", users: "👤", orders: "📦" };
+const FALLBACK_LABEL = { products: "Products", users: "Users", orders: "Orders" };
+
+const TITLE_PRIORITY = ["name", "title", "names", "label", "restaurant_name", "movie"];
+
+function prettify(name) {
+  return String(name ?? "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function entityLabel(name) {
+  const meta = state.entities[name] || {};
+  return meta.label || FALLBACK_LABEL[name] || prettify(name);
+}
+
+function defaultQuery(meta) {
+  const q = {
+    q: "",
+    sort: meta.default_sort || (meta.sorts || [])[0] || "",
+    dir: meta.default_dir || "asc",
+    page: 1,
+    page_size: 12,
+  };
+  for (const [param, filter] of Object.entries(meta.filters || {})) {
+    if (filter.kind === "range") {
+      q[filter.min_param] = "";
+      q[filter.max_param] = "";
+    } else if (filter.kind === "bool") {
+      q[param] = false;
+    } else {
+      q[param] = "";
+    }
+  }
+  return q;
+}
+
+function ensureQuery(entity) {
+  if (!state.query[entity]) {
+    state.query[entity] = defaultQuery(state.entities[entity] || {});
+  }
+  return state.query[entity];
+}
 
 function renderEntitySwitch() {
   const wrap = $("#entitySwitch");
   wrap.innerHTML = "";
   for (const name of Object.keys(state.entities)) {
+    const label = entityLabel(name);
+    const shown = label.length > 26 ? label.slice(0, 25) + "…" : label;
     wrap.appendChild(el("button", {
       type: "button",
       class: "entity-btn" + (name === state.entity ? " active" : ""),
-      onclick: () => { state.entity = name; state.query[name].page = 1; renderEntitySwitch(); renderFacets(); runSearch(); },
-    }, `${ENTITY_ICON[name] || ""} ${ENTITY_LABEL[name] || name}`));
+      title: label,
+      onclick: () => {
+        state.entity = name;
+        ensureQuery(name);
+        renderEntitySwitch();
+        renderFacets();
+        runSearch();
+      },
+    }, [ENTITY_ICON[name] || null, shown].filter(Boolean).join(" ")));
   }
 }
 
-const CATEGORY_CHIPS = ["electronics","books","clothing","toys","garden","sports","grocery","furniture","beauty","tools"];
-const CITY_CHIPS = ["Berlin","Mumbai","Tokyo","Lisbon","Nairobi","Toronto","Lyon","Osaka","Bogota","Warsaw","Cairo","Seoul"];
-const STATUS_CHIPS = ["pending","shipped","delivered","cancelled","refunded"];
-
 function renderFacets() {
-  const meta = state.entities[state.entity];
-  if (!meta) return;
-  const q = state.query[state.entity];
   const box = $("#facets");
   box.innerHTML = "";
+  if (!state.entity) return;
+  const meta = state.entities[state.entity];
+  if (!meta) return;
+  const q = ensureQuery(state.entity);
 
   const group = (title, ...kids) => {
     const g = el("div", { class: "facet-group" }, [el("div", { class: "facet-title" }, title), ...kids]);
     box.appendChild(g);
   };
 
-  if (state.entity === "products") {
-    group("Category", el("div", { class: "chips" },
-      [chip("", "All"), ...CATEGORY_CHIPS.map((c) => chip(c, c))].map((b) => {
-        b.classList.toggle("active", (q.category || "") === b.dataset.val);
-        b.onclick = () => { q.category = b.dataset.val; q.page = 1; renderFacets(); runSearch(); };
-        return b;
-      })));
-    group("Price range", rangeRow(q, "pmin", "pmax", "min ₹", "max ₹"));
-    group("Minimum rating", selectRow(q, "rating", [["", "any"], ["3", "3+"], ["4", "4+"], ["4.5", "4.5+"]]));
-    group("Availability", toggleRow(q, "instock", "In stock only"));
-  } else if (state.entity === "users") {
-    group("City", el("div", { class: "chips" },
-      [chip("", "All"), ...CITY_CHIPS.map((c) => chip(c, c))].map((b) => {
-        b.classList.toggle("active", (q.city || "") === b.dataset.val);
-        b.onclick = () => { q.city = b.dataset.val; q.page = 1; renderFacets(); runSearch(); };
-        return b;
-      })));
-    group("Age range", rangeRow(q, "amin", "amax", "min", "max"));
-    group("Score range", rangeRow(q, "smin", "smax", "min", "max"));
-    group("Status", toggleRow(q, "active", "Active only"));
-  } else {
-    group("Order status", el("div", { class: "chips" },
-      [chip("", "All"), ...STATUS_CHIPS.map((c) => chip(c, c))].map((b) => {
-        b.classList.toggle("active", (q.status || "") === b.dataset.val);
-        b.onclick = () => { q.status = b.dataset.val; q.page = 1; renderFacets(); runSearch(); };
-        return b;
-      })));
-    group("Total range", rangeRow(q, "tmin", "tmax", "min ₹", "max ₹"));
-    group("Quantity range", rangeRow(q, "qmin", "qmax", "min", "max"));
+  const filters = Object.entries(meta.filters || {});
+
+  for (const [param, filter] of filters) {
+    const title = prettify(filter.field);
+
+    if (filter.kind === "enum") {
+      const values = (filter.values || []).slice(0, 14);
+      if (!values.length) continue;
+      group(title, el("div", { class: "chips" },
+        [chip("", "All"), ...values.map((v) => chip(v, v))].map((b) => {
+          b.classList.toggle("active", (q[param] || "") === b.dataset.val);
+          b.onclick = () => { q[param] = b.dataset.val; q.page = 1; renderFacets(); runSearch(); };
+          return b;
+        })));
+    } else if (filter.kind === "range") {
+      const isNumber = (filter.dtype || "number") === "number";
+      group(title, rangeRow(q, filter.min_param, filter.max_param,
+        isNumber ? "min" : "from", isNumber ? "max" : "to", isNumber));
+    } else if (filter.kind === "bool") {
+      group(title, toggleRow(q, param, "Yes only"));
+    } else if (filter.kind === "min") {
+      group(title, numberRow(q, param, "min"));
+    }
+  }
+
+  if (!filters.length) {
+    group("Filters", el("div", { class: "muted" }, "none — use keyword search & sort"));
   }
 
   // Sort control (shared)
   const sortSel = el("select", {
     onchange: (e) => { q.sort = e.target.value; q.page = 1; runSearch(); },
   }, (meta.sorts || []).map((s) =>
-    el("option", { value: s, ...(s === q.sort ? { selected: "" } : {}) }, s)));
+    el("option", { value: s, ...(s === q.sort ? { selected: "" } : {}) }, prettify(s))));
 
   const dirSel = el("select", {
     onchange: (e) => { q.dir = e.target.value; q.page = 1; runSearch(); },
@@ -188,21 +234,35 @@ function renderFacets() {
   function chip(val, label) {
     return el("button", { type: "button", class: "chip", "data-val": val }, label);
   }
-  function rangeRow(obj, minK, maxK, minPh, maxPh) {
-    const a = el("input", { type: "number", placeholder: minPh, value: obj[minK] || "", oninput: debounce((e) => { obj[minK] = e.target.value; obj.page = 1; runSearch(); }, 350) });
-    const b = el("input", { type: "number", placeholder: maxPh, value: obj[maxK] || "", oninput: debounce((e) => { obj[maxK] = e.target.value; obj.page = 1; runSearch(); }, 350) });
+  function rangeRow(obj, minK, maxK, minPh, maxPh, isNumber) {
+    const type = isNumber ? "number" : "text";
+    const a = el("input", { type, placeholder: minPh, value: obj[minK] || "", oninput: debounce((e) => { obj[minK] = e.target.value; obj.page = 1; runSearch(); }, 350) });
+    const b = el("input", { type, placeholder: maxPh, value: obj[maxK] || "", oninput: debounce((e) => { obj[maxK] = e.target.value; obj.page = 1; runSearch(); }, 350) });
     return el("div", { class: "facet-row" }, [a, b]);
   }
-  function selectRow(obj, key, options) {
+  function numberRow(obj, key, ph) {
     return el("div", { class: "facet-row" }, [
-      el("select", { onchange: (e) => { obj[key] = e.target.value; obj.page = 1; runSearch(); } },
-        options.map(([v, l]) => el("option", { value: v, ...(obj[key] === v ? { selected: "" } : {}) }, l))),
+      el("input", { type: "number", placeholder: ph, value: obj[key] || "", oninput: debounce((e) => { obj[key] = e.target.value; obj.page = 1; runSearch(); }, 350) }),
     ]);
   }
   function toggleRow(obj, key, label) {
     const cb = el("input", { type: "checkbox", ...(obj[key] ? { checked: "" } : {}), onchange: (e) => { obj[key] = e.target.checked; obj.page = 1; runSearch(); } });
     return el("label", { class: "toggle" }, [cb, label]);
   }
+}
+
+function renderEmptyDatasets() {
+  const grid = $("#results");
+  $("#cacheStatus").innerHTML = "";
+  $("#resultsMeta").textContent = "";
+  $("#pager").innerHTML = "";
+  grid.innerHTML = "";
+  grid.appendChild(el("div", { class: "empty" }, [
+    el("div", {}, "No datasets imported yet."),
+    el("div", { class: "muted", style: "margin-top:6px" },
+      "Drop a file (CSV / TSV / JSON / JSONL / Parquet / Excel / Zip) into the datasets/ folder and restart python tui.py — or import right now:"),
+    el("pre", { class: "json" }, "python import_dataset.py --file datasets/your_file.csv\npython import_dataset.py --seed"),
+  ]));
 }
 
 function buildQuery(entity) {
@@ -223,10 +283,12 @@ function buildQuery(entity) {
 
 async function runSearch() {
   const entity = state.entity;
+  if (!entity || !state.entities[entity]) { renderEmptyDatasets(); return; }
+  ensureQuery(entity);
   const statusBox = $("#cacheStatus"), metaBox = $("#resultsMeta"), grid = $("#results");
   statusBox.innerHTML = ""; metaBox.textContent = "Searching…"; grid.innerHTML = "";
   try {
-    const result = await api(`/search/${entity}?${buildQuery(entity)}`);
+    const result = await api(`/search/${encodeURIComponent(entity)}?${buildQuery(entity)}`);
     state.lastResult = result;
     renderCacheStatus(result);
     renderMeta(result);
@@ -269,42 +331,55 @@ function renderResults(r) {
 }
 
 function cardFor(entity, it) {
+  const meta = state.entities[entity] || {};
+  const columns = meta.columns || Object.keys(meta.fields || {});
+  const types = meta.fields || {};
+
   const kids = [el("div", { class: "card-top" }, [
-    el("span", { class: "card-id" }, it.id ?? it.key ?? ""),
+    el("span", { class: "card-id" }, String(it.id ?? it.key ?? "")),
   ])];
 
-  if (entity === "products") {
-    kids.push(el("div", { class: "card-title" }, it.name));
-    kids.push(el("div", {}, [
-      el("span", { class: "price" }, money(it.price)),
-      el("span", { class: "rating" }, `  ★ ${num(it.rating)}`),
-    ]));
-    kids.push(el("div", { class: "tags" }, [
-      el("span", { class: "tag" }, it.category),
-      el("span", { class: "tag " + (it.stock > 0 ? "stock-ok" : "stock-out") },
-        it.stock > 0 ? `${it.stock} in stock` : "out of stock"),
-    ]));
-  } else if (entity === "users") {
-    kids.push(el("div", { class: "card-title" }, it.name));
-    kids.push(el("div", { class: "kv" }, [el("span", { class: "k" }, "email"), el("span", { class: "v" }, it.email)]));
-    kids.push(el("div", { class: "kv" }, [el("span", { class: "k" }, "city"), el("span", { class: "v" }, it.city)]));
-    kids.push(el("div", { class: "kv" }, [el("span", { class: "k" }, "age"), el("span", { class: "v" }, num(it.age))]));
-    kids.push(el("div", { class: "kv" }, [el("span", { class: "k" }, "score"), el("span", { class: "v" }, num(it.score))]));
-    kids.push(el("div", { class: "tags" }, [
-      el("span", { class: "tag " + (it.active ? "stock-ok" : "stock-out") }, it.active ? "active" : "inactive"),
-    ]));
-  } else {
-    kids.push(el("div", { class: "card-title" }, it.item));
-    kids.push(el("div", {}, [
-      el("span", { class: "price" }, money(it.total)),
-      el("span", { class: "rating" }, `  ×${num(it.quantity)}`),
-    ]));
-    kids.push(el("div", { class: "kv" }, [el("span", { class: "k" }, "user"), el("span", { class: "v" }, num(it.user_id))]));
-    kids.push(el("div", { class: "kv" }, [el("span", { class: "k" }, "created"), el("span", { class: "v" }, it.created_at)]));
-    kids.push(el("div", { class: "tags" }, [el("span", { class: "tag" }, it.status)]));
+  const lower = columns.map((c) => c.toLowerCase());
+  let titleIndex = lower.findIndex((c) => TITLE_PRIORITY.includes(c));
+  if (titleIndex < 0) titleIndex = columns.findIndex((c) => types[c] === "string");
+  const titleField = titleIndex >= 0 ? columns[titleIndex] : null;
+
+  if (titleField && it[titleField] != null && it[titleField] !== "") {
+    kids.push(el("div", { class: "card-title" }, String(it[titleField])));
   }
 
-  const fullKey = it.key || `${state.entity === "products" ? "product" : state.entity === "users" ? "user" : "order"}:${it.id}`;
+  let shown = 0;
+
+  for (let i = 0; i < columns.length && shown < 6; i++) {
+
+    const column = columns[i];
+    if (column === titleField) continue;
+
+    const value = it[column];
+    if (value === null || value === undefined || value === "") continue;
+
+    shown++;
+
+    if (typeof value === "boolean") {
+      kids.push(el("div", { class: "tags" }, [
+        el("span", { class: "tag " + (value ? "stock-ok" : "stock-out") },
+          value ? "yes" : "no"),
+      ]));
+    } else if (typeof value === "number") {
+      kids.push(el("div", { class: "kv" }, [
+        el("span", { class: "k" }, prettify(column)),
+        el("span", { class: "v" }, fmtNum(value)),
+      ]));
+    } else {
+      const text = String(value);
+      kids.push(el("div", { class: "kv" }, [
+        el("span", { class: "k" }, prettify(column)),
+        el("span", { class: "v", title: text }, text.length > 90 ? text.slice(0, 89) + "…" : text),
+      ]));
+    }
+  }
+
+  const fullKey = it.key || `${meta.prefix || ""}${it.id ?? ""}`;
   kids.push(el("div", { class: "card-actions" }, [
     el("button", { type: "button", class: "link-btn", onclick: () => inspectKey(fullKey) }, "Inspect key →"),
   ]));
@@ -516,10 +591,24 @@ async function runLab(event) {
   event.preventDefault();
   if (state.lab.running) return;
 
+  const entity = state.entity;
+  const meta = state.entities[entity];
+
+  if (!entity || !meta) {
+    alert("No dataset imported yet — import one via tui.py menu 'd' or import_dataset.py first.");
+    return;
+  }
+
   const query = $("#labQuery").value.trim();
   const count = Math.max(1, Math.min(500, +$("#labCount").value || 40));
   const delay = Math.max(0, Math.min(1000, +$("#labDelay").value || 0));
   const btn = $("#labRun");
+
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  params.set("sort", meta.default_sort || "");
+  params.set("dir", meta.default_dir || "asc");
+  params.set("page_size", "5");
 
   state.lab.running = true;
   state.lab.results = [];
@@ -534,7 +623,7 @@ async function runLab(event) {
   for (let i = 1; i <= count; i++) {
     const started = performance.now();
     try {
-      const r = await api(`/search/products?q=${encodeURIComponent(query)}&sort=price&dir=asc&page_size=5`);
+      const r = await api(`/search/${encodeURIComponent(entity)}?${params}`);
       const ms = performance.now() - started;
       const hit = r.source === "cache";
       if (hit) state.lab.cacheHits++; else state.lab.dbRuns++;
@@ -646,21 +735,26 @@ async function init() {
   // Search form
   $("#searchForm").addEventListener("submit", (e) => {
     e.preventDefault();
-    state.query[state.entity].q = $("#q").value.trim();
-    state.query[state.entity].page = 1;
+    if (!state.entity) return;
+    const q = ensureQuery(state.entity);
+    q.q = $("#q").value.trim();
+    q.page = 1;
     runSearch();
   });
   $("#clearBtn").addEventListener("click", () => {
     $("#q").value = "";
-    const q = state.query[state.entity];
+    if (!state.entity) return;
+    const q = ensureQuery(state.entity);
     for (const k of Object.keys(q)) if (!["sort", "dir", "page", "page_size"].includes(k)) q[k] = typeof q[k] === "boolean" ? false : "";
     q.page = 1;
     renderFacets();
     runSearch();
   });
   $("#q").addEventListener("input", debounce((e) => {
-    state.query[state.entity].q = e.target.value.trim();
-    state.query[state.entity].page = 1;
+    if (!state.entity) return;
+    const q = ensureQuery(state.entity);
+    q.q = e.target.value.trim();
+    q.page = 1;
     runSearch();
   }, 400));
 
@@ -679,19 +773,28 @@ async function init() {
   $("#labForm").addEventListener("submit", runLab);
   $("#labReset").addEventListener("click", resetLabCounters);
 
-  // Load entity metadata, then paint
+  // Load entity metadata (one entity per imported dataset), then paint
   try {
     const meta = await api("/search/entities");
     state.entities = meta.entities || {};
   } catch (_) {
-    state.entities = { products: { sorts: ["rating", "price"], default_sort: "rating", default_dir: "desc" } };
+    state.entities = {};
   }
+
+  const names = Object.keys(state.entities);
+  state.entity = names[0] || null;
+  names.forEach(ensureQuery);
 
   renderEntitySwitch();
   renderFacets();
   refreshClusterPill();
   setInterval(refreshClusterPill, 5000);
-  runSearch();
+
+  if (state.entity) {
+    runSearch();
+  } else {
+    renderEmptyDatasets();
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);

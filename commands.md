@@ -49,10 +49,13 @@ DCS/
 │   ├── routes_search.py / routes_dashboard.py / routes_static.py  <- Layer 8
 │   ├── _components.py       <- shared database / node_manager / services
 │   └── router.py            <- public re-export shim
-├── database/             <- Layer 5: SQLite source of truth
+├── database/             <- Layer 5: SQLite source of truth (1 file per store)
 │   ├── __init__.py
 │   ├── exceptions.py         <- DatabaseUnavailableError
-│   └── repository.py
+│   ├── repository.py         <- DatabaseRepository (CRUD + query over one file)
+│   ├── _connection_mixin.py / _crud_mixin.py
+│   ├── registry.py           <- data/registry.json manifest + schema/key sniffing
+│   └── multi_repository.py   <- MultiDatasetRepository: routes keys by prefix
 ├── services/             <- Layer 5 + 6.3 + 7 + 8: orchestration
 │   ├── __init__.py
 │   ├── cache_service.py      <- cache-aside policy + stampede protection
@@ -80,26 +83,24 @@ DCS/
 │   ├── test_statistics.py
 │   ├── test_warmup.py
 │   ├── test_import_dataset.py
-│   ├── test_generate_dataset.py
+│   ├── test_registry.py
+│   ├── test_multi_repository.py
 │   ├── test_config.py
 │   ├── test_tui.py
 │   ├── test_replication.py
 │   ├── test_search.py
 │   ├── test_telemetry.py
 │   └── test_dashboard.py
-├── data/                 <- generated SQLite DB (gitignored)
-│   └── cache.db
-├── datasets/             <- generated sample datasets (gitignored)
-│   ├── users.csv
-│   ├── products.json
-│   └── orders.jsonl
+├── data/                 <- generated SQLite stores (gitignored)
+│   ├── cache.db            <- system repo: search cache (q:/s:) + manual keys
+│   ├── registry.json       <- manifest: every imported dataset
+│   └── datasets/           <- one <name>.db per imported dataset
+├── datasets/             <- DROP FILES HERE: CSV/TSV/JSON/JSONL/Parquet/
+│   │                         Excel/Zip — auto-imported on TUI boot
+│   └── *.csv               <- your Kaggle/data.gov downloads
 ├── main.py               <- Layer 2: cache node server
-├── tui.py                <- ONE command: spawns everything + query UI
-├── import_dataset.py     <- load CSV/JSON/JSONL datasets into SQLite
-├── generate_dataset.py   <- synthesize test datasets for import_dataset.py
-├── demo.py               <- Layer 1 demo
-├── demo_hash.py          <- Layer 3.1 demo
-├── demo_router.py        <- Layer 3.2 demo
+├── tui.py                <- ONE command: seeds datasets/ + spawns everything + query UI
+├── import_dataset.py     <- import one file (or the drop folder) into its own SQLite
 ├── requirements.txt
 ├── README.md
 └── commands.md
@@ -115,6 +116,10 @@ python tui.py
 
 That single command:
 
+0. **Seeds the datasets**: every file in `datasets/` that is not
+   registered yet (or whose content changed) is imported once into
+   `data/datasets/<name>.db` — new files print `imported ...` lines
+   right in the header.
 1. Starts the router + 3 cache nodes, **each in its own visible
    console window** (you can watch every log live).
 2. Waits for the cluster: `waiting for router OK` →
@@ -137,10 +142,13 @@ spawned itself. `b` restarts anything that died.
     5   DB get   read the source of truth through the router
     b   Start anything that is down
 
+  DATASETS
+    d   List / import / delete dataset files
+
   QUERY
     6   Key inspector: every node vs database   <==
-    7   List database keys / prefixes
-    8   Run SQL on the source of truth (read-only)
+    7   List keys across every dataset store
+    8   Run SQL on one store (read-only)
     9   Statistics, hot keys & warm-up
 
     0   Stop everything this UI started & exit
@@ -152,13 +160,13 @@ Enter any key and the TUI reads **every node directly** (no
 cache-aside side effects) plus the database, then prints a verdict:
 
 ```
-  CACHE - direct node reads for 'user:42'
-    :8001   HIT   {"name": "Elena Aziz", ...}
-    :8002   HIT   {"name": "Elena Aziz", ...}
+  CACHE - direct node reads for 'netflix_titles:s1'
+    :8001   HIT   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
+    :8002   HIT   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
     :8003   MISS
 
   DATABASE - source of truth (read-only)
-    FOUND   {"name": "Elena Aziz", ...}
+    FOUND   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
 
   VERDICT  CONSISTENT - 2 caching node(s) match the database
 ```
@@ -175,12 +183,15 @@ cache-aside side effects) plus the database, then prints a verdict:
 
 ### SQL console (8)
 
-Read-only SQL against `data/cache.db` (single `SELECT` / `WITH` /
-`PRAGMA` / `EXPLAIN` statements, max 50 rows shown):
+Prompts for a **target store** first (`system`, or any dataset name
+shown by `d`), then runs read-only SQL against that physical file
+(single `SELECT` / `WITH` / `PRAGMA` / `EXPLAIN` statements, max 50
+rows shown):
 
 ```
-  SQL: SELECT key, json_extract(value,'$.city') AS city
-        FROM cache_data WHERE key LIKE 'user:%' LIMIT 5;
+  Run against [system | imdb_movies | netflix_titles] (blank = system)
+  SQL: SELECT key, json_extract(value,'$.title') AS title
+        FROM cache_data WHERE key LIKE 'netflix_titles:%' LIMIT 5;
 ```
 
 Writes are rejected twice over: statement allow-list + the
@@ -200,9 +211,6 @@ unaffected (curl tries both instantly).
 ## Layer 1 — Local LRU Cache Engine
 
 ```powershell
-# Run the interactive demo
-python demo.py
-
 # Run the full test suite
 pytest tests/test_cache.py -v
 ```
@@ -261,9 +269,6 @@ Missing keys return HTTP 404 `{"detail": "Cache miss"}`.
 No servers needed. This is a pure data-structure demo:
 
 ```powershell
-# Print the ring + key-to-node mapping
-python demo_hash.py
-
 # Run the consistent-hash unit tests
 pytest tests/test_consistent_hash.py -v
 ```
@@ -484,7 +489,9 @@ CacheService
   │
   ├──► Distributed Cache (Node 1/2/3)
   │
-  └──► SQLite  data/cache.db   (source of truth)
+  └──► SQLite  data/cache.db          (system store: search cache)
+              data/datasets/<name>.db (one file per imported dataset)
+              data/registry.json      (which dataset lives where)
 ```
 
 GET flow: cache HIT → return; cache MISS → database → populate cache →
@@ -1170,127 +1177,119 @@ pytest tests/test_warmup.py -v
 
 ---
 
-## Generating a synthetic dataset
+## Importing a real dataset (CSV / TSV / JSON / JSONL / Parquet / Excel / Zip)
 
-No Kaggle account or downloaded file needed — `generate_dataset.py`
-writes ready-to-import datasets in all three supported formats:
+DCS ships with **no bundled data** — you bring your own file
+(Kaggle, OpenML, data.gov, ...). Every imported file gets its
+**own SQLite database** (`data/datasets/<name>.db`) and becomes
+one searchable entity in the web UI, with filters and sorts
+generated from its sniffed schema.
 
-```powershell
-# All three datasets, 1000 records each (deterministic: seed 42)
-python generate_dataset.py --kind all --count 1000
+### The drop folder (recommended)
 
-# Just one dataset, larger, different seed
-python generate_dataset.py --kind users --count 5000 --seed 7
-```
-
-| Kind | File | Format | Key column | Suggested prefix |
-|---|---|---|---|---|
-| `users` | `datasets/users.csv` | CSV | `id` | `user:` |
-| `products` | `datasets/products.json` | JSON | `sku` | `product:` |
-| `orders` | `datasets/orders.jsonl` | JSONL | `order_id` | `order:` |
-
-The same `--seed` always produces byte-identical files, so
-re-generating never changes existing rows on re-import.
-
-Import what it generated (the script prints these commands too):
+Put any supported file into `datasets/` and either restart the TUI
+or run the seeder:
 
 ```powershell
-python import_dataset.py --file datasets/users.csv     --key-column id      --prefix user:
-python import_dataset.py --file datasets/products.json --key-column sku     --prefix product:
-python import_dataset.py --file datasets/orders.jsonl  --key-column order_id --prefix order:
+python tui.py                    # auto-seeds datasets/ on every boot
+python import_dataset.py --seed  # same thing, one-shot
 ```
 
-Verify what landed in the database:
+Only new (or changed) files are imported — the second run prints
+`drop folder is empty or fully imported`. Once imported, the data
+lives in `data/datasets/<name>.db` + `data/registry.json` until you
+delete those files (or `--delete` the dataset).
 
-```powershell
-python -c "from database.repository import DatabaseRepository as R; r = R(); print('rows:', r.count()); print(r.keys(limit=5))"
-```
-
-```powershell
-rows: 3000
-['order:o-000001', 'order:o-000002', 'order:o-000003', 'order:o-000004', 'order:o-000005']
-```
-
-`count()` and `keys(limit)` are small read-only helpers on
-`DatabaseRepository` for exactly this kind of sanity check.
-
-Then exercise the cache-aside path against a running cluster
-(Layer 4 setup): a first `GET` misses the cache and reads SQLite,
-the second is served from the cache:
-
-```powershell
-curl http://localhost:8000/cache/user:42          # source: "database"
-curl http://localhost:8000/cache/user:42          # source: "cache"
-curl http://localhost:8000/db/product:p-000007    # straight from SQLite
-curl http://localhost:8000/db/order:o-000007       # straight from SQLite
-```
-
-### Generator tests
-
-```powershell
-pytest tests/test_generate_dataset.py tests/test_repository.py -v
-```
-
----
-
-## Loading a dataset (CSV / JSON / JSONL)
-
-Any tabular dataset (Kaggle, OpenML, data.gov, ...) can be loaded
-into the SQLite source of truth with `import_dataset.py`. Each
-record becomes one `cache_data` row:
+### One file at a time
 
 ```
-key   = --prefix + <value of the key column>
+key   = <name>:<value of the key column>   (column auto-detected)
 value = the rest of the record, stored as JSON
 ```
 
 ```powershell
-# CSV — 'id' is detected automatically as the key column
-python import_dataset.py --file users.csv --prefix user:
+# CSV — key column detected automatically:
+#   exact id/uuid/sku -> "show_id"/"User_ID"/"Restaurant ID" style
+#   -> a column that is 100% unique in a sample -> row numbers
+python import_dataset.py --file datasets/netflix_titles.csv
 
-# Pick the key column yourself
-python import_dataset.py --file products.json --key-column sku --prefix product:
+# Pick the key column / dataset name / prefix yourself
+python import_dataset.py --file products.json --key-column sku --name products --prefix product:
 
 # JSONL (one JSON object per line)
-python import_dataset.py --file logs.jsonl --key-column request_id --prefix log:
+python import_dataset.py --file logs.jsonl --key-column request_id
 
 # Validate without writing anything
-python import_dataset.py --file users.csv --dry-run
+python import_dataset.py --file big.csv --dry-run
 
-# Import only the first 1000 rows, replacing what is already there
-python import_dataset.py --file users.csv --prefix user: --limit 1000 --clear
+# Import only the first 1000 rows
+python import_dataset.py --file big.csv --limit 1000
 
-# Store only some columns
-python import_dataset.py --file users.csv --value-columns name,age
+# Replace an already-registered dataset (fresh full import)
+python import_dataset.py --file users.csv --reimport
 ```
 
 Options:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--file` | (required) | `.csv`, `.tsv`, `.json`, `.jsonl`, `.ndjson` |
-| `--key-column` | `id`, else first column | Column that builds the cache key |
-| `--prefix` | empty | Prepended to every key (`user:`) |
-| `--value-columns` | all except key | Comma-separated subset to store |
+| `--file` | — | `.csv` `.tsv` `.json` `.jsonl` `.parquet` `.xlsx` `.zip` |
+| `--name` | file-name slug | Dataset name (also the default prefix, `netflix_titles`) |
+| `--prefix` | `<name>:` | Prepended to every key; `q:`/`s:` are reserved for the search cache |
+| `--key-column` | auto-detected | Column that builds the cache key (row numbers when none fits) |
 | `--limit` | none | Import at most N records |
-| `--db` | `data/cache.db` | SQLite path (`CACHE_DB_PATH` respected) |
-| `--batch-size` | 500 | Rows per transaction |
-| `--clear` | off | Delete existing rows first |
 | `--dry-run` | off | Parse and validate, write nothing |
+| `--reimport` | off | Replace an already-registered dataset |
+| `--seed` | off | Import every unregistered/changed file in the drop folder |
+| `--drop-dir` | `datasets/` | Drop folder used by `--seed` |
+| `--list` | off | List registered datasets (rows, prefix, key column) |
+| `--delete NAME` | off | Unregister a dataset and delete its database file |
 
 Notes:
 
-- CSV cells are auto-typed: `"21"` becomes the number `21`.
+- Formats: CSV, TSV, JSON, JSONL/NDJSON, Parquet, Excel and a Zip
+  containing any of those.
+- CSV cells are auto-typed: `"21"` becomes the number `21`,
+  `"True"` a boolean.
 - Duplicate keys overwrite (last record wins) and are reported.
-- Rows are written in batches, so importing 100k records takes
-  seconds, not minutes.
+- Imports write to a temporary file first and swap it in on
+  success — a failed import never destroys existing data.
 - After importing, the data flows through the normal cache-aside
-  path: a `GET` misses the cache, reads SQLite, and populates the
-  cache.
+  path: a `GET` misses the cache, reads the owning SQLite file, and
+  populates the cache.
 
 ```powershell
-python import_dataset.py --file users.csv --prefix user: --db data/cache.db
-curl http://localhost:8000/cache/user:42
+python import_dataset.py --file datasets/users.csv
+curl http://localhost:8000/cache/users:42    # source: "database" first, then "cache"
+curl http://localhost:8000/db/users:42       # straight from the dataset's SQLite file
+```
+
+### Inspect what is registered
+
+```powershell
+python import_dataset.py --list
+```
+
+```text
+netflix_titles   netflix_titles:   rows=8807   key=show_id     netflix_titles.csv
+imdb_movies      imdb_movies:      rows=10178  key=(row #)     imdb_movies.csv
+zomato_restaurant_dataset  zomato_restaurant_dataset:  rows=9551  key=Restaurant ID  Zomato Restaurant Dataset.csv
+```
+
+The dataset files are ordinary SQLite databases — open
+`data/datasets/<name>.db` with any SQLite browser, or query them
+from the TUI (`8`, pick the store) / the web UI Inspector.
+
+Sanity check in Python:
+
+```powershell
+python -c "from database.registry import DatasetRegistry as R; print(R().names())"
+```
+
+### Import tests
+
+```powershell
+pytest tests/test_import_dataset.py tests/test_registry.py tests/test_multi_repository.py -v
 ```
 
 ---
@@ -1313,7 +1312,7 @@ Four tabs:
 
 | Tab | What it does |
 |-----|--------------|
-| **Search** | Keyword + facet search over products / users / orders. |
+| **Search** | Keyword + facet search over every imported dataset. |
 | **Dashboard** | Cluster hit rates, telemetry, hot keys, replication log. |
 | **Inspector** | Read any key from the cache layer vs the database. |
 | **Cache Lab** | Run one query N times and watch DB load drop. |
@@ -1321,24 +1320,23 @@ Four tabs:
 ### Search endpoints
 
 ```powershell
-# Entities the search layer understands
+# One entity per imported dataset (name + filters/sorts generated
+# from its sniffed schema)
 curl http://127.0.0.1:8000/search/entities
 
-# Keyword search — first run hits the database, the repeat is cached
-curl "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc&page_size=8"
-curl "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc&page_size=8"
+# Keyword search — first run hits the database, the repeat is cached.
+# The entity name is your dataset's name (see import_dataset.py --list).
+curl "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=desc&page_size=8"
+curl "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=desc&page_size=8"
 
-# Faceted filters
-curl "http://127.0.0.1:8000/search/products?category=electronics&price_min=100&price_max=400&rating_min=4&instock=true"
-
-# Other entities
-curl "http://127.0.0.1:8000/search/users?city=Mumbai&active=true"
-curl "http://127.0.0.1:8000/search/orders?status=delivered&sort=total&dir=desc"
+# Faceted filters — parameter names come from /search/entities
+curl "http://127.0.0.1:8000/search/netflix_titles?type=Movie&release_year_min=2018&release_year_max=2021"
 
 # Autocomplete suggestions (cached separately)
-curl "http://127.0.0.1:8000/search/products/suggest?field=category&q=ele"
+curl "http://127.0.0.1:8000/search/netflix_titles/suggest?field=type&q=tv"
 
-# Browse what the search layer has cached (the q: result sets)
+# Browse dataset keys, or the cached q: result sets themselves
+curl "http://127.0.0.1:8000/browse/prefix?prefix=netflix_titles:&limit=10"
 curl "http://127.0.0.1:8000/browse/prefix?prefix=q:&limit=10"
 ```
 
@@ -1393,12 +1391,12 @@ pytest tests/test_search.py tests/test_telemetry.py tests/test_dashboard.py -v
 pytest -v
 ```
 
-Expected: **264 tests pass** — 14 cache + 16 consistent hash +
-8 router + 20 repository + 13 cache-service + 11 circuit-breaker +
-5 single-flight + 28 node lifecycle + 14 dataset import +
-15 statistics + 21 warm-up + 10 dataset generator +
-6 config + 13 terminal UI + 34 replication +
-25 search + 7 telemetry + 4 dashboard.
+Expected: **303 tests pass** — 34 replication + 29 dataset import +
+28 node lifecycle + 25 search + 21 warm-up + 20 repository +
+19 registry + 16 consistent hash + 15 statistics +
+15 multi-dataset repository + 14 cache + 13 cache-service +
+13 terminal UI + 11 circuit-breaker + 8 router + 7 telemetry +
+6 config + 5 single-flight + 4 dashboard.
 
 ---
 
@@ -1436,9 +1434,10 @@ In each terminal press `Ctrl + C`.
   blocks on a missing key — the database stays the source of truth.
   A database outage during warm-up keeps the node in RECOVERING
   (retried every health pass) instead of routing to a cold node.
-- Layer 5 uses SQLite at `data/cache.db` (no TTL — the DB keeps data
-  forever; TTL only affects the in-memory cache). Override the path
-  with the `CACHE_DB_PATH` environment variable.
+- Layer 5 uses SQLite with **no TTL** — the DB keeps data forever;
+  TTL only affects the in-memory cache. The system store lives at
+  `data/cache.db`, every imported dataset in `data/datasets/<name>.db`
+  (manifest: `data/registry.json`), all derived from `CACHE_DB_PATH`.
 - To point the router at a different set of nodes, set the
   `CACHE_NODES` environment variable before starting it:
   ```powershell

@@ -32,7 +32,7 @@
   <div class="search-hero">
     <div class="entity-switch" id="entitySwitch"></div>
     <form class="search-bar" id="searchForm">
-      <input type="search" id="q" placeholder="Search products&hellip;" autocomplete="off">
+      <input type="search" id="q" placeholder="Search&hellip;" autocomplete="off">
       <button type="submit" class="btn primary">Search</button>
       <button type="button" class="btn ghost" id="clearBtn">Clear</button>
     </form>
@@ -82,7 +82,7 @@
   <div class="panel">
     <h3>Single-key lookup &mdash; see what the cache layer saves</h3>
     <form class="search-bar" id="inspectForm">
-      <input type="text" id="inspectKey" placeholder="e.g. product:p-000001 or user:42" autocomplete="off">
+      <input type="text" id="inspectKey" placeholder="dataset key, e.g. users:42" autocomplete="off">
       <button type="submit" class="btn primary">Lookup</button>
       <button type="button" class="btn danger" id="inspectDelete">Delete key</button>
     </form>
@@ -92,7 +92,7 @@
   <div class="panel">
     <h3>Browse keys by prefix <span class="muted">(uncached &mdash; always live)</span></h3>
     <form class="search-bar" id="browseForm">
-      <input type="text" id="browsePrefix" placeholder="prefix, e.g. product:" value="product:">
+      <input type="text" id="browsePrefix" placeholder="prefix, e.g. users: (blank = all keys)" value="">
       <input type="number" id="browseLimit" value="25" min="1" max="500" class="narrow">
       <button type="submit" class="btn primary">Browse</button>
     </form>
@@ -110,7 +110,7 @@
       diverge &mdash; that gap <em>is</em> the load this system took off the database.
     </p>
     <form class="search-bar" id="labForm">
-      <input type="text" id="labQuery" value="electronics" placeholder="query">
+      <input type="text" id="labQuery" value="" placeholder="keyword (blank = all rows)">
       <input type="number" id="labCount" value="40" min="1" max="500" class="narrow" title="repetitions">
       <input type="number" id="labDelay" value="25" min="0" max="1000" class="narrow" title="delay ms between requests">
       <button type="submit" class="btn primary" id="labRun">Run</button>

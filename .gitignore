@@ -33,7 +33,7 @@ Thumbs.db
 data/
 *.db
 
-# Generated sample datasets
+# Drop-folder datasets (imported into data/datasets/*.db at runtime)
 datasets/
 
 # Research papers

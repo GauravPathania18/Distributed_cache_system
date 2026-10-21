@@ -58,19 +58,19 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Get-NetTCPConnection -LocalPort 8000,8001,8002,8003 `
   -State Listen -ErrorAction SilentlyContinue
 
-# 2. Project DB present with the standard 3000-row dataset?
-.venv\Scripts\python -c "from database.repository import DatabaseRepository as R; r=R(); print('rows:', r.count()); print(r.keys(limit=3))"
+# 2. Datasets imported? (one SQLite file per imported dataset)
+.venv\Scripts\python -c "from database.registry import DatasetRegistry as R; print(R().names())"
 ```
 
-Expected:
+Expected: a non-empty list of your dataset names, e.g.
 
 ```
-rows: 3000
-['order:o-000001', 'order:o-000002', 'order:o-000003']
+['imdb_movies', 'netflix_titles', 'zomato_restaurant_dataset']
 ```
 
-If `rows: 0` — run the dataset import in Phase 8 first, then come
-back. If a port is busy, see Troubleshooting (§11).
+If it prints `[]` — drop a file into `datasets/` and run
+`python import_dataset.py --seed` (Phase 8), then come back.
+If a port is busy, see Troubleshooting (§11).
 
 ### 0.4 How to read this guide
 
@@ -89,7 +89,7 @@ Fastest signal that nothing regressed. No servers needed.
 pytest -q
 ```
 
-Expected: **264 passed** in ~30s, no failures, no errors.
+Expected: **303 passed** in ~55s, no failures, no errors.
 
 Breakdown (for pinpointing a regression):
 
@@ -103,10 +103,11 @@ Breakdown (for pinpointing a regression):
 | Circuit breaker | 11 | `pytest tests/test_circuit_breaker.py -v` |
 | Single-flight coalescing | 5 | `pytest tests/test_single_flight.py -v` |
 | Node lifecycle (6.1) | 28 | `pytest tests/test_node_lifecycle.py -v` |
-| Dataset importer | 14 | `pytest tests/test_import_dataset.py -v` |
+| Dataset importer (files → per-dataset SQLite) | 29 | `pytest tests/test_import_dataset.py -v` |
+| Dataset registry (manifest + schema/key sniff) | 19 | `pytest tests/test_registry.py -v` |
+| Multi-dataset repository (prefix routing) | 15 | `pytest tests/test_multi_repository.py -v` |
 | Statistics / hot keys (6.2) | 15 | `pytest tests/test_statistics.py -v` |
 | Warm-up (6.3/6.4) | 21 | `pytest tests/test_warmup.py -v` |
-| Dataset generator | 10 | `pytest tests/test_generate_dataset.py -v` |
 | Node URL config | 6 | `pytest tests/test_config.py -v` |
 | Terminal UI logic | 13 | `pytest tests/test_tui.py -v` |
 | Replication (7.2-7.6) | 34 | `pytest tests/test_replication.py -v` |
@@ -114,40 +115,43 @@ Breakdown (for pinpointing a regression):
 | Telemetry / DB-load metric (8.2) | 7 | `pytest tests/test_telemetry.py -v` |
 | Dashboard + web UI (8.3) | 4 | `pytest tests/test_dashboard.py -v` |
 
-**Pass criteria:** 264 passed, 0 failed. Any other count means a
+**Pass criteria:** 303 passed, 0 failed. Any other count means a
 lost/added test — diff against this table before suspecting the code.
 
 **Data-safety check after the run** (proves tests are hermetic):
 
 ```powershell
-.venv\Scripts\python -c "from database.repository import DatabaseRepository as R; print('rows:', R().count())"
+.venv\Scripts\python -c "from database.registry import DatasetRegistry as R; print('datasets:', R().names())"
 ```
 
-Expected: `rows: 3000` — unchanged by the test suite.
+Expected: **identical to the pre-run listing** — the suite points
+`CACHE_DB_PATH` at a throwaway directory, so it never touches the
+real `data/` (system store, dataset files or registry).
 
 ---
 
-## 2. Phase 1 — Layer demos (no servers)
+## 2. Phase 1 — Dataset pipeline smoke (no servers)
 
-Pure in-process demos. No ports, no DB.
+Pure in-process checks. No ports, no cluster.
 
-### 2.1 Layer 1 — local LRU engine
-
-```powershell
-python demo.py
-```
-
-Pass criteria: runs to completion without a traceback; prints a
-short walkthrough of set/get, TTL expiry and LRU eviction.
-
-### 2.2 Layer 3 — consistent hashing
+### 2.1 Dry-run an import (parse + plan, writes nothing)
 
 ```powershell
-python demo_hash.py
+python import_dataset.py --file datasets/netflix_titles.csv --dry-run
 ```
 
-Pass criteria: prints the ring with virtual nodes, then a
-key → node mapping table; exits cleanly.
+Pass criteria: prints the detected format, columns, key column
+(`show_id`) and prefix (`netflix_titles:`), then
+`Dry run : nothing was written`.
+
+### 2.2 Registry listing
+
+```powershell
+python import_dataset.py --list
+```
+
+Pass criteria: one line per registered dataset with live row
+counts, prefix and key column; no stack trace.
 
 ---
 
@@ -231,6 +235,13 @@ python tui.py
 
 Expected within ~10–20s:
 
+0. Before anything starts, the drop folder seeds (once per file):
+
+```
+  imported netflix_titles.csv -> netflix_titles (8807 rows)
+  imported imdb_movies.csv -> imdb_movies (10178 rows)
+```
+
 1. Four new console windows open (router + 3 nodes) — watch their
    logs live.
 2. The TUI prints:
@@ -297,14 +308,14 @@ Expected:
 ```
 
 Pass criteria: `source: cache` (the value was just written).
-A dataset key that was never fetched (e.g. `user:42`) returns
-`source: database` on its FIRST GET (cache-aside fallback) and
-`source: cache` on the second — that two-GET switch is the
+A dataset key that was never fetched (e.g. `netflix_titles:s1`)
+returns `source: database` on its FIRST GET (cache-aside fallback)
+and `source: cache` on the second — that two-GET switch is the
 Layer 5 behavior; try it now:
 
 ```
-  3 → user:42   (expect source: database)
-  3 → user:42   (expect source: cache)
+  3 → netflix_titles:s1   (expect source: database)
+  3 → netflix_titles:s1   (expect source: cache)
 ```
 
 **Option 4 — DELETE**
@@ -324,11 +335,12 @@ cache nodes (the two that held it).
 
 **Option 5 — DB get (bypasses the cache)**
 
-Input: `5`, key `user:42`.
+Input: `5`, key `netflix_titles:s1`.
 
-Expected: the raw JSON value from `data/cache.db` (the synthetic
-user record: name/email/age/city/...). This endpoint is the
-"source of truth" view — it must match what GET eventually
+Expected: the raw JSON record from the dataset's own file
+`data/datasets/netflix_titles.db` — the imported row
+(`title: "Dick Johnson Is Dead"`, type, rating, ...). This endpoint
+is the "source of truth" view — it must match what GET eventually
 returns.
 
 **Option `b` — restart anything down**
@@ -338,25 +350,25 @@ healthy prints that nothing needed starting.
 
 **Option 6 — Key inspector (the flagship query)**
 
-Input: `6`, key `user:42`.
+Input: `6`, key `netflix_titles:s1`.
 
 Expected (cold cache):
 
 ```
-  CACHE - direct node reads for 'user:42'
+  CACHE - direct node reads for 'netflix_titles:s1'
     :8001   MISS
     :8002   MISS
     :8003   MISS
 
   DATABASE - source of truth (read-only)
-    FOUND   {"name": "Elena Aziz", ...}
+    FOUND   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
 
   VERDICT  DB-ONLY - source of truth has the key, the cache is cold
 ```
 
-Now GET `user:42` once (option 3) so it is cached, then inspect
-again. Expected: the two replica nodes show `HIT` with the same
-JSON, the third shows `MISS`, verdict:
+Now GET `netflix_titles:s1` once (option 3) so it is cached, then
+inspect again. Expected: the two replica nodes show `HIT` with the
+same JSON, the third shows `MISS`, verdict:
 
 ```
   VERDICT  CONSISTENT - 2 caching node(s) match the database
@@ -377,46 +389,48 @@ testing normally produces DB-ONLY, CONSISTENT and NOT FOUND):
 
 Inspect a key that exists nowhere (`6` → `nope:1`) → `NOT FOUND`.
 
-**Option 7 — List DB keys / prefixes**
+**Option 7 — List keys across every store**
 
-Input: `7`, prefix `user:`, limit blank (=20).
+Input: `7`, prefix `netflix_titles:`, limit blank (=20).
 
 Expected:
 
 ```
-  1000 key(s) matching 'user:' - showing 20
+  8807 key(s) matching 'netflix_titles:' - showing 20
 
-  key        value bytes
-  ------------------------
-  user:1     147
-  user:10    152
+  key                        value bytes
+  ----------------------------------------
+  netflix_titles:s1          612
+  netflix_titles:s10         588
   ...
 ```
 
-Then `7` with a blank prefix → a per-prefix summary
-(`user:` 1000, `product:` 1000, `order:` 1000, total 3000) plus
-the first 20 keys.
+Then `7` with a blank prefix → a **store summary** (system store +
+one line per dataset: prefix, key column, row count) followed by
+the first 20 keys merged across all stores.
 
 **Option 8 — SQL console (read-only)**
 
-Input: `8`, SQL `SELECT COUNT(*) FROM cache_data`.
+Input: `8`, target `netflix_titles`, then SQL
+`SELECT COUNT(*) FROM cache_data`.
 
 Expected:
 
 ```
   COUNT(*)
   ----------
-  3000
+  8807
 ```
 
-Try a JSON query too:
+Try a JSON query too (against the system store, blank target):
 
 ```sql
-SELECT key, json_extract(value,'$.city') AS city
-FROM cache_data WHERE key LIKE 'user:%' LIMIT 5;
+SELECT key, json_extract(value,'$.status') AS status
+FROM cache_data WHERE key LIKE 'q:%' LIMIT 5;
 ```
 
-Expected: 5 rows with real city names (Berlin, Mumbai, ...).
+Expected: cached search result sets (`q:...` keys), or 0 rows if
+you have not searched yet.
 
 Negative checks (must be REJECTED, printed in red):
 
@@ -434,8 +448,8 @@ Expected three blocks:
 ```
   ROUTER
     hot keys tracked: 2
-           6  test:tui          <- DELETE counted too; user:42 from your GETs
-           3  user:42
+           6  test:tui            <- DELETE counted too
+           3  netflix_titles:s1   <- from your GETs
     warm-up: enabled=True limit=1000 rate=100.0/s
       8001: done loaded=0 attempts=1
       ...
@@ -469,8 +483,8 @@ Get-NetTCPConnection -LocalPort 8000,8001,8002,8003 `
   -State Listen -ErrorAction SilentlyContinue
 ```
 
-Expected: empty (all ports free). DB row count back to 3000
-(put+delete of `test:tui` cancels out).
+Expected: empty (all ports free). The system store's row count is
+back to its pre-run value (put+delete of `test:tui` cancels out).
 
 **Done — Phase 3 complete.** Restart the cluster for Phase 4
 either with `python tui.py` again, or manually as below.
@@ -542,30 +556,41 @@ curl.exe http://127.0.0.1:8000/cache/user:101
 ### 5.4 Cache-aside with dataset keys
 
 ```powershell
-# 1st GET - miss -> SQLite -> populate
-curl.exe http://127.0.0.1:8000/cache/user:42
+# 1st GET - miss -> the dataset's SQLite file -> populate
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1
 # => ..."source":"database","node":null
 
 # 2nd GET - now cached
-curl.exe http://127.0.0.1:8000/cache/user:42
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1
 # => ..."source":"cache","node":"http://127.0.0.1:800x"
 
 # Direct DB endpoints (testing-only, bypass cache)
-curl.exe http://127.0.0.1:8000/db/user:42
-# => {"key":"user:42","value":{...},"source":"database"}
-curl.exe http://127.0.0.1:8000/db/product:p-000007
-curl.exe -X DELETE http://127.0.0.1:8000/db/order:o-000007   # deletes DB row ONLY
-curl.exe http://127.0.0.1:8000/cache/order:o-000007          # => 404 (gone from DB)
+curl.exe http://127.0.0.1:8000/db/netflix_titles:s1
+# => {"key":"netflix_titles:s1","value":{...},"source":"database"}
+curl.exe http://127.0.0.1:8000/db/netflix_titles:s2
+curl.exe -X DELETE http://127.0.0.1:8000/db/netflix_titles:s2   # deletes DB row ONLY
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s2          # => 404 (gone from DB)
 ```
 
 > The `/db/*` DELETE intentionally leaves the cache stale — that is
 > how you can manufacture a `STALE` verdict for the TUI inspector.
-> Re-import the dataset (Phase 8) afterwards to restore the row.
+> Re-import the dataset with `--reimport` (Phase 8) afterwards to
+> restore the row.
 
 ### 5.5 Distribution demo (optional)
 
 ```powershell
-python demo_router.py
+# PUT a handful of keys, then read each back and print its node
+1..6 | ForEach-Object {
+  $key = "test:dist-$_"
+  Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:8000/cache/$key" `
+    -ContentType "application/json" -Body '{"value":"v","ttl":60}' | Out-Null
+}
+1..6 | ForEach-Object {
+  $key = "test:dist-$_"
+  $r = Invoke-RestMethod -Uri "http://127.0.0.1:8000/cache/$key"
+  "{0} -> {1}" -f $key, $r.node
+}
 ```
 
 Pass criteria: PUTs spread across nodes by consistent hash, GETs
@@ -648,9 +673,10 @@ Expected: 8002 back under `active_nodes`, state `"ready"`,
 
 Pass criteria: FAIL detection logged → replica GET survived →
 gated RECOVERING → READY rejoin. The restarted node's RAM is
-empty — its cache repopulates lazily from the DB on the next miss
-(also a required observation: GET `user:777` right after rejoin
-shows `source: database` once, then `source: cache`).
+empty — caches repopulate lazily from the DB on the next miss
+(also a required observation: GET a dataset key you have not
+fetched yet, e.g. `netflix_titles:s5000`, right after rejoin —
+`source: database` once, then `source: cache`).
 
 ---
 
@@ -665,8 +691,8 @@ curl.exe http://127.0.0.1:8000/circuit-breaker/status
 # => {"state":"closed","failure_count":0,"failure_threshold":3,
 #     "recovery_timeout":30,...}
 
-# Make sure user:42 is cached (GET twice) so HITs still work later
-curl.exe http://127.0.0.1:8000/cache/user:42
+# Make sure a dataset key is cached (GET twice) so HITs work later
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1
 ```
 
 ### 7.2 Take the database away
@@ -698,7 +724,7 @@ curl.exe -w "%{time_total}`n" http://127.0.0.1:8000/cache/definitely:missing4
 ### 7.4 Cache HITs still work while OPEN (critical property)
 
 ```powershell
-curl.exe http://127.0.0.1:8000/cache/user:42
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1
 # => 200, "source":"cache"   <- served despite the open breaker
 ```
 
@@ -717,11 +743,13 @@ Remove-Item data\cache.db            # sqlite recreated an empty shell
 Move-Item data\cache.db.bak data\cache.db
 ```
 
-Wait >30s (recovery cooldown), then any miss triggers the
-HALF-OPEN probe:
+Wait >30s (recovery cooldown), then a MISS triggers the HALF-OPEN
+probe (a cache HIT never touches the DB and cannot heal the breaker,
+so use a key nothing has fetched yet):
 
 ```powershell
-curl.exe http://127.0.0.1:8000/cache/user:42
+curl.exe http://127.0.0.1:8000/cache/definitely:missing5
+# => HTTP 404 (the DB was probed and answered normally)
 
 curl.exe http://127.0.0.1:8000/circuit-breaker/status
 # => {"state":"closed","failure_count":0,...}
@@ -741,10 +769,10 @@ gets its hottest keys reloaded BEFORE it is allowed to serve.
 
 ```powershell
 1..10 | ForEach-Object {
-  curl.exe -X PUT http://127.0.0.1:8000/cache/user:42 `
+  curl.exe -X PUT http://127.0.0.1:8000/cache/test:hot `
     -H "Content-Type: application/json" -d '{"value":"hot","ttl":300}' | Out-Null
-  curl.exe http://127.0.0.1:8000/cache/user:42 | Out-Null
-  curl.exe http://127.0.0.1:8000/cache/product:p-000001 | Out-Null
+  curl.exe http://127.0.0.1:8000/cache/test:hot | Out-Null
+  curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1 | Out-Null
 }
 ```
 
@@ -754,7 +782,7 @@ gets its hottest keys reloaded BEFORE it is allowed to serve.
 curl.exe "http://127.0.0.1:8000/cluster/hot-keys?limit=5&per_node=100"
 ```
 
-Expected: `top_keys` led by `user:42` (highest count), a
+Expected: `top_keys` led by `test:hot` (highest count), a
 `per_node` block with each node's own top keys, `nodes_queried: 3`.
 
 Per-node raw view (Layer 6.2):
@@ -810,7 +838,7 @@ curl.exe -X POST "http://127.0.0.1:8000/cluster/warmup/http%3A%2F%2F127.0.0.1%3A
 curl.exe -X POST "http://127.0.0.1:8000/cluster/warmup/http%3A%2F%2F127.0.0.1%3A9999"
 ```
 
-Pass criteria: hot list ranks `user:42` first → restart → warm-up
+Pass criteria: hot list ranks `test:hot` first → restart → warm-up
 `running`→`done` with the hot key loaded → node READY only after
 warm-up completes → manual trigger works, unknown node 404.
 
@@ -822,56 +850,53 @@ warm-up completes → manual trigger works, unknown node 404.
 
 ---
 
-## 9. Phase 8 — Dataset pipeline
+## 9. Phase 8 — Dataset pipeline (import → serve)
 
-Verifies the generate → import → serve chain end to end.
+Verifies the file → per-dataset SQLite → registry → serve chain end
+to end. The TUI already seeded `datasets/` on boot (Phase 3); this
+phase exercises the CLI explicitly.
 
-### 9.1 Generate synthetic datasets (deterministic, seed 42)
-
-```powershell
-python generate_dataset.py --kind all --count 1000
-```
-
-Expected files (already present in a prepared checkout — the
-command overwrites them identically):
-
-```
-datasets\users.csv      1000 records, key column: id
-datasets\products.json  1000 records, key column: sku
-datasets\orders.jsonl   1000 records, key column: order_id
-```
-
-Determinism check: run it twice; the second run must not change
-file sizes or row counts.
-
-### 9.2 Import (dry-run first)
+### 9.1 Dry-run first (parses + plans, writes nothing)
 
 ```powershell
-python import_dataset.py --file datasets/users.csv --dry-run
+python import_dataset.py --file datasets/netflix_titles.csv --dry-run
 ```
 
-Expected: parses and validates, reports 1000 records, writes
-NOTHING (row count unchanged).
+Expected: prints the detected format, the sniffed columns, the
+detected key column (`show_id`), the prefix (`netflix_titles:`) and
+finally `Dry run       : nothing was written`. Row counts in
+`--list` are unchanged.
+
+### 9.2 Seed the whole drop folder (idempotent)
 
 ```powershell
-python import_dataset.py --file datasets/users.csv     --key-column id      --prefix user:     --clear
-python import_dataset.py --file datasets/products.json --key-column sku     --prefix product:  --clear
-python import_dataset.py --file datasets/orders.jsonl  --key-column order_id --prefix order:    --clear
+python import_dataset.py --seed
 ```
 
-(`--clear` makes the step idempotent — re-runnable any time.)
+Expected on a fresh folder: one report block per file (File /
+Columns / Key column / Rows written / Database ...). Run it again:
+`drop folder is empty or fully imported` — a file is only
+re-imported when its content changed.
 
 ### 9.3 Verify
 
 ```powershell
-python -c "from database.repository import DatabaseRepository as R; r=R(); print('rows:', r.count()); print(r.keys(limit=5))"
+python import_dataset.py --list
 ```
 
-Expected:
+Expected — one line per dataset (live rows, prefix, key column):
 
 ```
-rows: 3000
-['order:o-000001', 'order:o-000002', 'order:o-000003', 'order:o-000004', 'order:o-000005']
+imdb_movies                      imdb_movies:         rows=10178    key=(row #)          imdb_movies.csv
+netflix_titles                   netflix_titles:      rows=8807     key=show_id          netflix_titles.csv
+zomato_restaurant_dataset        ...                  rows=9551     key=Restaurant ID    Zomato Restaurant Dataset.csv
+```
+
+Each dataset is its own physical SQLite file:
+
+```powershell
+Get-ChildItem data\datasets
+# imdb_movies.db  netflix_titles.db  zomato_restaurant_dataset.db  ...
 ```
 
 ### 9.4 Serve it through the cluster
@@ -880,16 +905,15 @@ With the cluster running (restart via `python tui.py` or the
 4-terminal setup if you stopped it):
 
 ```powershell
-curl.exe http://127.0.0.1:8000/cache/user:42          # 1st: source "database"
-curl.exe http://127.0.0.1:8000/cache/user:42          # 2nd: source "cache"
-curl.exe http://127.0.0.1:8000/db/product:p-000007    # direct DB read
-curl.exe http://127.0.0.1:8000/db/order:o-000007
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1   # 1st: source "database"
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1   # 2nd: source "cache"
+curl.exe http://127.0.0.1:8000/db/imdb_movies:1          # direct read from that dataset's file
 ```
 
 Or simply use TUI options 3/5/6/7/8 from Phase 3 — same data.
 
 Import tests are covered by `pytest tests/test_import_dataset.py
-tests/test_generate_dataset.py -v` (24 tests).
+tests/test_registry.py tests/test_multi_repository.py -v` (63 tests).
 
 ---
 
@@ -1003,22 +1027,23 @@ are served as-is.
 ### 11.2 Search runs SQL once, then serves from cache
 
 ```powershell
-curl.exe "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc"
-curl.exe "http://127.0.0.1:8000/search/products?q=widget&sort=price&dir=asc"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=asc"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=asc"
 ```
 
 Expected: the **first** response carries `"source":"database"` and
 a non-zero `took_ms`; the **repeat** carries `"source":"cache"`,
 a `"node"` URL and `took_ms` near zero. Both share the same
-`cache_key` (starting `q:products:`). The UI shows this as a
+`cache_key` (starting `q:netflix_titles:`). The UI shows this as a
 `🗄 DATABASE` → `⚡ CACHE` banner flip on the same query.
 
-### 11.3 Facets, sorting and the other entities
+### 11.3 Facets, sorting and per-dataset entities
 
 ```powershell
-curl.exe "http://127.0.0.1:8000/search/products?category=electronics&price_min=100&price_max=400&rating_min=4&instock=true"
-curl.exe "http://127.0.0.1:8000/search/users?city=Mumbai&active=true"
-curl.exe "http://127.0.0.1:8000/search/orders?status=delivered&sort=total&dir=desc"
+# One entity per imported dataset; facet/range params come from
+# /search/entities (generated from each dataset's schema)
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?type=Movie&release_year_min=2018&release_year_max=2021"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?rating=TV-MA&sort=release_year&dir=desc"
 ```
 
 Expected: each returns 200 with a `total` that only counts matching
@@ -1048,7 +1073,7 @@ Open `http://127.0.0.1:8000/` and walk the four tabs:
    amber → green. Toggle a facet; the chips update.
 2. **Dashboard** — every node's hit rate is 0–100, the telemetry
    panel matches the curl numbers, hot keys are listed.
-3. **Inspector** — enter `user:42`; cache and DB values agree.
+3. **Inspector** — enter `netflix_titles:s1`; cache and DB values agree.
    Browse the prefix `q:` to see the cached result sets themselves.
 4. **Cache Lab** — pick a query, iterations = 20, press **Run**.
    The cumulative chart shows 1 SQL run then a flat line, with
@@ -1067,10 +1092,10 @@ Copy this table into the session notes and tick every row.
 
 | # | Feature | Phase | Pass criteria |
 |---|---|---|---|
-| 1 | Test suite green | 0 | 264 passed |
-| 2 | Tests are hermetic | 0 | DB rows still 3000 after pytest |
-| 3 | Layer 1 demo | 1 | `demo.py` completes |
-| 4 | Consistent hash demo | 1 | `demo_hash.py` prints ring + mapping |
+| 1 | Test suite green | 0 | 303 passed |
+| 2 | Tests are hermetic | 0 | registry + dataset files unchanged after pytest |
+| 3 | Import dry-run (no servers) | 1 | plan printed, `nothing was written` |
+| 4 | Registry listing | 1 | one line per dataset, no traceback |
 | 5 | Node health endpoint | 2 | `{"status":"healthy"}` |
 | 6 | Node SET/GET/EXISTS/DELETE | 2 | values round-trip; 404 on miss |
 | 7 | Node stats + window + top-keys | 2 | counters reflect traffic |
@@ -1083,9 +1108,9 @@ Copy this table into the session notes and tick every row.
 | 14 | Key inspector cold | 3 | `DB-ONLY` |
 | 15 | Key inspector warm | 3 | `CONSISTENT` |
 | 16 | Key inspector absent key | 3 | `NOT FOUND` |
-| 17 | Prefix listing | 3 | `1000 key(s) matching 'user:'` |
-| 18 | SQL COUNT(*) | 3 | `3000` |
-| 19 | SQL json_extract query | 3 | 5 rows with cities |
+| 17 | Prefix listing | 3 | `8807 key(s) matching 'netflix_titles:'` |
+| 18 | SQL COUNT(*) | 3 | `8807` against the `netflix_titles` store |
+| 19 | SQL json_extract query | 3 | rows for `q:` cache keys (or 0) |
 | 20 | SQL rejects writes | 3 | red error, nothing deleted |
 | 21 | Stats/hot-keys/breaker view | 3 | breaker closed, keys listed |
 | 22 | TUI clean stop | 3 | option 0 frees all 4 ports |
@@ -1094,7 +1119,7 @@ Copy this table into the session notes and tick every row.
 | 25 | GET via curl | 4 | `source: cache` |
 | 26 | DELETE via curl | 4 | `deleted_from_database: true` |
 | 27 | /db/* direct endpoints | 4 | read + delete bypass cache |
-| 28 | demo_router.py | 4 | keys spread over nodes |
+| 28 | Distribution loop (§5.5) | 4 | keys spread over nodes |
 | 29 | Node failure detection | 5 | `[NODE FAILED]` in ~6–20s |
 | 30 | Replica survives kill | 5 | GET returns value while 2/3 |
 | 31 | Gated rejoin | 5 | RECOVERING then READY |
@@ -1104,13 +1129,13 @@ Copy this table into the session notes and tick every row.
 | 35 | HITs served while open | 6 | 200 `source: cache` |
 | 36 | Breaker heals after restore | 6 | closed after cooldown+probe |
 | 37 | Writes protected by breaker | 6 | PUT 503 while DB down |
-| 38 | Cluster hot-key ranking | 7 | user:42 on top |
+| 38 | Cluster hot-key ranking | 7 | test:hot on top |
 | 39 | Warm-up on restart | 7 | `running` → `done` → READY |
 | 40 | Manual warm-up trigger | 7 | works; unknown node 404 |
-| 41 | Dataset generate | 8 | 3 files, deterministic |
+| 41 | Seed drop folder | 8 | report per file; 2nd run is a no-op |
 | 42 | Import dry-run | 8 | validates, writes nothing |
-| 43 | Import full | 8 | rows: 3000, keys `o-000001…` |
-| 44 | Imported data served | 8 | cache-aside works on user:42 |
+| 43 | Import full | 8 | `rows=8807 key=show_id`; own `data/datasets/*.db` |
+| 44 | Imported data served | 8 | cache-aside works on netflix_titles:s1 |
 | 45 | /cluster/replication status | 9 | sequence, nodes, empty failovers |
 | 46 | Write bumps sequence + acks | 9 | acked == current, behind 0 |
 | 47 | Node entry carries sequence | 9 | `/internal/entry` shows sequence |
@@ -1132,7 +1157,7 @@ Result: ___/56 passed  |  Date: ______  |  Tester: ______
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `pytest`: 265+ or <264 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
+| `pytest`: 304+ or <303 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
 | Port already in use | leftover process from a crashed session | `Get-NetTCPConnection -LocalPort 8000 -State Listen` → note `OwningProcess` → `Stop-Process -Id <pid> -F` |
 | TUI stuck at `waiting for 3 node(s)` | a node window failed to start | check the three node windows for tracebacks; `Ctrl+C` the TUI and restart |
 | PUT returns 503 right after boot | gated startup — nodes still `starting/recovering` | wait for `/cluster/status` to list them as `ready` (~5s) — expected behavior |
@@ -1140,7 +1165,7 @@ Result: ___/56 passed  |  Date: ______  |  Tester: ______
 | `curl` rejects `-X PUT` | PowerShell alias to Invoke-WebRequest | use `curl.exe` |
 | TUI opens no windows | console-session limitation (e.g. some remote shells) | run the 4-terminal manual setup (Phase 4) instead |
 | `Move-Item data\cache.db` → in use | SQLite connection still open from the last request | wait 1–2s, retry; the repo uses short-lived connections |
-| Breaker never returns to `closed` | cooldown not elapsed, or no miss since restore | wait the full 30s, then issue one GET |
+| Breaker never returns to `closed` | cooldown not elapsed, or only HITs issued since restore | wait the full 30s, then GET a key you have never fetched (only a miss probes the DB) |
 | Empty `data\cache.db` after breaker test | SQLite recreated a shell file while the DB was "away" | the restore steps in §7.5 (`Remove-Item` shell first) handle it |
 | `activate` blocked | execution policy | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
 | Tests fail with DB errors | someone set `CACHE_DB_PATH` globally | unset it: `Remove-Item Env:CACHE_DB_PATH` |
@@ -1161,9 +1186,9 @@ Get-NetTCPConnection -LocalPort 8000,8001,8002,8003 `
   -State Listen -ErrorAction SilentlyContinue
 # => empty
 
-# 3. Database intact?
-python -c "from database.repository import DatabaseRepository as R; print('rows:', R().count())"
-# => rows: 3000  (re-import via Phase 8 if a fault test deleted rows)
+# 3. Datasets intact? (row counts unchanged;
+#    repair a damaged one with: python import_dataset.py --file <f> --reimport)
+python import_dataset.py --list
 
 # 4. Nothing stray in git
 git status --short
@@ -1180,11 +1205,11 @@ taskkill /F /IM python.exe /FI "WINDOWTITLE eq *main.py*"
 
 For a fast "is it basically alive?" check between larger changes:
 
-1. `pytest -q` → 264 passed (Phase 0)
-2. `python tui.py` → `active: 3/3` (Phase 3.1)
-3. TUI `3` → `user:42` twice → `database` then `cache`
-4. TUI `6` → `user:42` → `CONSISTENT`
-5. TUI `8` → `SELECT COUNT(*) FROM cache_data` → `3000`
+1. `pytest -q` → 303 passed (Phase 0)
+2. `python tui.py` → seeds datasets/, then `active: 3/3` (Phase 3.1)
+3. TUI `3` → `netflix_titles:s1` twice → `database` then `cache`
+4. TUI `6` → `netflix_titles:s1` → `CONSISTENT`
+5. TUI `8` → target `netflix_titles` → `SELECT COUNT(*) FROM cache_data` → `8807`
 6. TUI `0` → ports free
 7. `start http://127.0.0.1:8000/` → UI loads; search twice → banner flips
    (Phase 10)
