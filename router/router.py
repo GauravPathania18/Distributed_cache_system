@@ -23,6 +23,7 @@ from . import routes_cluster  # noqa: F401
 from . import routes_search  # noqa: F401
 from . import routes_dashboard  # noqa: F401
 from . import routes_manage  # noqa: F401
+from . import routes_datasets  # noqa: F401
 
 # Static last: its mount is registered after every API route.
 from . import routes_static  # noqa: F401

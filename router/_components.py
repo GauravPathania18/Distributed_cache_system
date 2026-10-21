@@ -5,6 +5,7 @@ from cluster.node_manager import NodeManager
 from cluster.node_state import NodeState
 from database import DatasetRegistry, MultiDatasetRepository
 from services.cache_service import CacheService
+from services.dataset_admin import DatasetAdmin
 from services.distributed_cache import DistributedCache
 from services.replication import ReplicationManager
 from services.search import SearchService
@@ -156,6 +157,16 @@ node_manager.set_recovery_gate(
     )
 )
 
+# Layer 9 - dataset/entry mutations from the web UI: keeps rows,
+# node copies, search caches and the replication log consistent.
+admin = DatasetAdmin(
+    registry=registry,
+    database=database,
+    cache_service=cache_service,
+    distributed_cache=distributed_cache,
+    replication=replication
+)
+
 
 def configure_cluster(
     nodes,
@@ -179,7 +190,7 @@ def configure_cluster(
     """
 
     global node_manager, distributed_cache, cache_service, hot_keys, warmup
-    global replication, telemetry, search_service
+    global replication, telemetry, search_service, admin
 
     node_manager = NodeManager(
         nodes=nodes,
@@ -248,6 +259,14 @@ def configure_cluster(
     warmup.install()
     replication.install()
 
+    admin = DatasetAdmin(
+        registry=registry,
+        database=database,
+        cache_service=cache_service,
+        distributed_cache=distributed_cache,
+        replication=replication
+    )
+
     node_manager.set_recovery_gate(
         lambda node: (
             warmup.recovery_ready(node) and replication.sync_ready(node)
@@ -267,3 +286,4 @@ def configure_cluster(
         router_module.replication = replication
         router_module.telemetry = telemetry
         router_module.search_service = search_service
+        router_module.admin = admin

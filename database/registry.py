@@ -432,6 +432,28 @@ class DatasetRegistry:
 
         return True
 
+    def update(self, name, **fields) -> dict:
+        """
+        Partial update of one manifest entry (Layer 9 dataset admin).
+
+        Keeps every field not named in `fields` - used after entry
+        mutations to refresh row_count / schema without re-running
+        a full import. Raises KeyError for an unknown dataset.
+        """
+
+        datasets = self.entries()
+
+        if name not in datasets:
+            raise KeyError(name)
+
+        entry = dict(datasets[name])
+        entry.update(fields)
+
+        datasets[name] = entry
+        self._save(datasets)
+
+        return entry
+
     def _save(self, datasets: dict) -> None:
 
         Path(self.base_dir).mkdir(parents=True, exist_ok=True)
