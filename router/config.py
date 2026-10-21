@@ -31,6 +31,29 @@ WARMUP_LIMIT = int(os.environ.get("WARMUP_LIMIT", "1000"))
 WARMUP_RATE_LIMIT = float(os.environ.get("WARMUP_RATE_LIMIT", "100"))
 HOTKEY_MAX_KEYS = int(os.environ.get("HOTKEY_MAX_KEYS", "10000"))
 
+# Layer 6.5 - cold-start seeding: what an EMPTY node holds before
+# any traffic history exists (warm-up has nothing to reload then).
+SEED_ENABLED = os.environ.get(
+    "SEED_ENABLED", "on"
+).strip().lower() in ("1", "on", "true", "yes")
+
+# popular = top rows by each dataset's detected popularity column
+# (score / aggregate_rating / release_year / ...), sampled uniformly
+# when a dataset has no such column; random = uniform sample.
+# Unknown values are normalized to "popular" by CacheSeeder.
+SEED_STRATEGY = os.environ.get("SEED_STRATEGY", "popular").strip().lower()
+
+# Fraction of a node's own capacity seeding may claim - the rest of
+# the LRU stays free for the traffic the seeds are meant to attract.
+SEED_FILL_RATIO = float(os.environ.get("SEED_FILL_RATIO", "0.6"))
+
+# Candidate rows pulled per dataset (nodes keep only what they own,
+# so the pool must be several times a single node's budget).
+SEED_PER_DATASET = int(os.environ.get("SEED_PER_DATASET", "250"))
+
+# Capacity assumed for a node that does not answer /stats.
+SEED_FALLBACK_CAPACITY = int(os.environ.get("SEED_FALLBACK_CAPACITY", "100"))
+
 # Layer 7.3 - replication log + sync
 REPLICATION_ENABLED = os.environ.get(
     "REPLICATION_ENABLED", "on"

@@ -137,6 +137,35 @@ class NodeManager:
 
             return self.ring.with_node(node)
 
+    def declared_ring_view(self):
+        """
+        Snapshot of the ring over EVERY declared node, gated or not.
+
+        ring_view(node) answers "where will traffic route once THIS
+        node rejoins the live ring" - but during a full cold start
+        every node is gated, so that view has a single member and
+        each node would own (and therefore load) the identical
+        whole keyspace. Layer 6.5 seeding asks the different
+        question "which slice will this node own once the CLUSTER
+        is recovered": the declared membership. Each node then seeds
+        a distinct slice, so the cluster's unique coverage is
+        N x the per-node budget instead of 1 x it.
+
+        Nodes are only ever ADDED (register_node), never removed,
+        so the declared set cannot contain phantoms.
+        """
+
+        with self.lock:
+
+            view = ConsistentHashRing(
+                virtual_nodes=self.ring.virtual_nodes
+            )
+
+            for node in self.nodes:
+                view.add_node(node)
+
+            return view
+
     def expected_primary(self, key: str, node: str):
         """
         Who WOULD be the primary for `key` once `node` rejoins

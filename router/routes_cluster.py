@@ -83,12 +83,20 @@ def cluster_warmup_status():
     A node only reaches READY (and rejoins the hash ring) once its
     record is done - warm-up is an optimization gate, not a
     correctness one.
+
+    Layer 6.5: `seed` reports the cold-start seed policy (None when
+    off), and each node record's `source` says which candidate pool
+    filled it - "hot_keys" (traffic history) or "seed" (data-driven
+    cold start).
     """
+
+    seeder = _components.warmup.seeder
 
     return {
         "enabled": _components.warmup.enabled,
         "limit": _components.warmup.limit,
         "rate_limit": _components.warmup.rate_limit,
+        "seed": seeder.status() if seeder is not None else None,
         "hot_keys": _components.hot_keys.stats(),
         "nodes": _components.warmup.status()
     }

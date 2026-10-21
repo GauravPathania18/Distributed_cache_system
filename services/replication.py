@@ -438,7 +438,22 @@ class ReplicationManager:
             - never acked (fresh / restarted process)
             - gap exceeds the threshold
             - the log no longer reaches back to acked+1 (rolled over)
+
+        One carve-out: a process that has never allocated a sequence
+        (current == 0) has an EMPTY log, so there is no replication
+        state to restore - a never-acked node there is a true cold
+        start, not a fallen-behind replica. Snapshotting anyway would
+        replay persisted search-cache rows (`q:`/`s:`) from an earlier
+        session into capacity-bounded nodes, churning each one many
+        times over, and would evict the Layer 6.5 seeds that decide
+        what an empty cache starts with. Those rows regenerate
+        through normal write-through the moment they are queried
+        again, which is what the database-is-source-of-truth rule
+        (Section 18) already promises.
         """
+
+        if current <= 0 and acked <= 0:
+            return False
 
         if acked <= 0:
             return True

@@ -8,6 +8,7 @@ from services.cache_service import CacheService
 from services.distributed_cache import DistributedCache
 from services.replication import ReplicationManager
 from services.search import SearchService
+from services.seeding import CacheSeeder
 from services.telemetry import RequestTelemetry
 from services.warmup import CacheWarmup
 
@@ -24,6 +25,11 @@ from .config import (
     WARMUP_LIMIT,
     WARMUP_RATE_LIMIT,
     HOTKEY_MAX_KEYS,
+    SEED_ENABLED,
+    SEED_STRATEGY,
+    SEED_FILL_RATIO,
+    SEED_PER_DATASET,
+    SEED_FALLBACK_CAPACITY,
     REPLICATION_ENABLED,
     REPLICATION_LOG_SIZE,
     SYNC_SNAPSHOT_THRESHOLD,
@@ -102,8 +108,27 @@ search_service = SearchService(
     registry=registry
 )
 
+# Layer 6.5 - cold-start seeding: what an EMPTY node holds when
+# warm-up has no traffic history to reload. None = seeding off.
+def _make_seeder(repo):
+    """Build the seed pool for `repo`, or None when disabled."""
+
+    if not SEED_ENABLED:
+        return None
+
+    return CacheSeeder(
+        database=repo,
+        strategy=SEED_STRATEGY,
+        per_dataset=SEED_PER_DATASET,
+        fill_ratio=SEED_FILL_RATIO,
+        fallback_capacity=SEED_FALLBACK_CAPACITY
+    )
+
+
 # Layer 6.3 - warm-up service: triggers on RECOVERING, retries on
 # each health pass after a failure, and gates READY until done.
+# Layer 6.5: the seeder only speaks when the hot-key ranking is
+# empty (fresh boot) - see services/warmup.py.
 warmup = CacheWarmup(
     node_manager=node_manager,
     database=database,
@@ -112,7 +137,8 @@ warmup = CacheWarmup(
     circuit_breaker=cache_service.circuit_breaker,
     enabled=WARMUP_ENABLED,
     limit=WARMUP_LIMIT,
-    rate_limit=WARMUP_RATE_LIMIT
+    rate_limit=WARMUP_RATE_LIMIT,
+    seeder=_make_seeder(database)
 )
 
 warmup.install()
@@ -215,7 +241,8 @@ def configure_cluster(
         circuit_breaker=cache_service.circuit_breaker,
         enabled=WARMUP_ENABLED,
         limit=WARMUP_LIMIT,
-        rate_limit=WARMUP_RATE_LIMIT
+        rate_limit=WARMUP_RATE_LIMIT,
+        seeder=_make_seeder(database)
     )
 
     warmup.install()

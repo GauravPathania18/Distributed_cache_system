@@ -89,6 +89,13 @@ class CacheWarmup:
           routing via write_to_node (Section 10 corrected).
         - Top-WARMUP_LIMIT keys = recovered (Section 17); the rest
           loads lazily on cache MISS.
+        - Layer 6.5 (cold-start seeding): when there is NO hot-key
+          history AT ALL - a fresh boot, where the ranking is empty
+          because no traffic has flowed yet - an optional seeder
+          supplies a popularity-ordered pool of dataset keys
+          instead, capped at capacity x fill_ratio per node so the
+          seed can never evict itself. Traffic history always wins:
+          seeding only runs while the ranking is empty.
 
     Status states: pending -> running -> done | failed, plus
     "disabled". Only ensure()/_run() mutate status (single writer).
@@ -105,7 +112,8 @@ class CacheWarmup:
         limit=1000,
         rate_limit=100.0,
         merge_limit=100,
-        stats_fetcher=None
+        stats_fetcher=None,
+        seeder=None
     ):
 
         self.node_manager = node_manager
@@ -123,6 +131,12 @@ class CacheWarmup:
         # callable(node, limit) -> [[key, count], ...] | None
         # None = built-in fan-out to the node /stats/top-keys.
         self.stats_fetcher = stats_fetcher
+
+        # Layer 6.5 - CacheSeeder (or None = seeding off): supplies
+        # the candidate pool when there is no hot-key history.
+        # Duck-typed on purpose: candidates() -> [key, ...] and
+        # budget(node) -> int.
+        self.seeder = seeder
 
         self.limiter = WarmupRateLimiter(rate_limit)
 
@@ -292,6 +306,7 @@ class CacheWarmup:
         entry = {
             "state": state,
             "attempts": attempts,
+            "source": None,
             "keys_attempted": 0,
             "keys_loaded": 0,
             "keys_not_owned": 0,
@@ -341,6 +356,7 @@ class CacheWarmup:
 
             entry.update({
                 "state": result.get("state", "failed"),
+                "source": result.get("source"),
                 "keys_attempted": result.get("keys_attempted", 0),
                 "keys_loaded": result.get("keys_loaded", 0),
                 "keys_not_owned": result.get("keys_not_owned", 0),
@@ -362,7 +378,8 @@ class CacheWarmup:
         (Section 16) and the health loop retries it later.
 
         Returns:
-            {state: done|failed, keys_attempted, keys_loaded,
+            {state: done|failed, source: hot_keys|seed,
+             keys_attempted, keys_loaded,
              keys_not_owned, keys_missing, keys_write_failed,
              duration, error}
         """
@@ -379,6 +396,7 @@ class CacheWarmup:
 
         started = time.monotonic()
         error = None
+        source = None
 
         try:
 
@@ -388,11 +406,49 @@ class CacheWarmup:
 
             hot_keys = self.hot_keys.top_keys(limit)
 
+            # 1b. Layer 6.5 - cold start: NO history at all (fresh
+            #     boot) means the ranking cannot say what an empty
+            #     node should hold, so an optional seeder nominates
+            #     a data-driven pool instead. Traffic history always
+            #     wins - the moment it exists, seeding steps aside.
+            candidates = hot_keys
+            budget = None
+            source = "hot_keys"
+
+            if self.seeder is not None and not hot_keys:
+
+                source = "seed"
+                seeded = self.seeder.candidates()
+
+                if seeded:
+                    budget = self.seeder.budget(node)
+                    candidates = [(key, 0) for key in seeded]
+
             # 2. One ownership snapshot for the whole loop - the
             #    live ring keeps mutating underneath (Section 10).
-            view = self.node_manager.ring_view(node)
+            #
+            #    Hot keys: live ring + this node - where traffic
+            #    WILL route once it rejoins (Section 10).
+            #
+            #    Seeds: the DECLARED membership. During a full cold
+            #    start every node is gated, so the live-ring view
+            #    has a single member and each node would seed the
+            #    identical whole keyspace; the declared view gives
+            #    each node its own distinct slice, so the cluster's
+            #    unique coverage is N x the per-node budget.
+            if source == "seed":
+                view = self.node_manager.declared_ring_view()
+            else:
+                view = self.node_manager.ring_view(node)
 
-            for key, _frequency in hot_keys:
+            for key, _frequency in candidates:
+
+                # 2b. Seeding stops at this node's budget (capacity
+                #     x fill_ratio): the rest of the LRU stays free
+                #     for real traffic, so a seed can never evict
+                #     itself. Hot keys stay unlimited - unchanged.
+                if budget is not None and counters["keys_loaded"] >= budget:
+                    break
 
                 # 3. Ownership filter: primary-only on the view.
                 if view.get_node(key) != node:
@@ -434,6 +490,7 @@ class CacheWarmup:
             "state": "failed" if error else "done",
             "duration": duration,
             "error": error,
+            "source": source,
             **counters,
         }
 

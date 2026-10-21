@@ -62,6 +62,7 @@ layer that can be emptied and rebuilt at any time.
 | **6.1** | **Node lifecycle: STARTING → RECOVERING → READY → UNHEALTHY → FAILED** | **Done** |
 | **6.2** | **Cache statistics & hot-key tracking** | **Done** |
 | **6.3** | **Hot-key aggregation & cache warm-up (incl. the 6.4 rejoin gate)** | **Done** |
+| **6.5** | **Cold-start seeding — what an empty cache starts with** | **Done** |
 | **7.1** | **Replica selection (placement)** | **Done** |
 | **7.2** | **Replicated writes (primary → replicas, internal endpoint)** | **Done** |
 | **7.3** | **Replication log, sequence versions & sync** | **Done** |
@@ -108,6 +109,36 @@ and rejoin the ring. Missing keys are skipped (the database stays
 the source of truth), and a database outage keeps the node in
 `RECOVERING` with retries every health pass — warm-up is an
 optimization, never a correctness blocker.
+
+### Layer 6.5 in one paragraph
+
+Warm-up answers "what did the cluster *learn* is hot?" — but a
+truly fresh boot has learned nothing yet, so nodes would come up
+empty (every first request a database miss) or, worse, filled with
+everything. Seeding decides the first contents from the **data**
+instead: each dataset is ranked by the column its schema already
+flags as its popularity signal — the same default sort the UI
+shows (`score`, `aggregate_rating`, `release_year`, …) — and its
+top rows become the candidate pool, interleaved across datasets so
+every node's slice stays diverse (`SEED_STRATEGY=random` samples
+uniformly instead; datasets with no numeric/date column are
+sampled too). The seeder only speaks while the hot-key ranking is
+*empty* — traffic history always wins — and each node loads at
+most `capacity × SEED_FILL_RATIO` of the keys it will own once the
+cluster is back at full membership (during a full boot every node
+is gated, so ownership is computed on the *declared* membership —
+each node gets a distinct slice instead of all three seeding the
+identical top keys), so seeding can never overflow a node and
+evict its own seeds (the capacity is read from the node's own
+`/stats`). Seeds are a starting set,
+not a reservation: normal cache-aside takes over from there — a
+miss reads the database and the LRU evicts the
+least-recently-used row, while every access moves a key back to
+the MRU front, which is how a frequently read entry keeps its
+priority. A fresh process also skips the replication snapshot
+(its log is empty, so there is nothing to restore): persisted
+`q:`/`s:` search-cache rows regenerate through normal
+write-through, leaving the initial cache exactly the seeded subset.
 
 ### Layer 8 in one paragraph
 
@@ -187,6 +218,11 @@ Configuration (environment variables):
 | `WARMUP_LIMIT` | `1000` | Top-K keys reloaded during warm-up |
 | `WARMUP_RATE_LIMIT` | `100` | Max database reads/second during warm-up |
 | `HOTKEY_MAX_KEYS` | `10000` | Bound on the router-side hot-key ranking |
+| `SEED_ENABLED` | `on` | Cold-start seeding switch (only consulted while the hot-key ranking is empty) |
+| `SEED_STRATEGY` | `popular` | Seed selection: `popular` (top rows per dataset's popularity column) or `random` (uniform sample) |
+| `SEED_FILL_RATIO` | `0.6` | Fraction of a node's own capacity seeding may claim — the rest stays free for live traffic |
+| `SEED_PER_DATASET` | `250` | Candidate rows pulled per dataset (the pool is then filtered to what each node owns) |
+| `SEED_FALLBACK_CAPACITY` | `100` | Capacity assumed for a node that does not answer `/stats` |
 
 ---
 
@@ -196,9 +232,9 @@ Configuration (environment variables):
 pytest -v
 ```
 
-Expected: **303 passed** — 34 replication + 29 dataset import +
-28 node lifecycle + 25 search + 21 warm-up + 20 repository +
-19 registry + 16 consistent hash + 15 statistics +
+Expected: **343 passed** — 39 search + 35 replication +
+29 dataset import + 28 node lifecycle + 28 warm-up + 20 repository +
+19 registry + 18 seeding + 16 consistent hash + 15 statistics +
 15 multi-dataset repository + 14 cache + 13 cache-service +
 13 terminal UI + 11 circuit-breaker + 8 router + 7 telemetry +
 6 config + 5 single-flight + 4 dashboard.
