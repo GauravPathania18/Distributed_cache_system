@@ -212,6 +212,34 @@ class CacheService:
         }
 
     # --------------------------------------------------
+    # EVICT (Layer 9 - cache-only invalidation)
+    # --------------------------------------------------
+
+    def evict(self, key: str) -> dict:
+        """
+        Remove `key` from every cache node that holds it - the
+        database row is deliberately kept.
+
+        The other half of the deletion split: evict = "make the
+        next read go to the database (and repopulate)", delete =
+        "remove the row everywhere".  No replication log entry is
+        written: the row itself did not change, so a replay of an
+        older set would only restore a still-correct copy.
+        """
+
+        self.hot_keys.record(key)
+
+        nodes = self.cache.delete(key)
+
+        self.telemetry.record_delete()
+
+        return {
+            "key": key,
+            "evicted": bool(nodes),
+            "nodes": nodes
+        }
+
+    # --------------------------------------------------
     # INSPECTION
     # --------------------------------------------------
 
