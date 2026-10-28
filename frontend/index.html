@@ -227,6 +227,43 @@
     <div class="verdict" id="burstVerdict"></div>
   </div>
 
+  <div class="panel">
+    <h3>Lab 5 &mdash; LRU eviction, watched live</h3>
+    <p class="muted">
+      Drives <em>one</em> node directly &mdash; no hash-ring fan-out &mdash; and renders its
+      doubly linked list exactly as the cache holds it: HEAD &rarr; most recently used
+      &hellip; least recently used &rarr; TAIL. A read hops a key to the front; the next
+      overflow drops the node at the tail. Writes here are node-local (no database, no
+      replication), which is what keeps the demo deterministic.
+    </p>
+    <form class="search-bar" id="lruForm">
+      <select id="lruNode" title="node whose linked list you watch"></select>
+      <button type="submit" class="btn primary" id="lruFill"
+        title="insert lab:lru:N keys, one by one, until the tail gives one up">Fill to overflow</button>
+      <input type="number" id="lruCount" value="12" min="1" max="300" class="narrow"
+        title="keys to insert — preset to capacity − size + 1, the exact number that triggers one eviction">
+      <input type="number" id="lruDelay" value="80" min="0" max="1000" class="narrow"
+        title="delay ms between writes">
+      <input type="text" id="lruKey" placeholder="key — blank means the tail" autocomplete="off">
+      <button type="button" class="btn" id="lruTouch"
+        title="GET: a hit hops the key to HEAD, a miss touches nothing">Touch (GET)</button>
+      <button type="button" class="btn warn" id="lruDelete"
+        title="DELETE /cache on this node: unlinks the key by hand">Delete key</button>
+      <button type="button" class="btn ghost" id="lruClear"
+        title="prefix-flush every lab:lru: key on this node">Clear lab keys</button>
+    </form>
+    <div class="lab-stats" id="lruStats"></div>
+    <div class="lru-strip" id="lruStrip"></div>
+    <div class="lru-legend">
+      <span class="k-arrived">just inserted (lands at HEAD)</span>
+      <span class="k-touched">touched by a read (hops to HEAD)</span>
+      <span class="k-victim">next to be evicted (TAIL)</span>
+      <span class="k-ghost">fell off on overflow</span>
+    </div>
+    <div class="verdict" id="lruVerdict"></div>
+    <div class="lab-feed" id="lruFeed"></div>
+  </div>
+
 </section>
 
 </main>

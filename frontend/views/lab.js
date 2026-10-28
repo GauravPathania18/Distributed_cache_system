@@ -1,10 +1,11 @@
 /* =========================================================
-   Lab view - four experiments that show the cache behaving.
+   Lab view - five experiments that show the cache behaving.
 
    1. search storm          same search N times: hits vs SQL
    2. point-read storm      same key N times, optional evict-per-read
    3. node failure drill    stop a node, keep reading, restart it
    4. eviction burst        write K keys, evict all, read all back
+   5. live LRU order        one node's linked list: reorder + eviction
    ========================================================= */
 
 "use strict";
@@ -447,6 +448,425 @@
   }
 
   /* =========================================================
+     LAB 5 - LIVE LRU ORDER (one node, linked list + eviction)
+
+     Everything the other labs treat as a black box is rendered
+     here: the exact MRU -> LRU order of ONE node's doubly linked
+     list, read from GET /stats/lru through the router's
+     single-node proxy (no hash-ring fan-out), diffed after every
+     operation so inserts, reorders and evictions are visible.
+     ========================================================= */
+
+  const LAB5_PREFIX = "lab:lru:";
+
+  const lab5 = {
+    running: false,
+    timer: null,
+    nodes: [],
+    port: null,        // selected node
+    boundPort: null,   // node the strip/feed are currently bound to
+    seq: 0,            // next lab:lru:N number
+    keys: [],          // last snapshot, MRU -> LRU
+    stats: null,       // last /stats/lru payload
+    added: [],         // keys to flash as inserted (one shot)
+    touched: null,     // key to flash as read (one shot)
+    lastTouch: null,   // key awaiting confirmation from the next snapshot
+    ghosts: [],        // evicted keys flashing at the tail
+    ghostTimer: null,
+    narrate: null,     // how the next diff narrates removals: evict | gone
+    opSeq: 0,
+  };
+
+  function lruUrl(path) {
+    return `/cluster/nodes/${lab5.port}${path}`;
+  }
+
+  function lruKeyPath(key) {
+    return lruUrl(`/cache/${encodeURIComponent(key)}`);
+  }
+
+  /* ---------- node list + binding ---------- */
+
+  async function loadLruNodes() {
+    const sel = $("#lruNode");
+    const prev = sel.value;
+
+    try {
+      const data = await api("/cluster/nodes");
+      lab5.nodes = data.nodes || [];
+    } catch (_) {
+      lab5.nodes = [];
+    }
+
+    sel.innerHTML = "";
+    for (const node of lab5.nodes) {
+      const s = node.stats;
+      sel.appendChild(el("option", { value: node.port },
+        `127.0.0.1:${node.port} (${node.state}${s ? ` · ${s.size}/${s.capacity}` : ""})`));
+    }
+    if (prev && lab5.nodes.some((n) => String(n.port) === prev)) sel.value = prev;
+
+    const port = +sel.value || null;
+
+    if (port !== lab5.boundPort) {
+      lab5.port = port;
+      await bindLruNode();
+    } else {
+      refreshLru();          // same node: silent refresh of strip + stats
+    }
+  }
+
+  async function bindLruNode() {
+    lab5.boundPort = lab5.port;
+    lab5.keys = [];
+    lab5.stats = null;
+    lab5.added = [];
+    lab5.touched = null;
+    lab5.lastTouch = null;
+    lab5.ghosts = [];
+    lab5.narrate = null;
+    lab5.opSeq = 0;
+    clearTimeout(lab5.ghostTimer);
+
+    $("#lruStrip").innerHTML = "";
+    $("#lruStats").innerHTML = "";
+    $("#lruFeed").innerHTML = "";
+    setVerdict($("#lruVerdict"), "", "");
+
+    if (!lab5.port) {
+      $("#lruStrip").appendChild(
+        el("span", { class: "muted" }, "no node selected — scale up in the Cluster tab first")
+      );
+      return;
+    }
+
+    const snap = await refreshLru();
+
+    if (snap) {
+      syncLruCount(snap);
+      adoptExistingLabKeys(snap.keys || []);
+    }
+  }
+
+  /* Preset the fill count to the exact number of writes that forces
+     one eviction: capacity − size + 1. */
+  function syncLruCount(snap) {
+    const need = (snap.capacity || 0) - (snap.size || 0) + 1;
+    $("#lruCount").value = Math.max(1, Math.min(300, need));
+  }
+
+  /* Never renumber keys a previous session already wrote: continue
+     after the highest lab:lru:N currently on the node. */
+  function adoptExistingLabKeys(keys) {
+    for (const key of keys) {
+      if (!key.startsWith(LAB5_PREFIX)) continue;
+      const n = parseInt(key.slice(LAB5_PREFIX.length), 10);
+      if (Number.isFinite(n) && n + 1 > lab5.seq) lab5.seq = n + 1;
+    }
+  }
+
+  /* ---------- snapshot: fetch, diff, render ---------- */
+
+  async function refreshLru() {
+    if (!lab5.port) return null;
+
+    try {
+      const snap = await api(lruUrl("/cache-state"));
+      applySnapshot(snap);
+      return snap;
+    } catch (e) {
+      lab5.narrate = null;
+      setVerdict($("#lruVerdict"),
+        `node ${lab5.port} unreachable (${e.message}) — start it in the Cluster tab`, "warn");
+      return null;
+    }
+  }
+
+  function applySnapshot(snap) {
+    const prev = lab5.keys;
+    const next = Array.isArray(snap.keys) ? snap.keys : [];
+
+    const removed = prev.filter((k) => !next.includes(k));
+    const added = next.filter((k) => !prev.includes(k));
+    const narrate = lab5.narrate;
+
+    // ---- removals: capacity eviction, expiry, or our own delete ----
+    for (const key of removed) {
+
+      if (narrate === "evict") {
+        feedLine($("#lruFeed"), ++lab5.opSeq, "evict",
+          `${key} dropped off the tail — capacity ${snap.capacity} reached`);
+      } else if (narrate !== "gone") {
+        feedLine($("#lruFeed"), ++lab5.opSeq, "muted",
+          `${key} left the list (evicted by cluster traffic, or TTL expired)`);
+      }
+    }
+
+    if (removed.length && narrate !== "gone") {
+      lab5.ghosts = lab5.ghosts.concat(removed).slice(-8);
+      clearTimeout(lab5.ghostTimer);
+      lab5.ghostTimer = setTimeout(() => {
+        lab5.ghosts = [];
+        renderLru();
+      }, 1800);
+    }
+
+    lab5.keys = next;
+    lab5.stats = snap;
+    lab5.added = added;
+    lab5.touched = (lab5.lastTouch && next.includes(lab5.lastTouch))
+      ? lab5.lastTouch : null;
+
+    lab5.lastTouch = null;
+    lab5.narrate = null;
+
+    renderLru();
+    renderLruStats();
+
+    lab5.added = [];      // flashes fire exactly once, on this render
+    lab5.touched = null;
+  }
+
+  function renderLru() {
+    const strip = $("#lruStrip");
+    strip.innerHTML = "";
+
+    strip.appendChild(el("span", { class: "lru-end" }, "HEAD · most recent"));
+
+    const last = lab5.keys.length - 1;
+
+    lab5.keys.forEach((key, i) => {
+      const cls = ["lru-chip"];
+      if (lab5.added.includes(key)) cls.push("arrived");
+      if (lab5.touched === key) cls.push("touched");
+      if (i === last) cls.push("victim");
+
+      const tip = i === last
+        ? `"${key}" — least recently used: the next overflow evicts it`
+        : `"${key}" — recency #${i + 1} of ${lab5.keys.length} (click to load into the key box)`;
+
+      strip.appendChild(el("span", {
+        class: cls.join(" "),
+        title: tip,
+        onclick: () => { $("#lruKey").value = key; },
+      }, key));
+    });
+
+    for (const key of lab5.ghosts) {
+      strip.appendChild(el("span", {
+        class: "lru-chip ghost",
+        title: `"${key}" — just fell off the tail`,
+      }, key));
+    }
+
+    strip.appendChild(el("span", { class: "lru-end tail" },
+      lab5.keys.length ? "TAIL · evicted next →" : "TAIL · empty"));
+  }
+
+  function renderLruStats() {
+    const box = $("#lruStats");
+    const s = lab5.stats;
+
+    if (!s) { box.innerHTML = ""; return; }
+
+    box.innerHTML = "";
+    box.appendChild(statCard("Size", `${s.size}/${s.capacity}`,
+      "entries vs capacity", s.size >= s.capacity ? "bad" : ""));
+    box.appendChild(statCard("Evictions", s.evictions,
+      "capacity removals on this node"));
+    box.appendChild(statCard("Hits", s.hits,
+      `${s.hit_rate}% hit rate`, "good"));
+    box.appendChild(statCard("Misses", s.misses,
+      "lookups that found nothing"));
+  }
+
+  /* ---------- operations ---------- */
+
+  async function runLruFill(event) {
+    event.preventDefault();
+    if (lab5.running) return;
+    if (!lab5.port) {
+      alert("No node selected — scale up in the Cluster tab first.");
+      return;
+    }
+
+    const count = Math.max(1, Math.min(300, +$("#lruCount").value || 1));
+    const delay = Math.max(0, Math.min(1000, +$("#lruDelay").value || 0));
+    const btn = $("#lruFill");
+    const sel = $("#lruNode");
+
+    const evictionsBefore = lab5.stats ? lab5.stats.evictions : null;
+    let inserted = 0;
+
+    lab5.running = true;
+    btn.disabled = true;
+    sel.disabled = true;
+    btn.textContent = "Filling…";
+    setVerdict($("#lruVerdict"), "", "");
+
+    try {
+      for (let i = 1; i <= count; i++) {
+
+        const key = LAB5_PREFIX + String(lab5.seq++).padStart(3, "0");
+        lab5.narrate = "evict";     // removals in the next diff are capacity evictions
+
+        try {
+          await api(lruKeyPath(key), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ value: { key, at: Date.now() } }),
+          });
+          inserted++;
+          feedLine($("#lruFeed"), ++lab5.opSeq, "set", `${key} → HEAD`);
+        } catch (e) {
+          feedLine($("#lruFeed"), ++lab5.opSeq, "error", `set ${key}: ${e.message}`);
+          break;
+        }
+
+        await refreshLru();
+        if (delay) await sleep(delay);
+      }
+    } finally {
+      lab5.running = false;
+      btn.disabled = false;
+      sel.disabled = false;
+      btn.textContent = "Fill to overflow";
+    }
+
+    const snap = lab5.stats;
+    const evicted = (evictionsBefore != null && snap)
+      ? Math.max(0, snap.evictions - evictionsBefore) : 0;
+
+    if (!snap) return;
+
+    setVerdict($("#lruVerdict"), evicted > 0
+      ? `Inserted ${inserted} key(s) and forced ${evicted} eviction(s): the tail gave ` +
+        `way because the list cannot exceed ${snap.capacity}. Watch which keys fell — ` +
+        `cold ones before the fresh ones, and a key you Touch survives its own turn.`
+      : `Inserted ${inserted} key(s) — the node now holds ${snap.size}/${snap.capacity}, ` +
+        `no overflow yet. The count is preset to capacity − size + 1: press Fill again.`,
+      evicted > 0 ? "ok" : "warn");
+  }
+
+  async function touchKey() {
+    if (lab5.running) return;
+    if (!lab5.port) {
+      alert("No node selected — scale up in the Cluster tab first.");
+      return;
+    }
+
+    let key = $("#lruKey").value.trim();
+    if (!key) key = lab5.keys[lab5.keys.length - 1];   // blank: the current victim
+    if (!key) {
+      setVerdict($("#lruVerdict"), "the list is empty — press Fill first", "warn");
+      return;
+    }
+
+    const feed = $("#lruFeed");
+    lab5.running = true;
+
+    try {
+      const r = await api(lruKeyPath(key));
+
+      lab5.lastTouch = key;
+      lab5.narrate = null;
+      feedLine(feed, ++lab5.opSeq, "touch",
+        `hit: ${key} → HEAD · ${preview(r.value)}`);
+      setVerdict($("#lruVerdict"),
+        `HIT — "${key}" hopped to HEAD (recency 1 of ${lab5.keys.length || "?"}). ` +
+        `That is the whole trick: reads promote, unread keys slide toward the tail ` +
+        `and eventually fall off.`, "ok");
+
+      await refreshLru();
+
+    } catch (e) {
+      if (String(e.message).startsWith("404")) {
+        feedLine(feed, ++lab5.opSeq, "muted",
+          `miss: ${key} is not on this node — the list stays untouched`);
+        setVerdict($("#lruVerdict"),
+          `MISS — "${key}" is not cached on this node. A miss cannot reorder anything: ` +
+          `there is no node to move.`, "warn");
+      } else {
+        feedLine(feed, ++lab5.opSeq, "error", `get ${key}: ${e.message}`);
+        setVerdict($("#lruVerdict"), e.message, "err");
+      }
+    } finally {
+      lab5.running = false;
+    }
+  }
+
+  async function deleteKey() {
+    if (lab5.running) return;
+    if (!lab5.port) {
+      alert("No node selected — scale up in the Cluster tab first.");
+      return;
+    }
+
+    const key = $("#lruKey").value.trim();
+    if (!key) {
+      alert("Type a key first (or click a chip to load it into the box).");
+      return;
+    }
+
+    const feed = $("#lruFeed");
+    lab5.running = true;
+
+    try {
+      await api(lruKeyPath(key), { method: "DELETE" });
+      lab5.narrate = "gone";      // we narrate it ourselves: no eviction ghosts
+      feedLine(feed, ++lab5.opSeq, "evict",
+        `deleted ${key} — hand-picked removal, the tail got no say`);
+      setVerdict($("#lruVerdict"),
+        `Deleted "${key}" in O(1): unlinked from the list and dropped from the map. ` +
+        `Note the difference — capacity eviction is the only removal the recency ` +
+        `order decides by itself.`, "ok");
+      await refreshLru();
+    } catch (e) {
+      if (String(e.message).startsWith("404")) {
+        feedLine(feed, ++lab5.opSeq, "muted", `delete ${key}: not cached on this node`);
+        setVerdict($("#lruVerdict"), `"${key}" is not cached on this node.`, "warn");
+      } else {
+        feedLine(feed, ++lab5.opSeq, "error", `delete ${key}: ${e.message}`);
+        setVerdict($("#lruVerdict"), e.message, "err");
+      }
+    } finally {
+      lab5.running = false;
+    }
+  }
+
+  async function clearLabKeys() {
+    if (lab5.running) return;
+    if (!lab5.port) {
+      alert("No node selected — scale up in the Cluster tab first.");
+      return;
+    }
+
+    const feed = $("#lruFeed");
+    lab5.running = true;
+
+    try {
+      const r = await api(lruUrl(`/cache-prefix/${LAB5_PREFIX}`), { method: "DELETE" });
+      lab5.narrate = "gone";
+      feedLine(feed, ++lab5.opSeq, "muted",
+        `prefix flush: ${r.removed} lab key(s) removed from node ${lab5.port}`);
+      setVerdict($("#lruVerdict"),
+        `Cleared ${r.removed} lab key(s); capacity is free again for the next run.`, "ok");
+      await refreshLru();
+    } catch (e) {
+      feedLine(feed, ++lab5.opSeq, "error", `prefix flush: ${e.message}`);
+      setVerdict($("#lruVerdict"), e.message, "err");
+    } finally {
+      lab5.running = false;
+    }
+  }
+
+  function preview(value) {
+    const json = JSON.stringify(value);
+    if (json == null) return "no value";
+    return json.length > 70 ? json.slice(0, 67) + "…" : json;
+  }
+
+  /* =========================================================
      WIRING
      ========================================================= */
 
@@ -466,10 +886,35 @@
 
   $("#burstForm").addEventListener("submit", runBurst);
 
+  $("#lruForm").addEventListener("submit", runLruFill);
+  $("#lruNode").addEventListener("change", () => {
+    lab5.port = +$("#lruNode").value || null;
+    bindLruNode();
+  });
+  $("#lruTouch").addEventListener("click", touchKey);
+  $("#lruDelete").addEventListener("click", deleteKey);
+  $("#lruClear").addEventListener("click", clearLabKeys);
+  $("#lruKey").addEventListener("focus", (e) => {
+    if (!e.target.value && lab5.keys.length) {
+      e.target.value = lab5.keys[lab5.keys.length - 1];  // the current victim
+    }
+    e.target.select();   // typing replaces the prefill
+  });
+
   registerView("lab", {
     show() {
       populateLabEntity();
       loadDrillNodes();
+      loadLruNodes();
+      if (!lab5.timer) {
+        lab5.timer = setInterval(() => {
+          if (lab5.running || document.hidden) return;
+          refreshLru();
+        }, 1500);
+      }
+    },
+    hide() {
+      if (lab5.timer) { clearInterval(lab5.timer); lab5.timer = null; }
     },
   });
 

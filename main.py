@@ -346,6 +346,29 @@ def stats_top_keys(
 
 
 # ---------------------------------------------------------
+# LRU ORDER (Lab 5 - the linked list itself, for the web UI)
+# ---------------------------------------------------------
+
+@app.get("/stats/lru")
+def stats_lru():
+    """
+    The recency order every LRU implementation keeps but usually
+    never shows: index 0 is the most recently used key and the
+    last entry is the node the cache evicts on the next overflow.
+
+    One lock section so `size` and `keys` can never disagree while
+    the list is mutating under a concurrent request.
+    """
+
+    with cache.lock:
+
+        snapshot = cache.stats()
+        snapshot["keys"] = cache.keys()
+
+    return snapshot
+
+
+# ---------------------------------------------------------
 # START SERVER
 # ---------------------------------------------------------
 

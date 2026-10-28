@@ -299,6 +299,79 @@ pre.json { font-family: var(--mono); font-size: 12px; background: var(--bg); pad
 .lab-line .src.database { color: var(--amber); }
 .lab-line .ms { color: var(--muted); margin-left: auto; }
 
+.lab-line .src.set   { color: var(--accent); }
+.lab-line .src.touch { color: var(--green); }
+.lab-line .src.evict { color: var(--red); }
+
+/* ---------- Lab 5: live LRU linked list ---------- */
+
+#lruForm { flex-wrap: wrap; }
+#lruKey { flex: 1 1 200px; min-width: 170px; }
+
+.lru-strip {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 16px;
+  padding: 14px; min-height: 60px; max-height: 200px; overflow-y: auto;
+  background: var(--bg-soft); border: 1px solid var(--line);
+  border-radius: var(--radius); margin: 14px 0 8px;
+}
+
+.lru-end {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted);
+  border: 1px dashed var(--line); padding: 6px 9px; border-radius: 7px;
+  white-space: nowrap;
+}
+.lru-end.tail { border-color: rgba(248,81,73,.5); color: var(--red); }
+
+.lru-chip {
+  position: relative; font-family: var(--mono); font-size: 11.5px;
+  padding: 6px 10px; border-radius: 7px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lru-chip:hover { border-color: var(--accent); }
+
+/* linked-list connector sitting in the gap after each chip */
+.lru-chip::after {
+  content: "↔"; position: absolute; right: -13px; top: 50%;
+  transform: translateY(-50%); color: var(--muted); font-size: 10px;
+}
+
+.lru-chip.arrived { border-color: var(--accent); animation: lruPop .45s ease-out; }
+.lru-chip.touched { border-color: var(--green); background: var(--green-bg); animation: lruFlash .9s ease-in-out; }
+.lru-chip.victim  { border-color: var(--red); box-shadow: 0 0 0 1px rgba(248,81,73,.45); }
+.lru-chip.ghost {
+  color: var(--red); background: var(--red-bg); border-style: dashed;
+  border-color: var(--red); pointer-events: none;
+  animation: lruDrop 1.8s ease-in forwards;
+}
+
+@keyframes lruPop {
+  0%   { transform: scale(.7); opacity: 0; }
+  60%  { transform: scale(1.08); opacity: 1; }
+  100% { transform: scale(1); }
+}
+@keyframes lruFlash {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(46,160,67,0); }
+  30%      { box-shadow: 0 0 0 3px rgba(46,160,67,.65); }
+}
+@keyframes lruDrop {
+  0%   { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(18px); }
+}
+
+.lru-legend {
+  display: flex; flex-wrap: wrap; gap: 16px;
+  font-size: 11px; color: var(--muted); margin-bottom: 4px;
+}
+.lru-legend span::before { content: "■"; margin-right: 5px; }
+.lru-legend .k-arrived::before { color: var(--accent); }
+.lru-legend .k-touched::before { color: var(--green); }
+.lru-legend .k-victim::before  { color: var(--red); }
+.lru-legend .k-ghost::before   { color: var(--red); opacity: .55; }
+
+.stat.bad .value { color: var(--red); }
+
 /* ---------- misc ---------- */
 
 .empty { color: var(--muted); padding: 40px; text-align: center; }
