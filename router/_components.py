@@ -43,7 +43,7 @@ from .config import (
 
 # Source of truth. Shared by the whole router process.
 # The registry mirrors data/registry.json (mtime-cached), so datasets
-# imported by the TUI / import_dataset.py become visible to search
+# imported by run.py --seed / import_dataset.py become visible to search
 # without restarting the router.
 registry = DatasetRegistry(db_path=DEFAULT_DB_PATH)
 

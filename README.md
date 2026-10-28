@@ -204,19 +204,18 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # 2. THE one command: imports everything sitting in datasets/
-#    (once), opens the 3 nodes + router, each in its own
-#    visible console window, waits for the cluster, then shows an
-#    interactive control/query UI (option 0 stops everything)
-python tui.py
+#    (once, with --seed), spawns 3 nodes + the router, and prints
+#    the web UI URL. Ctrl+C stops the whole cluster again.
+python run.py --seed
 ```
 
 Manual startup (4 terminals), if you prefer:
 
 ```powershell
 # Terminal 1-3: cache nodes
-python main.py --port 8001 --capacity 100
-python main.py --port 8002 --capacity 100
-python main.py --port 8003 --capacity 100
+python main.py --port 8001 --capacity 5000
+python main.py --port 8002 --capacity 5000
+python main.py --port 8003 --capacity 5000
 
 # Terminal 4: router (do NOT use --reload)
 uvicorn router.router:app --port 8000
@@ -259,7 +258,7 @@ Configuration (environment variables):
 | `SEED_FALLBACK_CAPACITY` | `100` | Capacity assumed for a node that does not answer `/stats` |
 | `MAX_NODES` | `8` | Size of the node port pool the UI may spawn into |
 | `NODE_PORT_BASE` | `8001` | First port of that pool (`8001…8008` by default) |
-| `NODE_CAPACITY` | `100` | Cache capacity given to nodes spawned by the router |
+| `NODE_CAPACITY` | `5000` | Cache capacity given to nodes spawned by the router |
 | `NODE_START_TIMEOUT` | `10` | Seconds a scale/start request waits for a fresh node to answer `/health` |
 
 ---
@@ -325,13 +324,14 @@ examples in [`commands.md`](commands.md).
 pytest -v
 ```
 
-Expected: **386 passed** — 39 search + 37 replication +
+Expected: **377 passed** — 39 search + 37 replication +
 29 dataset import + 28 node lifecycle + 28 warm-up + 21 registry +
 20 repository + 18 multi-dataset repository + 18 seeding + 16 cache +
 16 consistent hash + 15 statistics + 13 cache-service +
-13 terminal UI + 12 process manager + 12 dataset routes +
+12 process manager + 12 dataset routes +
 11 circuit-breaker + 9 cluster-control routes + 9 router +
-7 telemetry + 6 config + 5 single-flight + 4 dashboard.
+7 telemetry + 6 config + 5 single-flight + 4 LRU lab +
+4 dashboard.
 
 ### Bringing your own data
 
@@ -340,8 +340,8 @@ CSV, TSV, JSON, JSONL, Parquet, Excel or a Zip containing one —
 into `datasets/`:
 
 ```powershell
-# Drop a file in, then either restart the TUI (it auto-seeds on boot)...
-python tui.py
+# Drop a file in, then either restart the launcher (it seeds with --seed)...
+python run.py --seed
 
 # ...or import explicitly:
 python import_dataset.py --file datasets/netflix_titles.csv

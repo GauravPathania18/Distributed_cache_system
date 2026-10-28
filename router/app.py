@@ -7,8 +7,9 @@ from fastapi import FastAPI
 async def lifespan(app: FastAPI):
     """
     Stop the node processes THIS router spawned (Cluster control /
-    scale-up) before exit.  Nodes started by another process - the
-    TUI - are left alone: their owner stops them.
+    scale-up) before exit.  Nodes started by another process - by
+    hand, or by a second router - are left alone: their owner stops
+    them.
     """
 
     yield

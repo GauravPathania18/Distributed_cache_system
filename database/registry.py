@@ -281,8 +281,9 @@ class DatasetRegistry:
     """JSON manifest of imported datasets, hot-reloadable.
 
     entries() re-reads registry.json whenever its mtime/size
-    changes, so a router process picks up datasets imported by a
-    TUI/import process without a restart. `revision()` bumps on
+    changes, so a router process picks up datasets imported by
+    another process (run.py --seed, import_dataset.py) without a
+    restart. `revision()` bumps on
     every change and lets caches (the multi-repository's file
     handles, the search entity builder) refresh cheaply.
     """

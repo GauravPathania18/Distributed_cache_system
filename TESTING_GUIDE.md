@@ -109,13 +109,12 @@ Breakdown (for pinpointing a regression):
 | Statistics / hot keys (6.2) | 15 | `pytest tests/test_statistics.py -v` |
 | Warm-up (6.3/6.4) | 21 | `pytest tests/test_warmup.py -v` |
 | Node URL config | 6 | `pytest tests/test_config.py -v` |
-| Terminal UI logic | 13 | `pytest tests/test_tui.py -v` |
 | Replication (7.2-7.6) | 34 | `pytest tests/test_replication.py -v` |
 | Cached search (8.1) | 25 | `pytest tests/test_search.py -v` |
 | Telemetry / DB-load metric (8.2) | 7 | `pytest tests/test_telemetry.py -v` |
 | Dashboard + web UI (8.3) | 4 | `pytest tests/test_dashboard.py -v` |
 
-**Pass criteria:** 303 passed, 0 failed. Any other count means a
+**Pass criteria:** 377 passed, 0 failed. Any other count means a
 lost/added test — diff against this table before suspecting the code.
 
 **Data-safety check after the run** (proves tests are hermetic):
@@ -161,7 +160,7 @@ Terminal A:
 
 ```powershell
 .venv\Scripts\activate
-python main.py --port 8001 --capacity 100
+python main.py --port 8001 --capacity 5000
 ```
 
 Terminal B (all checks):
@@ -222,7 +221,7 @@ running — Phase 4 starts its own three nodes on 8001–8003, so
 
 ---
 
-## 4. Phase 3 — Full cluster + Terminal UI (main path)
+## 4. Phase 3 — Full cluster via the launcher (main path)
 
 This is the primary way to run and inspect the whole system.
 
@@ -230,112 +229,106 @@ This is the primary way to run and inspect the whole system.
 
 ```powershell
 .venv\Scripts\activate
-python tui.py
+python run.py --seed
 ```
 
 Expected within ~10–20s:
 
-0. Before anything starts, the drop folder seeds (once per file):
+0. Before the cluster starts, the drop folder seeds (once per file):
 
 ```
-  imported netflix_titles.csv -> netflix_titles (8807 rows)
-  imported imdb_movies.csv -> imdb_movies (10178 rows)
+  [SEED] imported: netflix_titles.csv -> netflix_titles (8807 rows)
+  [SEED] imported: imdb_movies.csv -> imdb_movies (10178 rows)
 ```
 
-1. Four new console windows open (router + 3 nodes) — watch their
-   logs live.
-2. The TUI prints:
+1. The launcher spawns 3 background nodes (logs in
+   `data/logs/node-<port>.log`) and runs the router in this terminal:
 
 ```
-  started router  :8000  (own window)
-  started node :8001  (own window)
-  started node :8002  (own window)
-  started node :8003  (own window)
+  Starting 3 node(s) from port 8001 at capacity 5000...
+  node :8001 started (capacity 5000, pid 12345)
+  node :8002 started (capacity 5000, pid 23456)
+  node :8003 started (capacity 5000, pid 34567)
 
-  waiting for router ..OK
-  waiting for 3 node(s) to become active ............OK
-  active: 3/3
+  Router: http://127.0.0.1:8000/  (web UI at /ui)
 ```
 
-3. The control-panel menu appears, header shows
-   `cluster 3/3 ready ... spawned windows alive 4/4`.
+2. The router log (same terminal) shows the nodes gating through
+   `starting → recovering → ready`.
 
 > Nodes are gated at boot (`starting → recovering → ready`, needs
 > 2 healthy checks × 2s). If boot ever stalls >60s, see §11.
 
-### 4.2 Walk through every menu option
+### 4.2 Cluster check (second terminal)
 
-Work top to bottom. After each action the menu redraws; the TUI
-remembers nothing between options — each is a fresh query.
+Open a second terminal (venv active):
 
-**Option 1 — Cluster status**
-
-Input: `1`
+```powershell
+curl.exe http://127.0.0.1:8000/cluster/status
+```
 
 Expected: JSON with `"total_nodes": 3`, all three URLs under
 `active_nodes`, `"node_states"` all `"ready"`,
-`"replication_factor": 2`, then a per-node readiness list.
+`"replication_factor": 2`. Also open the web UI
+(http://127.0.0.1:8000/) — the **Cluster** tab shows three green
+node cards.
 
-**Option 2 — PUT through the router**
+### 4.3 PUT / GET / DELETE through the router
 
-Input: `2`, then key `test:tui`, value `{"hello":"world"}`, TTL
-blank (=300).
+**PUT**
 
-Expected:
-
+```powershell
+curl.exe -X PUT http://127.0.0.1:8000/cache/test:put `
+  -H "Content-Type: application/json" `
+  -d "{\"value\": {\"hello\": \"world\"}, \"ttl\": 300}"
 ```
-  stored {"status": "stored", "key": "test:tui",
-          "source": "database+cache", "replicated_to": 2,
-          "nodes": ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]}
-```
+
+Expected: `"status": "stored"`, `"source": "database+cache"`,
+`"replicated_to": 2` with two node URLs listed.
 
 Pass criteria: `replicated_to: 2` (replication factor) and the DB
 row count grows by 1 (Phase 8 verification command).
 
-**Option 3 — GET through the router**
+**GET**
 
-Input: `3`, key `test:tui`.
-
-Expected:
-
-```
-  source: cache
-  node  : http://127.0.0.1:8001      <- one of the two replica nodes
-
-  {
-    "hello": "world"
-  }
+```powershell
+curl.exe http://127.0.0.1:8000/cache/test:put
 ```
 
-Pass criteria: `source: cache` (the value was just written).
-A dataset key that was never fetched (e.g. `netflix_titles:s1`)
+Expected: `"source": "cache"` (the value was just written), the
+`{"hello": "world"}` value and the node that served it.
+
+Pass criteria: `source: cache`.
+A dataset key that was never fetched (`netflix_titles:s1`)
 returns `source: database` on its FIRST GET (cache-aside fallback)
 and `source: cache` on the second — that two-GET switch is the
-Layer 5 behavior; try it now:
+Layer 5 behavior; run it twice now:
 
+```powershell
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1   # source: database
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1   # source: cache
 ```
-  3 → netflix_titles:s1   (expect source: database)
-  3 → netflix_titles:s1   (expect source: cache)
+
+**DELETE (the database + cache cascade)**
+
+```powershell
+curl.exe -X DELETE http://127.0.0.1:8000/db/test:put
 ```
 
-**Option 4 — DELETE**
-
-Input: `4`, key `test:tui`.
-
-Expected:
-
-```
-  deleted {"status": "deleted", "key": "test:tui",
-           "deleted_from_database": true,
-           "nodes": ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]}
-```
+Expected: `"status": "deleted"` with the node URLs it was removed
+from.
 
 Pass criteria: removed from BOTH the database and the replica
-cache nodes (the two that held it).
+cache nodes (the two that held it) — a follow-up
+`curl.exe http://127.0.0.1:8000/cache/test:put` now returns 404.
+The cache-only half of the deletion split is
+`DELETE /cache/{key}`: it evicts the node copies and keeps the row.
 
-**Option 5 — DB get (bypasses the cache)**
+**DB get (bypasses the cache)**
 
-Input: `5`, key `netflix_titles:s1`.
+```powershell
+curl.exe http://127.0.0.1:8000/db/netflix_titles:s1
+```
 
 Expected: the raw JSON record from the dataset's own file
 `data/datasets/netflix_titles.db` — the imported row
@@ -343,36 +336,17 @@ Expected: the raw JSON record from the dataset's own file
 is the "source of truth" view — it must match what GET eventually
 returns.
 
-**Option `b` — restart anything down**
+### 4.4 Key inspector + stats (web UI)
 
-Leave for the fault test (Phase 5); typing `b` with everything
-healthy prints that nothing needed starting.
+Open http://127.0.0.1:8000/ → **Inspector** tab and look up
+`netflix_titles:s1`:
 
-**Option 6 — Key inspector (the flagship query)**
-
-Input: `6`, key `netflix_titles:s1`.
-
-Expected (cold cache):
-
-```
-  CACHE - direct node reads for 'netflix_titles:s1'
-    :8001   MISS
-    :8002   MISS
-    :8003   MISS
-
-  DATABASE - source of truth (read-only)
-    FOUND   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
-
-  VERDICT  DB-ONLY - source of truth has the key, the cache is cold
-```
-
-Now GET `netflix_titles:s1` once (option 3) so it is cached, then
-inspect again. Expected: the two replica nodes show `HIT` with the
-same JSON, the third shows `MISS`, verdict:
-
-```
-  VERDICT  CONSISTENT - 2 caching node(s) match the database
-```
+- Cold cache: verdict `DB-ONLY` — the source of truth has the key,
+  the cache is cold.
+- After one GET (curl above, or any Search): the two replica nodes
+  show HIT with the same JSON, the third MISS, verdict
+  `CONSISTENT`.
+- A key that exists nowhere (`nope:1`) → `NOT FOUND`.
 
 Verdict reference (all seven are exercised by the test suite; live
 testing normally produces DB-ONLY, CONSISTENT and NOT FOUND):
@@ -387,96 +361,44 @@ testing normally produces DB-ONLY, CONSISTENT and NOT FOUND):
 | `NOT FOUND` | neither cache nor DB |
 | `DATABASE UNAVAILABLE` | cannot verify (breaker likely open) |
 
-Inspect a key that exists nowhere (`6` → `nope:1`) → `NOT FOUND`.
+The **Inspector** prefix view replaces the old key-listing menu:
+browse `netflix_titles:` for a paged view of the store (system store
++ one store per dataset). For SQL-level checks, query the dataset
+file directly:
 
-**Option 7 — List keys across every store**
-
-Input: `7`, prefix `netflix_titles:`, limit blank (=20).
-
-Expected:
-
-```
-  8807 key(s) matching 'netflix_titles:' - showing 20
-
-  key                        value bytes
-  ----------------------------------------
-  netflix_titles:s1          612
-  netflix_titles:s10         588
-  ...
+```powershell
+python -c "import sqlite3; print(sqlite3.connect('data/datasets/netflix_titles.db').execute('SELECT COUNT(*) FROM cache_data').fetchone())"
 ```
 
-Then `7` with a blank prefix → a **store summary** (system store +
-one line per dataset: prefix, key column, row count) followed by
-the first 20 keys merged across all stores.
+Expected: `(8807,)`.
 
-**Option 8 — SQL console (read-only)**
+### 4.5 Statistics, hot keys & warm-up
 
-Input: `8`, target `netflix_titles`, then SQL
-`SELECT COUNT(*) FROM cache_data`.
+The **Dashboard** tab shows what the old terminal menu printed:
+node hit rates, the hot-key ranking (the keys you just touched),
+warm-up state `done` per node and a closed circuit breaker. The
+endpoints behind it:
 
-Expected:
-
-```
-  COUNT(*)
-  ----------
-  8807
+```powershell
+curl.exe http://127.0.0.1:8000/cluster/hot-keys
+curl.exe http://127.0.0.1:8000/cluster/warmup
 ```
 
-Try a JSON query too (against the system store, blank target):
+Pass criteria: hot-key list contains the keys you touched,
+per-node counters non-zero, breaker `closed`, warm-up `done` for
+every node.
 
-```sql
-SELECT key, json_extract(value,'$.status') AS status
-FROM cache_data WHERE key LIKE 'q:%' LIMIT 5;
-```
+### 4.6 Stop
 
-Expected: cached search result sets (`q:...` keys), or 0 rows if
-you have not searched yet.
-
-Negative checks (must be REJECTED, printed in red):
-
-```sql
-DELETE FROM cache_data          -- rejected: not read-only
-SELECT 1; DELETE FROM cache_data -- rejected: multi-statement
-```
-
-**Option 9 — Statistics, hot keys & warm-up**
-
-Input: `9`.
-
-Expected three blocks:
+Press **Ctrl+C** in the launcher terminal. Expected:
 
 ```
-  ROUTER
-    hot keys tracked: 2
-           6  test:tui            <- DELETE counted too
-           3  netflix_titles:s1   <- from your GETs
-    warm-up: enabled=True limit=1000 rate=100.0/s
-      8001: done loaded=0 attempts=1
-      ...
-    breaker: closed (failures 0/3)
-
-  NODE http://127.0.0.1:8001
-    hits=N misses=N hit_rate=... sets=N evictions=0
-    tracked_keys=N window=300s
-           2  test:tui
-           ...
+^C
+[SHUTDOWN] launcher stopped.
 ```
 
-Pass criteria: router hot-key list contains the keys you touched,
-per-node counters are non-zero, breaker `closed`,
-warm-up state `done` for every node.
-
-**Option 0 — Stop everything**
-
-Input: `0`.
-
-Expected:
-
-```
-  stopping everything this UI started...
-```
-
-All four spawned windows close. Verify:
+The router's shutdown hook stops every node the launcher spawned
+(run.py runs the router in-process). Verify:
 
 ```powershell
 Get-NetTCPConnection -LocalPort 8000,8001,8002,8003 `
@@ -484,10 +406,10 @@ Get-NetTCPConnection -LocalPort 8000,8001,8002,8003 `
 ```
 
 Expected: empty (all ports free). The system store's row count is
-back to its pre-run value (put+delete of `test:tui` cancels out).
+back to its pre-run value (put+delete of `test:put` cancels out).
 
 **Done — Phase 3 complete.** Restart the cluster for Phase 4
-either with `python tui.py` again, or manually as below.
+either with `python run.py` again, or manually as below.
 
 ---
 
@@ -495,8 +417,9 @@ either with `python tui.py` again, or manually as below.
 
 Low-level view: you see the router's health-check log directly.
 
-> Alternative: keep using the TUI for Phases 5–7 — every curl
-> below has a menu equivalent. The manual setup is preferred here
+> Alternative: keep using the launcher for Phases 5–7 and drive
+> the checks from the web UI — every curl
+> below has a UI equivalent. The manual setup is preferred here
 > because the router window prints `[HEALTH FAIL] / [NODE READY]`
 > lines that the fault test needs you to observe.
 
@@ -504,11 +427,11 @@ Low-level view: you see the router's health-check log directly.
 
 ```powershell
 # Terminal 1
-python main.py --port 8001 --capacity 100
+python main.py --port 8001 --capacity 5000
 # Terminal 2
-python main.py --port 8002 --capacity 100
+python main.py --port 8002 --capacity 5000
 # Terminal 3
-python main.py --port 8003 --capacity 100
+python main.py --port 8003 --capacity 5000
 # Terminal 4 — the router (NO --reload)
 uvicorn router.router:app --port 8000
 ```
@@ -573,7 +496,7 @@ curl.exe http://127.0.0.1:8000/cache/netflix_titles:s2          # => 404 (gone f
 ```
 
 > The `/db/*` DELETE intentionally leaves the cache stale — that is
-> how you can manufacture a `STALE` verdict for the TUI inspector.
+> how you can manufacture a `STALE` verdict for the web UI Inspector.
 > Re-import the dataset with `--reimport` (Phase 8) afterwards to
 > restore the row.
 
@@ -651,7 +574,7 @@ replica). **This is the core fault-tolerance proof.**
 ### 6.5 Restart Node 2 (Terminal 2)
 
 ```powershell
-python main.py --port 8002 --capacity 100
+python main.py --port 8002 --capacity 5000
 ```
 
 Watch Terminal 4 — expected, NOT immediate rejoin:
@@ -795,7 +718,7 @@ curl.exe "http://127.0.0.1:8001/stats/window?limit=5"
 ### 8.3 Kill a node, restart it, watch warm-up
 
 1. `Ctrl+C` Terminal 1 (node 8001). Wait for `[NODE FAILED]`.
-2. Restart: `python main.py --port 8001 --capacity 100`
+2. Restart: `python main.py --port 8001 --capacity 5000`
 3. While it is RECOVERING, poll:
 
 ```powershell
@@ -853,7 +776,7 @@ warm-up completes → manual trigger works, unknown node 404.
 ## 9. Phase 8 — Dataset pipeline (import → serve)
 
 Verifies the file → per-dataset SQLite → registry → serve chain end
-to end. The TUI already seeded `datasets/` on boot (Phase 3); this
+to end. The launcher already seeded `datasets/` on boot (Phase 3); this
 phase exercises the CLI explicitly.
 
 ### 9.1 Dry-run first (parses + plans, writes nothing)
@@ -901,7 +824,7 @@ Get-ChildItem data\datasets
 
 ### 9.4 Serve it through the cluster
 
-With the cluster running (restart via `python tui.py` or the
+With the cluster running (restart via `python run.py` or the
 4-terminal setup if you stopped it):
 
 ```powershell
@@ -910,7 +833,7 @@ curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1   # 2nd: source "cache"
 curl.exe http://127.0.0.1:8000/db/imdb_movies:1          # direct read from that dataset's file
 ```
 
-Or simply use TUI options 3/5/6/7/8 from Phase 3 — same data.
+Or simply use the web UI tabs (Search / Datasets / Inspector) — same data.
 
 Import tests are covered by `pytest tests/test_import_dataset.py
 tests/test_registry.py tests/test_multi_repository.py -v` (63 tests).
@@ -996,7 +919,7 @@ returns to the configured replication factor. The automated suite
 proves this precisely
 (`tests/test_replication.py::test_repair_restores_ownership_after_failure`).
 
-2. Restart it: `python main.py --port 8002 --capacity 100` — it
+2. Restart it: `python main.py --port 8002 --capacity 5000` — it
 rejoins gated (RECOVERING) as in Phase 7.
 
 Pass criteria: sequence increments per write → acked on the writing
@@ -1092,28 +1015,28 @@ Copy this table into the session notes and tick every row.
 
 | # | Feature | Phase | Pass criteria |
 |---|---|---|---|
-| 1 | Test suite green | 0 | 303 passed |
+| 1 | Test suite green | 0 | 377 passed |
 | 2 | Tests are hermetic | 0 | registry + dataset files unchanged after pytest |
 | 3 | Import dry-run (no servers) | 1 | plan printed, `nothing was written` |
 | 4 | Registry listing | 1 | one line per dataset, no traceback |
 | 5 | Node health endpoint | 2 | `{"status":"healthy"}` |
 | 6 | Node SET/GET/EXISTS/DELETE | 2 | values round-trip; 404 on miss |
 | 7 | Node stats + window + top-keys | 2 | counters reflect traffic |
-| 8 | TUI spawns 4 windows + gate | 3 | `active: 3/3` |
-| 9 | TUI PUT (replicated_to 2) | 3 | 2 nodes listed |
-| 10 | TUI GET source cache | 3 | `source: cache` |
+| 8 | Launcher spawns 3 nodes + gate | 3 | `/cluster/status` 3/3 ready |
+| 9 | PUT (replicated_to 2) | 3 | 2 nodes listed |
+| 10 | GET source cache | 3 | `source: cache` |
 | 11 | Cache-aside fallback | 3 | 1st GET `database`, 2nd `cache` |
-| 12 | TUI DELETE | 3 | DB + replicas cleared |
-| 13 | TUI DB get | 3 | raw DB value |
+| 12 | DELETE cascade | 3 | DB + replicas cleared |
+| 13 | DB get | 3 | raw DB value |
 | 14 | Key inspector cold | 3 | `DB-ONLY` |
 | 15 | Key inspector warm | 3 | `CONSISTENT` |
 | 16 | Key inspector absent key | 3 | `NOT FOUND` |
-| 17 | Prefix listing | 3 | `8807 key(s) matching 'netflix_titles:'` |
-| 18 | SQL COUNT(*) | 3 | `8807` against the `netflix_titles` store |
-| 19 | SQL json_extract query | 3 | rows for `q:` cache keys (or 0) |
-| 20 | SQL rejects writes | 3 | red error, nothing deleted |
-| 21 | Stats/hot-keys/breaker view | 3 | breaker closed, keys listed |
-| 22 | TUI clean stop | 3 | option 0 frees all 4 ports |
+| 17 | Inspector prefix browse | 3 | paged `netflix_titles:` keys |
+| 18 | Dashboard hot keys | 3 | touched keys listed |
+| 19 | /cluster/hot-keys | 3 | touched keys ranked |
+| 20 | /cluster/warmup | 3 | `done` for every node |
+| 21 | Web UI loads at /ui | 3 | page renders, tabs switch |
+| 22 | Launcher clean stop | 3 | Ctrl+C frees all 4 ports |
 | 23 | Router /cluster/status gate | 4 | 503 until ready, then 3/3 |
 | 24 | Replicated PUT via curl | 4 | `replicated_to: 2` |
 | 25 | GET via curl | 4 | `source: cache` |
@@ -1157,13 +1080,13 @@ Result: ___/56 passed  |  Date: ______  |  Tester: ______
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `pytest`: 304+ or <303 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
+| `pytest`: ≠377 tests | wrong interpreter / stale checkout | activate `.venv`, `git pull`, re-run |
 | Port already in use | leftover process from a crashed session | `Get-NetTCPConnection -LocalPort 8000 -State Listen` → note `OwningProcess` → `Stop-Process -Id <pid> -F` |
-| TUI stuck at `waiting for 3 node(s)` | a node window failed to start | check the three node windows for tracebacks; `Ctrl+C` the TUI and restart |
+| Launcher stuck at `starting` nodes | a node process failed to start | check `data/logs/node-<port>.log` for tracebacks; `Ctrl+C` the launcher and restart |
 | PUT returns 503 right after boot | gated startup — nodes still `starting/recovering` | wait for `/cluster/status` to list them as `ready` (~5s) — expected behavior |
 | Every request is slow (~2s) | something talks to `localhost` (IPv6 fallback penalty) | use `127.0.0.1` in scripts/demos |
 | `curl` rejects `-X PUT` | PowerShell alias to Invoke-WebRequest | use `curl.exe` |
-| TUI opens no windows | console-session limitation (e.g. some remote shells) | run the 4-terminal manual setup (Phase 4) instead |
+| Nodes spawn but never `ready` | warm-up gate waiting on a slow database | check `curl.exe http://127.0.0.1:8000/cluster/warmup`; wait it out or start with `WARMUP_ENABLED=off` |
 | `Move-Item data\cache.db` → in use | SQLite connection still open from the last request | wait 1–2s, retry; the repo uses short-lived connections |
 | Breaker never returns to `closed` | cooldown not elapsed, or only HITs issued since restore | wait the full 30s, then GET a key you have never fetched (only a miss probes the DB) |
 | Empty `data\cache.db` after breaker test | SQLite recreated a shell file while the DB was "away" | the restore steps in §7.5 (`Remove-Item` shell first) handle it |
@@ -1178,7 +1101,7 @@ End of session — all of it takes <30s:
 
 ```powershell
 # 1. Stop the cluster
-#    - TUI: option 0 (stops what it spawned)
+#    - Launcher: Ctrl+C (stops the router + every node it spawned)
 #    - Manual: Ctrl+C in each of the 4 terminals
 
 # 2. Ports free?
@@ -1194,9 +1117,11 @@ python import_dataset.py --list
 git status --short
 # => only your intended changes
 
-# 5. Stray node windows left behind after a crash?
-taskkill /F /IM python.exe /FI "WINDOWTITLE eq *main.py*"
-# (or close the windows by hand)
+# 5. Stray node processes left behind after a crash?
+Get-NetTCPConnection -LocalPort 8001,8002,8003 -State Listen `
+  -ErrorAction SilentlyContinue |
+  Select-Object -ExpandProperty OwningProcess -Unique |
+  ForEach-Object { Stop-Process -Id $_ -Force }
 ```
 
 ---
@@ -1205,14 +1130,14 @@ taskkill /F /IM python.exe /FI "WINDOWTITLE eq *main.py*"
 
 For a fast "is it basically alive?" check between larger changes:
 
-1. `pytest -q` → 303 passed (Phase 0)
-2. `python tui.py` → seeds datasets/, then `active: 3/3` (Phase 3.1)
-3. TUI `3` → `netflix_titles:s1` twice → `database` then `cache`
-4. TUI `6` → `netflix_titles:s1` → `CONSISTENT`
-5. TUI `8` → target `netflix_titles` → `SELECT COUNT(*) FROM cache_data` → `8807`
-6. TUI `0` → ports free
+1. `pytest -q` → 377 passed (Phase 0)
+2. `python run.py --seed` → seeds datasets/, then `/cluster/status` shows 3/3 ready (Phase 3)
+3. `curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1` twice → `database` then `cache`
+4. Web UI Inspector → `netflix_titles:s1` → `CONSISTENT`
+5. `curl.exe http://127.0.0.1:8000/db/netflix_titles:s1` → raw DB value
+6. Ctrl+C → ports free
 7. `start http://127.0.0.1:8000/` → UI loads; search twice → banner flips
    (Phase 10)
 
-If those seven pass, the core (cluster + cache-aside + DB + TUI +
+If those seven pass, the core (cluster + cache-aside + DB +
 web UI) is healthy; run the full guide before a release or demo.

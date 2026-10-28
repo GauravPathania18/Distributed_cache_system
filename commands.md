@@ -86,7 +86,6 @@ DCS/
 │   ├── test_registry.py
 │   ├── test_multi_repository.py
 │   ├── test_config.py
-│   ├── test_tui.py
 │   ├── test_replication.py
 │   ├── test_search.py
 │   ├── test_telemetry.py
@@ -96,110 +95,53 @@ DCS/
 │   ├── registry.json       <- manifest: every imported dataset
 │   └── datasets/           <- one <name>.db per imported dataset
 ├── datasets/             <- DROP FILES HERE: CSV/TSV/JSON/JSONL/Parquet/
-│   │                         Excel/Zip — auto-imported on TUI boot
+│   │                         Excel/Zip — auto-imported with run.py --seed
 │   └── *.csv               <- your Kaggle/data.gov downloads
 ├── main.py               <- Layer 2: cache node server
-├── tui.py                <- ONE command: seeds datasets/ + spawns everything + query UI
+├── run.py                <- ONE command: (optionally) seeds datasets/ + spawns nodes + router
 ├── import_dataset.py     <- import one file (or the drop folder) into its own SQLite
 ├── requirements.txt
+├── requirements-import.txt <- optional: pandas/pyarrow/openpyxl for Parquet/Excel
 ├── README.md
 └── commands.md
 ```
 
 ---
 
-## Terminal UI — the one command
+## Launcher — the one command
 
 ```powershell
-python tui.py
+python run.py --seed
 ```
 
 That single command:
 
-0. **Seeds the datasets**: every file in `datasets/` that is not
-   registered yet (or whose content changed) is imported once into
-   `data/datasets/<name>.db` — new files print `imported ...` lines
-   right in the header.
-1. Starts the router + 3 cache nodes, **each in its own visible
-   console window** (you can watch every log live).
-2. Waits for the cluster: `waiting for router OK` →
-   `waiting for 3 node(s) to become active OK`.
-3. Drops into the control/query menu. The header shows cluster
-   state, breaker state and how many spawned windows are alive.
+0. **(with `--seed`) Seeds the datasets**: every file in `datasets/`
+   that is not registered yet (or whose content changed) is imported
+   once into `data/datasets/<name>.db` — each import prints an
+   `imported ...` line.
+1. Starts 3 cache nodes as background processes — logs land in
+   `data/logs/node-<port>.log`, PID files in `data/pids/` so the web
+   UI's Cluster tab can stop them. A port that already answers
+   `/health` is adopted instead of double-started.
+2. Runs the router in this terminal and prints the web UI URL
+   (http://127.0.0.1:8000/) — cluster control, datasets, the key
+   inspector and the labs all live there.
 
-If something is already running (started by hand), the TUI attaches
-to it instead of double-starting, and only ever stops what it
-spawned itself. `b` restarts anything that died.
+Ctrl+C stops the router and every node this launcher spawned.
 
-### Menu
+Useful flags:
 
-```
-  CONTROL
-    1   Cluster status & lifecycle
-    2   PUT      write through the router
-    3   GET      read  through the router
-    4   DELETE   invalidate
-    5   DB get   read the source of truth through the router
-    b   Start anything that is down
-
-  DATASETS
-    d   List / import / delete dataset files
-
-  QUERY
-    6   Key inspector: every node vs database   <==
-    7   List keys across every dataset store
-    8   Run SQL on one store (read-only)
-    9   Statistics, hot keys & warm-up
-
-    0   Stop everything this UI started & exit
-```
-
-### The key inspector (6) — generalized cache vs DB query
-
-Enter any key and the TUI reads **every node directly** (no
-cache-aside side effects) plus the database, then prints a verdict:
-
-```
-  CACHE - direct node reads for 'netflix_titles:s1'
-    :8001   HIT   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
-    :8002   HIT   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
-    :8003   MISS
-
-  DATABASE - source of truth (read-only)
-    FOUND   {"type": "Movie", "title": "Dick Johnson Is Dead", ...}
-
-  VERDICT  CONSISTENT - 2 caching node(s) match the database
-```
-
-| Verdict | Meaning |
+| Flag | Meaning |
 |---|---|
-| `CONSISTENT` | every caching node matches the database |
-| `PARTIAL` | some nodes match, some hold stale data |
-| `STALE` | the key is cached everywhere but differs from the DB |
-| `CACHE-ONLY` | cached, but the database does not have the key |
-| `DB-ONLY` | source of truth has it, the cache is cold |
-| `NOT FOUND` | neither cache nor database |
-| `DATABASE UNAVAILABLE` | cannot verify (breaker likely open) |
-
-### SQL console (8)
-
-Prompts for a **target store** first (`system`, or any dataset name
-shown by `d`), then runs read-only SQL against that physical file
-(single `SELECT` / `WITH` / `PRAGMA` / `EXPLAIN` statements, max 50
-rows shown):
-
-```
-  Run against [system | imdb_movies | netflix_titles] (blank = system)
-  SQL: SELECT key, json_extract(value,'$.title') AS title
-        FROM cache_data WHERE key LIKE 'netflix_titles:%' LIMIT 5;
-```
-
-Writes are rejected twice over: statement allow-list + the
-connection is opened with SQLite `mode=ro`.
+| `--nodes N` | how many nodes to spawn (default 3, from `NODE_PORT_BASE`) |
+| `--capacity N` | per-node cache capacity (default 5000; try `20` for the eviction lab) |
+| `--port N` | router port (default 8000) |
+| `--seed` | import the `datasets/` drop folder before boot |
 
 ### Note on `127.0.0.1` vs `localhost`
 
-The router and TUI talk to the cluster over `127.0.0.1` on purpose:
+The router talks to the cluster over `127.0.0.1` on purpose:
 on Windows a `localhost` connect may try IPv6 `::1` first, wait out
 the whole connect timeout (~2s) and then fall back to IPv4 — every
 single request would crawl. Same machine, same ports, no penalty.
@@ -225,7 +167,7 @@ prevention with get_or_set, etc.).
 Start one cache node:
 
 ```powershell
-python main.py --port 8001 --capacity 100
+python main.py --port 8001 --capacity 5000
 ```
 
 Then in a second terminal:
@@ -285,19 +227,19 @@ You need **4 terminals**. Run these one per terminal:
 ### Terminal 1 — Node 1
 
 ```powershell
-python main.py --port 8001 --capacity 100
+python main.py --port 8001 --capacity 5000
 ```
 
 ### Terminal 2 — Node 2
 
 ```powershell
-python main.py --port 8002 --capacity 100
+python main.py --port 8002 --capacity 5000
 ```
 
 ### Terminal 3 — Node 3
 
 ```powershell
-python main.py --port 8003 --capacity 100
+python main.py --port 8003 --capacity 5000
 ```
 
 ### Terminal 4 — Router (public entry point)
@@ -449,7 +391,7 @@ curl http://localhost:8000/cache/user:101
 5. **Restart Node 2**:
 
 ```powershell
-python main.py --port 8002 --capacity 100
+python main.py --port 8002 --capacity 5000
 ```
 
 6. Router detects recovery — note the gate: a node that comes back
@@ -805,7 +747,7 @@ under `active_nodes`, then:
 4. Restart Node 2:
 
 ```powershell
-python main.py --port 8002 --capacity 100
+python main.py --port 8002 --capacity 5000
 ```
 
 5. The router logs `[NODE RECOVERING] http://localhost:8002` on the
@@ -1187,12 +1129,12 @@ generated from its sniffed schema.
 
 ### The drop folder (recommended)
 
-Put any supported file into `datasets/` and either restart the TUI
-or run the seeder:
+Put any supported file into `datasets/` and either restart the
+launcher with `--seed` or run the seeder:
 
 ```powershell
-python tui.py                    # auto-seeds datasets/ on every boot
-python import_dataset.py --seed  # same thing, one-shot
+python run.py --seed              # seeds datasets/ before boot
+python import_dataset.py --seed   # same thing, one-shot
 ```
 
 Only new (or changed) files are imported — the second run prints
@@ -1277,8 +1219,8 @@ zomato_restaurant_dataset  zomato_restaurant_dataset:  rows=9551  key=Restaurant
 ```
 
 The dataset files are ordinary SQLite databases — open
-`data/datasets/<name>.db` with any SQLite browser, or query them
-from the TUI (`8`, pick the store) / the web UI Inspector.
+`data/datasets/<name>.db` with any SQLite browser, or browse them
+from the web UI Inspector (prefix view).
 
 Sanity check in Python:
 

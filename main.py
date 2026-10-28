@@ -17,7 +17,7 @@ from cache import LRUCache, CacheStatistics
 # ---------------------------------------------------------
 
 DEFAULT_PORT = 8001
-DEFAULT_CAPACITY = 100
+DEFAULT_CAPACITY = 5000
 
 
 def parse_args():
@@ -269,7 +269,8 @@ def internal_flush_prefix(prefix: str):
 # INTERNAL SHUTDOWN (web UI stop for nodes we do not own)
 #
 # The router may need to stop a node a different process started
-# (the TUI). Asking politely beats killing: uvicorn finishes
+# (started by hand, or by another router). Asking politely beats
+# killing: uvicorn finishes
 # in-flight requests and runs its lifespan hooks.
 # ---------------------------------------------------------
 

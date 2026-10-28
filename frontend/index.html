@@ -235,6 +235,9 @@
       &hellip; least recently used &rarr; TAIL. A read hops a key to the front; the next
       overflow drops the node at the tail. Writes here are node-local (no database, no
       replication), which is what keeps the demo deterministic.
+      Tip: the fill preset stops at 300 keys, so overflow demos work best on a
+      small-capacity node &mdash; e.g. start one with
+      <code>python main.py --port 8008 --capacity 20</code>; the router attaches to it automatically.
     </p>
     <form class="search-bar" id="lruForm">
       <select id="lruNode" title="node whose linked list you watch"></select>

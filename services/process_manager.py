@@ -1,21 +1,23 @@
 """
 Spawn and stop cache-node OS processes on behalf of one parent
-process (the router, when it scales the cluster from the web UI).
-
-Extracted from the primitives tui.py already proved:
+process - the router, when it scales the cluster from the web UI,
+or the run.py launcher:
 
     process_manager.start(port, capacity)  -> run main.py --port ...
     process_manager.stop(port)             -> terminate a child we
                                               own, else kill via the
                                               PID file main.py wrote
-    process_manager.stop_all()             -> router shutdown hook
+    process_manager.stop_all()             -> launcher/router shutdown
+                                              hook (run.py runs the
+                                              router in-process, so its
+                                              nodes die with it)
 
 Nothing here knows about the cluster: it only owns processes.  The
 router's routes_manage.py does the membership bookkeeping.
 
 Logs land in data/logs/node-<port>.log, PID files in
 data/pids/node-<port>.pid (written by main.py), so a node started by
-another process - the TUI, a second router - can still be found and
+another process - by hand, by a second router - can still be found and
 stopped from this side.  The `spawner` hook is injectable for tests.
 """
 
@@ -288,5 +290,5 @@ class ProcessManager:
         )
 
 
-# One registry per parent process (router or TUI consumer).
+# One registry per parent process (router / run.py launcher).
 process_manager = ProcessManager()

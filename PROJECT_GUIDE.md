@@ -5,17 +5,16 @@
 
 ## 1. Repository scope
 
-This guide covers the **48 files tracked by Git** at the time it was written:
-43 Python files and 5 project-level metadata/documentation files. It describes
+This guide covers the project's Python source, frontend, and
+project-level metadata/documentation files. It describes
 the purpose of each file, the problems it addresses, its principal classes or
 functions, and why its imports are needed.
 
-Generated data, local environments, research materials, and test files are
-excluded from this tracked-file inventory. In particular, `.gitignore`
-excludes `tests/`, `data/`, `datasets/`, `.venv/`, and `/DCS_research`. The
-README and `commands.md` describe a pytest suite, but no test files are tracked
-in the current repository inventory. Treat their stated test counts as
-documentation claims, not as verification from this checkout.
+Generated data, local environments, and research materials are
+excluded from this inventory. In particular, `.gitignore`
+excludes `data/`, `datasets/`, `.venv/`, and `/DCS_research` — while
+the pytest suite under `tests/` is tracked. The README and
+`commands.md` state the expected test counts.
 
 ## 2. Problem statement and solution
 
@@ -369,8 +368,8 @@ and the recovery gate are satisfied.
   `query`/`set_many`/`clear`) so every layer above works unchanged. Each
   key is routed by its longest matching dataset prefix; unmatched keys
   fall through to the system store. `repo_for()`, `repo_named()`,
-  `repos_matching()`, and `repos()` expose the individual stores for the
-  TUI and SQL console; `query()` infers the target store from `LIKE`
+  `repos_matching()`, and `repos()` expose the individual stores for
+  the dataset browser and admin tooling; `query()` infers the target store from `LIKE`
   parameters. Registry changes are picked up live via a revision check,
   and dataset files are created lazily on first touch.
 - **Imports:** `heapq`/`itertools` merge sorted key streams across stores;
@@ -581,40 +580,29 @@ and the recovery gate are satisfied.
 - **Important behavior:** Cache storage is process memory and is lost when
   the node exits.
 
-#### [`tui.py`](./tui.py)
+#### [`run.py`](./run.py)
 
-- **Purpose/problem solved:** One-command local launcher and interactive
-  operations panel for the router and cache nodes.
-- **Functions:** `node_port()`, `db_path()`, and `repository()` resolve local
-  endpoints/storage (`repository()` returns a `MultiDatasetRepository`).
-  `auto_seed()` imports new/changed files from the `datasets/` drop folder
-  before the cluster starts. `init_color()`, `paint()`, and `clear()` render
-  the terminal. `http()`/`_detail()` normalize API results.
-  `project_python()`, `spawn()`, `is_alive()`, `alive_children()`,
-  `ensure_running()`, `stop_all()`, and `_emergency_stop()` manage child
-  processes while avoiding termination of services the UI did not start.
-  `wait_for()`, `active_nodes()`, `boot()`, and `print_cluster_summary()`
-  coordinate startup. `header()`, `menu()`, `ask()`, `pause()`, `fmt()`, and
-  `render_table()` support display/input. `parse_value()` and
-  `compute_verdict()` handle values and cache-vs-database consistency
-  summaries. `action_status()`, `action_put()`, `action_get()`,
-  `action_delete()`, `action_db_get()`, `action_resume()`,
-  `action_inspect()`, `action_list_keys()`, `action_sql()`,
-  `action_stats()`, and `action_datasets()` (list/import/delete datasets)
-  implement menu operations. `main()` runs the menu and arranges shutdown.
-- **Imports:** Standard-library `atexit`, `signal`, `subprocess`, `sys`, and
-  `os` manage child processes, shutdown, paths, and terminal behavior;
-  `json` formats and parses values; `time` implements wait/deadline logic;
-  `quote` and `urlparse` encode keys and parse node URLs. `requests` performs
-  HTTP calls; `check_node` probes cache nodes; `DatasetRegistry` and
-  `MultiDatasetRepository` provide dataset-aware diagnostics (key listing
-  and the per-store SQL console); `slugify`, `import_file`,
-  `list_datasets`, and `seed_drop_folder` implement dataset management;
-  `DatabaseUnavailableError` classifies read failures; `nodes_from_env`
-  uses the router's configured node set.
-- **Engineering note:** The SQL console is intentionally described here as
-  an inspection tool, but the repository query guard should not be treated
-  as a security boundary; see §5.
+- **Purpose/problem solved:** One-command local launcher: optionally
+  seeds the drop folder, spawns the cache nodes, and runs the router
+  in-process so a single Ctrl+C stops the whole cluster.
+- **Functions:** `parse_args()` defines `--nodes`, `--port`,
+  `--capacity`, and `--seed`. `seed_drop_folder()` imports new or
+  changed files from `datasets/` before boot and prints the seeder's
+  per-file report. `spawn_nodes()` starts `count` nodes from the port
+  pool through the shared `process_manager` (adopting a port that
+  already answers `/health` instead of double-starting).
+  `main()` orchestrates and hands off to `uvicorn.run`, with a
+  `KeyboardInterrupt` guard for a clean exit.
+- **Imports:** `argparse`/`os`/`sys`/`time` handle CLI parsing, paths,
+  exit codes, and the brief pre-server settle delay; `uvicorn` serves
+  the router in this process; `router.config` supplies `NODE_CAPACITY`
+  and `NODE_PORT_BASE`; `cluster.health_monitor.check_node` probes
+  candidate ports; `services.process_manager.process_manager` spawns
+  and stops nodes (its PID files let the web UI stop them too);
+  `import_dataset.seed_drop_folder` performs the drop-folder import.
+- **Engineering note:** Because the router runs in this process, its
+  lifespan hook (`process_manager.stop_all`) is the same registry the
+  launcher spawned into — Ctrl+C leaves no orphaned nodes.
 
 #### [`import_dataset.py`](./import_dataset.py)
 
@@ -635,7 +623,7 @@ and the recovery gate are satisfied.
   it in with `os.replace` so a failed import never destroys existing data,
   then registers or re-imports the dataset. `seed_drop_folder()` imports
   every new or changed file in the drop folder and returns per-file
-  `imported`/`reimported`/`failed` records (used by `tui.py` on boot).
+  `imported`/`reimported`/`failed` records (used by `run.py --seed`).
   `list_datasets()` reports live row counts and database sizes.
 - **Imports:** `argparse`/`sys` provide CLI and error reporting; `csv`,
   `json`, `zipfile`, and `os` read inputs and manage paths; `time` measures
@@ -659,6 +647,15 @@ and the recovery gate are satisfied.
 - **Dependencies:** `fastapi` defines HTTP APIs; `uvicorn` serves ASGI
   applications; `requests` performs node/router HTTP calls; `pytest` is the
   documented test runner.
+
+#### [`requirements-import.txt`](./requirements-import.txt)
+
+- **Purpose/problem solved:** Optional dependencies needed only to
+  import Parquet and Excel dataset files (pandas, pyarrow, openpyxl).
+  CSV/TSV/JSON/JSONL imports use the standard library alone;
+  `import_dataset.py` reports a clear error if a Parquet/Excel file
+  arrives without these installed.
+- **Imports:** Not applicable.
 - **Note:** Versions are unpinned.
 
 #### [`README.md`](./README.md)
@@ -674,7 +671,7 @@ and the recovery gate are satisfied.
 #### [`commands.md`](./commands.md)
 
 - **Purpose/problem solved:** Detailed operator/developer command reference:
-  environment setup, terminal UI, layer-specific endpoints, fault-tolerance
+  environment setup, the launcher, layer-specific endpoints, fault-tolerance
   walkthroughs, warm-up, dataset import, and test commands.
 - **Important content:** Contains setup and examples; it is not executable
   application logic. Cross-check these commands against the current code
@@ -795,6 +792,6 @@ These notes describe observed code behavior, not future design intent:
    [`cache/hot_keys.py`](./cache/hot_keys.py) for recovery warm-up.
 6. [`router/_components.py`](./router/_components.py) and the route modules
    for application wiring and HTTP contracts.
-7. [`main.py`](./main.py), [`tui.py`](./tui.py), and
+7. [`main.py`](./main.py), [`run.py`](./run.py), and
    [`import_dataset.py`](./import_dataset.py) for local execution and
    tooling.

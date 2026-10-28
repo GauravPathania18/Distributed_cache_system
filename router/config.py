@@ -60,7 +60,7 @@ SEED_FALLBACK_CAPACITY = int(os.environ.get("SEED_FALLBACK_CAPACITY", "100"))
 # pool is capacity the UI can grow into.
 MAX_NODES = int(os.environ.get("MAX_NODES", "8"))
 NODE_PORT_BASE = int(os.environ.get("NODE_PORT_BASE", "8001"))
-NODE_CAPACITY = int(os.environ.get("NODE_CAPACITY", "100"))
+NODE_CAPACITY = int(os.environ.get("NODE_CAPACITY", "5000"))
 
 # How long a scale/start request waits for freshly spawned nodes to
 # answer /health before reporting them as still starting.

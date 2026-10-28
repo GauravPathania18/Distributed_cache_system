@@ -8,8 +8,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Test and coverage files
-tests/
+# Test and coverage files (the suite itself IS tracked)
 .pytest_cache/
 .coverage
 htmlcov/

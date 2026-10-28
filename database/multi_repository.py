@@ -13,7 +13,8 @@ interface (get/set/delete/exists/count/keys/iter_keys/query/
 set_many/clear) and routes each key by its longest matching
 dataset prefix; unmatched keys fall through to the system store.
 Every layer above (cache service, warm-up, replication, router
-endpoints, TUI) therefore works unchanged, but searches and SQL
+endpoints, the run.py launcher) therefore works unchanged, but
+searches and SQL
 console sessions can still target one physical file via
 repo_for() / repo_named() / repos_matching().
 """

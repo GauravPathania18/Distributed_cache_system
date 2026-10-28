@@ -1,0 +1,11 @@
+# Optional dependencies - only needed to IMPORT Parquet / Excel
+# dataset files:
+#
+#   pip install -r requirements-import.txt
+#
+# CSV, TSV, JSON and JSONL imports work with the standard library
+# alone; import_dataset.py reports a clear error if a Parquet/Excel
+# file arrives without these installed.
+pandas
+pyarrow
+openpyxl

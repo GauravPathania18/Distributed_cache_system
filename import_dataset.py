@@ -9,7 +9,7 @@ SQLite file and registers the result:
     value = the rest of the record, as JSON
 
     data/datasets/<name>.db   the dataset's own physical file
-    data/registry.json        the manifest the router and TUI read
+    data/registry.json        the manifest the router reads
 
 One file -> one database -> one searchable entity. No hardcoding
 anywhere: the schema is sniffed from the data and drives the
@@ -513,7 +513,7 @@ def seed_drop_folder(
 ) -> list:
     """Import every unregistered (or changed) file in the drop folder.
 
-    This is what `tui.py` runs on boot: drop a Kaggle CSV into
+    This is what `run.py --seed` runs on boot: drop a Kaggle CSV into
     datasets/ and the next start imports it once. Already-imported
     files are skipped; a file whose size/mtime changed re-imports.
     """
