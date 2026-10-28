@@ -236,8 +236,9 @@
       overflow drops the node at the tail. Writes here are node-local (no database, no
       replication), which is what keeps the demo deterministic.
       Tip: the fill preset stops at 300 keys, so overflow demos work best on a
-      small-capacity node &mdash; e.g. start one with
-      <code>python main.py --port 8008 --capacity 20</code>; the router attaches to it automatically.
+      small-capacity node &mdash; start one
+      (<code>python main.py --port 8004 --capacity 20</code>) and attach it
+      (Cluster tab &rarr; scale to 4); it then appears in this selector.
     </p>
     <form class="search-bar" id="lruForm">
       <select id="lruNode" title="node whose linked list you watch"></select>
