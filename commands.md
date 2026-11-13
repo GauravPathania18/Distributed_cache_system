@@ -47,6 +47,7 @@ DCS/
 │   ├── app.py / config.py / models.py
 │   ├── routes_cache.py / routes_cluster.py / routes_db.py
 │   ├── routes_search.py / routes_dashboard.py / routes_static.py  <- Layer 8
+│   ├── routes_manage.py / routes_node.py / routes_datasets.py     <- Layer 9
 │   ├── _components.py       <- shared database / node_manager / services
 │   └── router.py            <- public re-export shim
 ├── database/             <- Layer 5: SQLite source of truth (1 file per store)
@@ -65,11 +66,16 @@ DCS/
 │   ├── warmup.py             <- Layer 6.3: CacheWarmup + rate limiter
 │   ├── replication.py        <- Layer 7.3-7.6: sequence/log/sync/repair
 │   ├── search.py             <- Layer 8.1: keyword/facet search over cache
-│   └── telemetry.py          <- Layer 8.2: DB-load-reduction counters
-├── frontend/             <- Layer 8.3: vanilla SPA served by the router
-│   ├── index.html            <- four tabs: Search/Dashboard/Inspector/Lab
+│   ├── telemetry.py          <- Layer 8.2: DB-load-reduction counters
+│   ├── seeding.py            <- Layer 6.5: cold-start cache seeding
+│   ├── process_manager.py    <- Layer 9.1: spawn / stop node processes
+│   └── dataset_admin.py      <- Layer 9.2: entities as isolated databases
+├── frontend/             <- Layers 8.3/9: vanilla SPA served by the router
+│   ├── index.html            <- six tabs: Search/Dashboard/Cluster/
+│   │                          Datasets/Inspector/Lab
 │   ├── style.css
-│   └── app.js
+│   ├── app.js                <- shell + the Search and Dashboard views
+│   └── views/                <- cluster, datasets, inspector, lab
 ├── tests/                <- test suite
 │   ├── conftest.py         <- points tests at a throwaway database
 │   ├── test_cache.py
@@ -85,6 +91,11 @@ DCS/
 │   ├── test_import_dataset.py
 │   ├── test_registry.py
 │   ├── test_multi_repository.py
+│   ├── test_seeding.py
+│   ├── test_datasets_routes.py
+│   ├── test_manage_routes.py
+│   ├── test_process_manager.py
+│   ├── test_lru_lab.py
 │   ├── test_config.py
 │   ├── test_replication.py
 │   ├── test_search.py
@@ -103,6 +114,8 @@ DCS/
 ├── requirements.txt
 ├── requirements-import.txt <- optional: pandas/pyarrow/openpyxl for Parquet/Excel
 ├── README.md
+├── PROJECT_GUIDE.md
+├── TESTING_GUIDE.md
 └── commands.md
 ```
 
@@ -1250,14 +1263,16 @@ step, no npm. It is mounted at `/ui` and `/` redirects there.
 start http://127.0.0.1:8000/
 ```
 
-Four tabs:
+Six tabs:
 
 | Tab | What it does |
 |-----|--------------|
 | **Search** | Keyword + facet search over every imported dataset. |
 | **Dashboard** | Cluster hit rates, telemetry, hot keys, replication log. |
+| **Cluster** | Scale the cluster and start/stop/restart individual nodes. |
+| **Datasets** | Create an entity, browse its entries, add and delete rows. |
 | **Inspector** | Read any key from the cache layer vs the database. |
-| **Cache Lab** | Run one query N times and watch DB load drop. |
+| **Lab** | Five repeatable experiments (search storm, point-read storm, node-failure drill, eviction burst, live LRU eviction). |
 
 ### Search endpoints
 
@@ -1302,12 +1317,14 @@ curl -X POST http://127.0.0.1:8000/dashboard/telemetry/reset
 
 ### The Cache Lab demo
 
-1. Open `http://127.0.0.1:8000/` → **Cache Lab** tab.
-2. Pick an entity + query, set iterations to 20, press **Run**.
+1. Open `http://127.0.0.1:8000/` → **Lab** tab (Lab 1 — search storm).
+2. Pick an entity + query, leave **Runs** at its default of 100 (or set
+   20 for a quicker demo), press **Run**.
 3. The chart plots cumulative cache hits vs SQL queries.
 
-Expected shape: **1 database run, 19 cache hits → 95% DB load
+Expected shape: **1 database run, 99 cache hits → 99% DB load
 reduction**, with the SQL count flat-lining after the first run.
+(At 20 runs the same shape reads 1 SQL + 19 cache hits → 95%.)
 
 ### Configuration
 
@@ -1323,7 +1340,80 @@ reduction**, with the SQL count flat-lining after the first run.
 pytest tests/test_search.py tests/test_telemetry.py tests/test_dashboard.py -v
 ```
 
-36 tests: 25 search + 7 telemetry + 4 dashboard.
+50 tests: 39 search + 7 telemetry + 4 dashboard.
+
+---
+
+## Layer 9 - Cluster control & dataset administration
+
+Everything below is driven by the **Cluster** and **Datasets** tabs,
+but each action is a plain endpoint you can curl.
+
+### Scale and manage node processes
+
+```powershell
+# What is running right now: state, PID, process ownership, cache stats
+curl http://127.0.0.1:8000/cluster/nodes
+
+# Scale to 4 nodes - spawns/adopts a real main.py process, which then
+# gates through health -> warm-up -> READY
+curl -X POST http://127.0.0.1:8000/cluster/nodes -H "Content-Type: application/json" -d '{"target": 4}'
+
+# Scale back down - highest ports leave first, their processes stop
+curl -X POST http://127.0.0.1:8000/cluster/nodes -H "Content-Type: application/json" -d '{"target": 3}'
+
+# Individual lifecycle, once the node exists
+curl -X POST http://127.0.0.1:8000/cluster/nodes/8004/stop
+curl -X POST http://127.0.0.1:8000/cluster/nodes/8004/start
+curl -X POST http://127.0.0.1:8000/cluster/nodes/8004/restart
+```
+
+A port that already answers `/health` is **adopted**, never spawned
+twice. Shrinking does not drain: cached rows on a removed node simply
+live on their RF=2 replica or fall back to the database.
+
+### Dataset administration
+
+Each dataset is its own isolated SQLite file
+(`data/datasets/<name>.db`) with its own `<name>:` key prefix and its
+own search entity.
+
+```powershell
+# Everything registered: prefix, schema and live row count
+curl http://127.0.0.1:8000/datasets
+
+# Create a new entity (key_column = the column that becomes the key)
+curl -X POST http://127.0.0.1:8000/datasets -H "Content-Type: application/json" -d '{"name": "scratch", "key_column": "id"}'
+
+# Inspect it
+curl http://127.0.0.1:8000/datasets/scratch
+
+# Page through its rows (limit 1-500, offset >= 0)
+curl "http://127.0.0.1:8000/datasets/scratch/entries?limit=20&offset=0"
+
+# Add one row - the key is derived server-side (declared key column,
+# then "id", then the next free number); re-posting an id upserts
+curl -X POST http://127.0.0.1:8000/datasets/scratch/entries -H "Content-Type: application/json" -d '{"value": {"id": 1, "title": "hello"}}'
+
+# Delete one row everywhere (DB row + node copies + search caches)
+curl -X DELETE "http://127.0.0.1:8000/datasets/scratch/entries?key=scratch:1"
+
+# Delete the whole dataset: node copies by prefix, search caches,
+# replication-log entries, manifest row and the SQLite file
+curl -X DELETE http://127.0.0.1:8000/datasets/scratch
+```
+
+Every mutation purges the affected `q:`/`s:` search caches on disk
+*and* in the nodes, so a stale search page can never outlive its data.
+
+### Layer 9 tests
+
+```powershell
+pytest tests/test_manage_routes.py tests/test_datasets_routes.py tests/test_process_manager.py -v
+```
+
+33 tests: 9 cluster-control routes + 12 dataset routes +
+12 process manager.
 
 ---
 
@@ -1333,12 +1423,17 @@ pytest tests/test_search.py tests/test_telemetry.py tests/test_dashboard.py -v
 pytest -v
 ```
 
-Expected: **303 tests pass** — 34 replication + 29 dataset import +
-28 node lifecycle + 25 search + 21 warm-up + 20 repository +
-19 registry + 16 consistent hash + 15 statistics +
-15 multi-dataset repository + 14 cache + 13 cache-service +
-13 terminal UI + 11 circuit-breaker + 8 router + 7 telemetry +
-6 config + 5 single-flight + 4 dashboard.
+Expected: **376 pass, 1 skipped** (377 collected) — 39 search +
+37 replication + 29 dataset import + 28 node lifecycle + 28 warm-up +
+21 registry + 20 repository + 18 multi-dataset repository +
+18 seeding + 16 cache + 16 consistent hash + 15 statistics +
+13 cache-service + 12 dataset routes + 12 process manager +
+11 circuit-breaker + 9 cluster-control routes + 9 router +
+7 telemetry + 6 config + 5 single-flight + 4 LRU lab +
+4 dashboard.
+
+The skip is the Excel-import test, which needs the optional
+`requirements-import.txt` (openpyxl).
 
 ---
 
