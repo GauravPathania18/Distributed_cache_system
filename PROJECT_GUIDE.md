@@ -42,7 +42,14 @@ DCS is an educational Python implementation of a distributed cache with:
 - Node lifecycle states, periodic health checks, and gated recovery.
 - In-memory operation statistics, bounded hot-key tracking, and throttled
   cache warm-up before a recovering node re-enters the ring.
-- A terminal launcher/control panel and a file-based dataset importer.
+- Replicated writes with a sequence-numbered log, sync/resync, recorded
+  failover and re-replication back onto healthy nodes.
+- Cached keyword/facet search over the datasets, router-side DB-load
+  telemetry, and a six-tab web UI (Search, Dashboard, Cluster,
+  Datasets, Inspector, Lab) served by the router itself.
+- A one-command launcher (`run.py`) that seeds the drop folder, spawns
+  the node processes and runs the router, plus a file-based dataset
+  importer.
 
 ### Request and recovery paths
 
@@ -560,7 +567,74 @@ and the recovery gate are satisfied.
 - **Imports:** `app` and the shared components are re-exported; the route
   modules are imported for their endpoint-registration side effects.
 
-### 3.6 Root-level Python files — entry points and data tools
+### 3.6 `frontend/` — the web UI
+
+Vanilla HTML/CSS/JavaScript single-page app with **no build step**. The
+router mounts it from disk on every request
+(`router/routes_static.py` → `app.mount("/ui", StaticFiles(...))`), so
+an edit to any file here is live on the next page load — no server
+restart. `GET /` is only a redirect to `/ui`.
+
+#### [`frontend/index.html`](./frontend/index.html)
+
+- **Purpose/problem solved:** The entire SPA markup: the header with
+  the live cluster pill, one `<section>` per view, and every form,
+  table, chart container and stat card the scripts fill in. The six
+  views are `view-search`, `view-dashboard`, `view-cluster`,
+  `view-datasets`, `view-inspector` and `view-lab`.
+- **Important behavior:** Element ids are the contract between the
+  markup and the scripts — 95 ids in total, 88 of them referenced from
+  JavaScript, none missing. Each view opens with a `.view-head` title
+  and a one-line description, and the Lab forms use labelled
+  `.form-row` / `.field` groups.
+
+#### [`frontend/style.css`](./frontend/style.css)
+
+- **Purpose/problem solved:** The whole visual system: palette tokens,
+  page layout, per-view styles, cards, tables, forms, badges, the lab
+  chart and the responsive rules.
+- **Important behavior:** Every colour is declared once as a CSS custom
+  property under `:root`; the SVG donut/bar chart drawn in `app.js`
+  repeats those same hex values, so a palette change has to be made in
+  both places.
+
+#### [`frontend/app.js`](./frontend/app.js)
+
+- **Purpose/problem solved:** The application shell plus two of the six
+  views. It provides `el()` (DOM builder), `api()` (fetch wrapper),
+  `esc`/`fmtNum`/`debounce`/`setVerdict` helpers, the `state` object,
+  the view router (`registerView` / `showView`), the cluster pill
+  refresh, the dataset-entity catalogue, and `init()` which wires the
+  tabs and forms. It also implements the **Search** view
+  (`runSearch`, facets, result cards, pager) and the **Dashboard**
+  view (`renderStatCards`, `renderHitRateBars`, `renderDonut`,
+  `renderHotKeys`, `renderNodeStates`, `renderBreakerRepl`).
+- **Important behavior:** `el(tag, attrs, children)` passes real `Node`
+  children straight through and stringifies anything else, so numbers
+  and booleans can be handed to it directly.
+
+#### `frontend/views/*.js`
+
+One module per remaining view; each calls `registerView(name, hooks)`
+so the shell can show/hide it:
+
+- [`cluster.js`](./frontend/views/cluster.js) — cluster sizing form and
+  the per-node cards (state, process ownership, PID, cache stats and
+  start/stop/restart buttons), refreshed every 3 s.
+- [`datasets.js`](./frontend/views/datasets.js) — dataset list, detail
+  pane, entry browsing, add-entry form and the row/dataset deletions;
+  it re-runs `reloadEntities()` after a mutation so the Search tab's
+  entity picker stays in step.
+- [`inspector.js`](./frontend/views/inspector.js) — single-key lookup
+  and prefix browsing, including the split **Evict from cache** /
+  **Delete from database** actions and the consistency verdict. It is
+  also reused from the Search tab's "Inspect key" links.
+- [`lab.js`](./frontend/views/lab.js) — the five labs: search storm,
+  point-read storm, node-failure drill, eviction burst and the live
+  LRU-eviction watcher (which polls a node's `/stats/lru` and animates
+  insert / touch / evict transitions).
+
+### 3.7 Root-level Python files — entry points and data tools
 
 #### [`main.py`](./main.py)
 
@@ -630,14 +704,18 @@ and the recovery gate are satisfied.
   elapsed import time. `DatasetRegistry` owns the manifest; the repository
   classes provide batched persistence.
 
-### 3.7 Project metadata and documentation
+### 3.8 Project metadata and documentation
 
 #### [`.gitignore`](./.gitignore)
 
 - **Purpose/problem solved:** Keeps local runtime artifacts out of Git:
   virtual environments, Python bytecode, test/coverage output, IDE/OS files,
   logs, SQLite data (system store, `data/datasets/*.db`, registry), user
-  dataset files in the `datasets/` drop folder, and research PDFs.
+  dataset files in the `datasets/` drop folder, research PDFs, and the
+  capstone report work — `DCS_Capstone_Report_*`, `PersonalLLM_*` and the
+  whole `_report_bench/` tree (bench harness, generated figures, UI
+  screenshots, JSON results). The test suite itself is deliberately
+  **not** ignored: `tests/` is tracked.
 - **Imports:** Not applicable.
 
 #### [`requirements.txt`](./requirements.txt)
@@ -690,6 +768,15 @@ and the recovery gate are satisfied.
   reference. It explains the implementation and its current limitations.
 - **Imports:** Not applicable.
 
+#### [`TESTING_GUIDE.md`](./TESTING_GUIDE.md)
+
+- **Purpose/problem solved:** The team's phased test plan: Phase 0 runs
+  the automated suite, then manual smoke phases cover the dataset
+  pipeline, a single node, the router cluster, failure/rejoin, the
+  circuit breaker, warm-up, import, replication and the web UI —
+  followed by a 58-row master checklist and a troubleshooting table.
+- **Imports:** Not applicable.
+
 ## 4. Runtime configuration and externally visible surfaces
 
 ### Main configuration
@@ -721,14 +808,29 @@ interval 2 seconds, failure threshold 3, and request timeout 2 seconds.
 
 **Router (`router/routes_*.py`, typically port 8000):**
 
+- `GET /` — redirect to `/ui`; the `/ui` mount serves `frontend/` from
+  disk on every request, so UI edits need no restart.
 - `GET /health`
-- `GET|PUT|DELETE /cache/{key}`
-- `GET|DELETE /db/{key}` (direct database diagnostic access)
-- `GET /cluster/status`
-- `GET /cluster/hot-keys`
-- `GET /cluster/warmup`
-- `POST /cluster/warmup/{node:path}`
-- `GET /circuit-breaker/status`
+- **Cache / database:** `GET|PUT|DELETE /cache/{key}` (the `DELETE`
+  only **evicts** node copies) and `GET|DELETE /db/{key}` (direct
+  database access; its `DELETE` removes the row everywhere).
+- **Search (8.1):** `GET /search/entities`, `GET /search/{entity}`,
+  `GET /search/{entity}/suggest`, `GET /browse/prefix`.
+- **Telemetry (8.2):** `GET /dashboard/aggregate`,
+  `POST /dashboard/telemetry/reset`.
+- **Cluster introspection:** `GET /cluster/status`,
+  `GET /cluster/hot-keys`, `GET /cluster/warmup`,
+  `POST /cluster/warmup/{node:path}`, `GET /circuit-breaker/status`.
+- **Replication (7.3–7.6):** `GET /cluster/replication`,
+  `POST /cluster/resync/{node:path}`.
+- **Cluster control (9.1):** `GET|POST /cluster/nodes` and
+  `POST /cluster/nodes/{port}/start|stop|restart`, plus the per-node
+  cache helpers `GET /cluster/nodes/{port}/cache-state`,
+  `GET|PUT|DELETE /cluster/nodes/{port}/cache/{key}` and
+  `DELETE /cluster/nodes/{port}/cache-prefix/{prefix:path}`.
+- **Dataset admin (9.2):** `GET|POST /datasets`,
+  `GET|DELETE /datasets/{name}` and
+  `GET|POST|DELETE /datasets/{name}/entries`.
 
 FastAPI also provides its normal OpenAPI/docs surfaces when enabled.
 
@@ -743,9 +845,10 @@ These notes describe observed code behavior, not future design intent:
 2. **Not strongly consistent replication.** Writes are sent to selected
    nodes without a quorum or durable replication log. A successful response
    can list fewer nodes than the configured replication factor as long as at
-   least one node accepted the write. Database-first write failure is
-   surfaced; cache fan-out failure after a successful database write can
-   still return HTTP 503.
+   least one node accepted the write. The Layer 7.3 log is a bounded
+   **in-memory** `deque`, so it is not a durable journal. Database-first
+   write failure is surfaced; cache fan-out failure after a successful
+   database write can still return HTTP 503.
 3. **Cache TTL and database retention differ.** Expiration removes/ignores an
    in-memory entry; the SQLite value remains until explicitly deleted.
 4. **Cache misses treat `None` as absent.** Both the cache and service use
@@ -759,17 +862,10 @@ These notes describe observed code behavior, not future design intent:
    with one of four allowed keywords and limits result rows, but
    `_get_connection()` opens a regular SQLite connection; it does not use
    `mode=ro`. A mutating statement can be prefixed by `WITH`, and `PRAGMA`
-   can also have side effects. The `commands.md` claim that the connection is
-   opened read-only does not match this implementation. Do not expose this
-   query helper to untrusted callers.
-7. **Documented tests are not present in the tracked tree.** `README.md` and
-   `commands.md` cite 303 pytest tests, but `.gitignore` excludes `tests/`
-   and `git ls-files` currently contains no test sources. Restore/track the
-   intended test suite before using those counts as a release gate.
-8. **Planned roadmap is not implemented by this inventory.** README items
-   after Layer 6.3 (replica placement evolution, write replication log/version
-   sync, formal failure detection, automatic failover, and re-replication/
-   rebalancing) are listed as planned/next, not current capabilities.
+   can also have side effects. Today the helper is only called from
+   `services/seeding.py` with trusted SQL and is **not** exposed over HTTP —
+   do not wire it up to an untrusted caller without switching the
+   connection to `file:...?mode=ro`.
 
 ## 6. Suggested reading order for maintainers
 
