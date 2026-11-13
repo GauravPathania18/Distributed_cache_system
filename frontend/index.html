@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DCS — Distributed Cache Search</title>
+<title>DCS — Distributed Cache System</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
 <header class="topbar">
   <div class="brand">
     <span class="logo">DCS</span>
-    <span class="tagline">Distributed Cache &mdash; search that pays for itself</span>
+    <span class="tagline">Distributed Cache System</span>
   </div>
   <nav class="tabs" id="tabs">
     <button data-view="search"    class="tab active">Search</button>
@@ -31,6 +31,11 @@
 
 <!-- ================= SEARCH ================= -->
 <section id="view-search" class="view active">
+  <div class="view-head">
+    <h2>Search</h2>
+    <p class="muted">Keyword, facet and range queries over every dataset. Each result set is cached as a <code>q:</code> entry and replicated across the nodes.</p>
+  </div>
+
   <div class="search-hero">
     <div class="entity-switch" id="entitySwitch"></div>
     <form class="search-bar" id="searchForm">
@@ -54,18 +59,24 @@
 
 <!-- ================= DASHBOARD ================= -->
 <section id="view-dashboard" class="view">
+  <div class="view-head">
+    <h2>Dashboard</h2>
+    <p class="muted">Live telemetry from the router and every node: hit rates, database load avoided, hot keys and the replication log. Counters accumulate from the moment the router booted, across <em>every</em> query &mdash; a single experiment's window is what the Lab reports.</p>
+  </div>
+
   <div class="stat-cards" id="statCards"></div>
+
   <div class="dash-grid">
     <div class="panel">
-      <h3>Cache tier hit rate (all nodes, lifetime)</h3>
+      <h3>Cache tier hit rate <span class="muted">per node, lifetime</span></h3>
       <div id="hitRateBars"></div>
     </div>
     <div class="panel">
-      <h3>Reads &mdash; where they were served</h3>
+      <h3>Reads <span class="muted">where they were served</span></h3>
       <div id="sourceDonut" class="donut-wrap"></div>
     </div>
     <div class="panel wide">
-      <h3>Hottest keys (live)</h3>
+      <h3>Hottest keys <span class="muted">live, last 5-minute window</span></h3>
       <table class="table" id="hotKeysTable"></table>
     </div>
     <div class="panel">
@@ -81,8 +92,13 @@
 
 <!-- ================= CLUSTER ================= -->
 <section id="view-cluster" class="view">
+  <div class="view-head">
+    <h2>Cluster</h2>
+    <p class="muted">Scale real <code>main.py</code> processes and watch each one move through STARTING &rarr; RECOVERING &rarr; READY.</p>
+  </div>
+
   <div class="panel">
-    <h3>Cluster sizing <span class="muted">&mdash; real node processes, spawned and stopped by the router</span></h3>
+    <h3>Cluster sizing <span class="muted">spawned and stopped by the router</span></h3>
     <div class="scale-row">
       <span class="muted" id="scaleInfo">loading&hellip;</span>
       <div class="scale-controls">
@@ -100,8 +116,13 @@
 
 <!-- ================= DATASETS ================= -->
 <section id="view-datasets" class="view">
+  <div class="view-head">
+    <h2>Datasets</h2>
+    <p class="muted">Every dataset is an isolated SQLite file with its own schema, key prefix and search filters.</p>
+  </div>
+
   <div class="panel">
-    <h3>Datasets <span class="muted">&mdash; each one is an isolated SQLite space with its own key prefix</span></h3>
+    <h3>All datasets</h3>
     <form class="inline-form" id="datasetCreateForm">
       <input type="text" id="dsName" class="wide" placeholder="dataset name (e.g. invoices)" autocomplete="off">
       <input type="text" id="dsKeyColumn" placeholder="key column (optional, e.g. id)" autocomplete="off">
@@ -119,11 +140,18 @@
 
 <!-- ================= INSPECTOR ================= -->
 <section id="view-inspector" class="view">
+  <div class="view-head">
+    <h2>Inspector</h2>
+    <p class="muted">Read any key straight from the cache layer, then compare the two deletion paths side by side.</p>
+  </div>
+
   <div class="panel">
-    <h3>Single-key lookup &mdash; see what the cache layer saves</h3>
-    <form class="search-bar" id="inspectForm">
-      <input type="text" id="inspectKey" placeholder="dataset key, e.g. users:42" autocomplete="off">
-      <button type="submit" class="btn primary">Lookup</button>
+    <h3>Single-key lookup</h3>
+    <form class="form-row" id="inspectForm">
+      <label class="field grow"><span>Key</span>
+        <input type="text" id="inspectKey" placeholder="dataset key, e.g. users:42" autocomplete="off">
+      </label>
+      <div class="field action"><button type="submit" class="btn primary">Lookup</button></div>
     </form>
 
     <div class="verdict" id="inspectVerdict"></div>
@@ -139,11 +167,15 @@
   </div>
 
   <div class="panel">
-    <h3>Browse keys by prefix <span class="muted">(uncached &mdash; always live)</span></h3>
-    <form class="search-bar" id="browseForm">
-      <input type="text" id="browsePrefix" placeholder="prefix, e.g. users: (blank = all keys)" value="">
-      <input type="number" id="browseLimit" value="25" min="1" max="500" class="narrow">
-      <button type="submit" class="btn primary">Browse</button>
+    <h3>Browse keys by prefix <span class="muted">uncached, always live</span></h3>
+    <form class="form-row" id="browseForm">
+      <label class="field grow"><span>Prefix</span>
+        <input type="text" id="browsePrefix" placeholder="e.g. users: (blank = all keys)" value="">
+      </label>
+      <label class="field narrow-f"><span>Limit</span>
+        <input type="number" id="browseLimit" value="25" min="1" max="500">
+      </label>
+      <div class="field action"><button type="submit" class="btn primary">Browse</button></div>
     </form>
     <div id="browseOut"></div>
   </div>
@@ -151,111 +183,135 @@
 
 <!-- ================= CACHE LAB ================= -->
 <section id="view-lab" class="view">
+  <div class="view-head">
+    <h2>Cache Lab</h2>
+    <p class="muted">Five repeatable experiments that turn the cache's behaviour into numbers you can watch. Every figure below covers <em>that run only</em> &mdash; the Dashboard's counters are cumulative instead.</p>
+  </div>
 
+  <!-- Lab 1 -->
   <div class="panel">
-    <h3>Lab 1 &mdash; search storm: prove the database load drops</h3>
-    <p class="muted">
-      Fire the same search N times. The first run touches SQLite; every
-      repeat is served from the cache cluster. Watch the two counters
-      diverge &mdash; that gap <em>is</em> the load this system took off the database.
-    </p>
-    <form class="search-bar" id="labForm">
-      <select id="labEntity" title="dataset to search"></select>
-      <input type="text" id="labQuery" value="" placeholder="keyword (blank = all rows)">
-      <input type="number" id="labCount" value="40" min="1" max="500" class="narrow" title="repetitions">
-      <input type="number" id="labDelay" value="25" min="0" max="1000" class="narrow" title="delay ms between requests">
-      <button type="submit" class="btn primary" id="labRun">Run</button>
-      <button type="button" class="btn ghost" id="labReset">Reset counters</button>
+    <h3>Lab 1 &mdash; search storm <span class="muted">does the database load actually drop?</span></h3>
+    <p class="note">Fire the same search N times: the first run touches SQLite, every repeat is served from a node.</p>
+
+    <form class="form-row" id="labForm">
+      <label class="field"><span>Dataset</span><select id="labEntity" title="dataset to search"></select></label>
+      <label class="field grow"><span>Keyword</span>
+        <input type="text" id="labQuery" value="" placeholder="blank = all rows">
+      </label>
+      <label class="field narrow-f"><span>Runs</span>
+        <input type="number" id="labCount" value="100" min="1" max="500" title="repetitions">
+      </label>
+      <label class="field narrow-f"><span>Delay ms</span>
+        <input type="number" id="labDelay" value="25" min="0" max="1000" title="delay between requests">
+      </label>
+      <div class="field action">
+        <button type="submit" class="btn primary" id="labRun">Run</button>
+        <button type="button" class="btn ghost" id="labReset">Reset</button>
+      </div>
     </form>
+
     <div class="lab-stats" id="labStats"></div>
     <div id="labChart"></div>
     <div class="lab-feed" id="labFeed"></div>
   </div>
 
+  <!-- Lab 2 -->
   <div class="panel">
-    <h3>Lab 2 &mdash; point-read storm with per-iteration eviction</h3>
-    <p class="muted">
-      Read one key N times. Without eviction every read after the first is a
-      pure cache hit; with "evict every iteration" each read pays a database
-      load &mdash; and the row must survive all of it (evict &ne; delete).
-    </p>
-    <form class="search-bar" id="prForm">
-      <input type="text" id="prKey" placeholder="key, e.g. users:1" autocomplete="off">
-      <input type="number" id="prCount" value="12" min="1" max="200" class="narrow" title="iterations">
-      <label class="toggle"><input type="checkbox" id="prEvict"> evict every iteration</label>
-      <button type="submit" class="btn primary" id="prRun">Run</button>
+    <h3>Lab 2 &mdash; point-read storm <span class="muted">with per-iteration eviction</span></h3>
+    <p class="note">Read one key N times. Without eviction every read after the first is a pure hit; with eviction each read pays a database load &mdash; and the row survives all of it (evict &ne; delete).</p>
+
+    <form class="form-row" id="prForm">
+      <label class="field grow"><span>Key</span>
+        <input type="text" id="prKey" placeholder="e.g. users:1" autocomplete="off">
+      </label>
+      <label class="field narrow-f"><span>Reads</span>
+        <input type="number" id="prCount" value="12" min="1" max="200" title="iterations">
+      </label>
+      <label class="field check"><input type="checkbox" id="prEvict"> <span>evict every iteration</span></label>
+      <div class="field action"><button type="submit" class="btn primary" id="prRun">Run</button></div>
     </form>
+
     <div class="lab-stats" id="prStats"></div>
     <div class="verdict" id="prVerdict"></div>
     <div class="lab-feed" id="prFeed"></div>
   </div>
 
+  <!-- Lab 3 -->
   <div class="panel">
-    <h3>Lab 3 &mdash; node failure drill</h3>
-    <p class="muted">
-      Stop a node and keep reading: the RF=2 replica (or the database) answers
-      instead. Start it again and watch it rejoin through
-      STARTING &rarr; warm-up &rarr; READY.
-    </p>
-    <form class="search-bar" id="drillForm">
-      <select id="drillNode" title="node to stop/start"></select>
-      <input type="text" id="drillKey" placeholder="key to read, e.g. users:1" autocomplete="off">
-      <input type="number" id="drillCount" value="8" min="1" max="50" class="narrow" title="reads per phase">
-      <button type="submit" class="btn primary" id="drillRun">Run drill</button>
+    <h3>Lab 3 &mdash; node failure drill <span class="muted">failover and warm-up</span></h3>
+    <p class="note">Stop a node and keep reading: the RF=2 replica (or the database) answers instead. Start it again and watch it rejoin through STARTING &rarr; warm-up &rarr; READY.</p>
+
+    <form class="form-row" id="drillForm">
+      <label class="field"><span>Node</span><select id="drillNode" title="node to stop/start"></select></label>
+      <label class="field grow"><span>Key</span>
+        <input type="text" id="drillKey" placeholder="e.g. users:1" autocomplete="off">
+      </label>
+      <label class="field narrow-f"><span>Reads / phase</span>
+        <input type="number" id="drillCount" value="8" min="1" max="50" title="reads per phase">
+      </label>
+      <div class="field action"><button type="submit" class="btn primary" id="drillRun">Run drill</button></div>
     </form>
+
     <div class="btn-row">
-      <button type="button" class="btn danger" id="drillStop" title="POST /cluster/nodes/{port}/stop">Stop selected node</button>
-      <button type="button" class="btn" id="drillStart" title="POST /cluster/nodes/{port}/start">Start selected node</button>
+      <button type="button" class="btn danger" id="drillStop" title="POST /cluster/nodes/{port}/stop">Stop node</button>
+      <button type="button" class="btn" id="drillStart" title="POST /cluster/nodes/{port}/start">Start node</button>
     </div>
+
     <div class="verdict" id="drillVerdict"></div>
     <div class="lab-feed" id="drillFeed"></div>
   </div>
 
+  <!-- Lab 4 -->
   <div class="panel">
-    <h3>Lab 4 &mdash; eviction burst</h3>
-    <p class="muted">
-      Write K fresh keys, evict them all from the cache, then read them back:
-      every value reloads from its surviving database row. Compare with
-      "delete from database" in the Inspector &mdash; that one leaves nothing to reload.
-    </p>
-    <form class="search-bar" id="burstForm">
-      <input type="text" id="burstPrefix" value="lab:burst:" class="narrow" style="flex:0 0 150px; text-align:left" title="key prefix">
-      <input type="number" id="burstCount" value="15" min="1" max="100" class="narrow" title="keys">
-      <button type="submit" class="btn primary" id="burstRun">Run burst</button>
+    <h3>Lab 4 &mdash; eviction burst <span class="muted">evict &ne; delete</span></h3>
+    <p class="note">Write K fresh keys, evict them all from the cache, then read them back: every value reloads from its surviving database row.</p>
+
+    <form class="form-row" id="burstForm">
+      <label class="field"><span>Prefix</span>
+        <input type="text" id="burstPrefix" value="lab:burst:" title="key prefix">
+      </label>
+      <label class="field narrow-f"><span>Keys</span>
+        <input type="number" id="burstCount" value="15" min="1" max="100" title="keys">
+      </label>
+      <div class="field action"><button type="submit" class="btn primary" id="burstRun">Run burst</button></div>
     </form>
+
     <div class="lab-stats" id="burstStats"></div>
     <div class="verdict" id="burstVerdict"></div>
   </div>
 
+  <!-- Lab 5 -->
   <div class="panel">
-    <h3>Lab 5 &mdash; LRU eviction, watched live</h3>
-    <p class="muted">
-      Drives <em>one</em> node directly &mdash; no hash-ring fan-out &mdash; and renders its
-      doubly linked list exactly as the cache holds it: HEAD &rarr; most recently used
-      &hellip; least recently used &rarr; TAIL. A read hops a key to the front; the next
-      overflow drops the node at the tail. Writes here are node-local (no database, no
-      replication), which is what keeps the demo deterministic.
-      Tip: the fill preset stops at 300 keys, so overflow demos work best on a
-      small-capacity node &mdash; start one
-      (<code>python main.py --port 8004 --capacity 20</code>) and attach it
-      (Cluster tab &rarr; scale to 4); it then appears in this selector.
-    </p>
-    <form class="search-bar" id="lruForm">
-      <select id="lruNode" title="node whose linked list you watch"></select>
-      <button type="submit" class="btn primary" id="lruFill"
-        title="insert lab:lru:N keys, one by one, until the tail gives one up">Fill to overflow</button>
-      <input type="number" id="lruCount" value="12" min="1" max="300" class="narrow"
-        title="keys to insert — preset to capacity − size + 1, the exact number that triggers one eviction">
-      <input type="number" id="lruDelay" value="80" min="0" max="1000" class="narrow"
-        title="delay ms between writes">
-      <input type="text" id="lruKey" placeholder="key — blank means the tail" autocomplete="off">
-      <button type="button" class="btn" id="lruTouch"
-        title="GET: a hit hops the key to HEAD, a miss touches nothing">Touch (GET)</button>
-      <button type="button" class="btn warn" id="lruDelete"
-        title="DELETE /cache on this node: unlinks the key by hand">Delete key</button>
-      <button type="button" class="btn ghost" id="lruClear"
-        title="prefix-flush every lab:lru: key on this node">Clear lab keys</button>
+    <h3>Lab 5 &mdash; LRU eviction, watched live <span class="muted">one node, no hash-ring fan-out</span></h3>
+    <p class="note">Renders the doubly linked list exactly as the cache holds it: HEAD &rarr; most recently used &hellip; least recently used &rarr; TAIL. A read hops a key to the front; the next overflow drops the node at the tail.</p>
+    <p class="note">Tip: fill stops at 300 keys, so overflow demos need a small-capacity node &mdash; run <code>python main.py --port 8004 --capacity 20</code> and attach it from the Cluster tab.</p>
+
+    <form class="form-row" id="lruForm">
+      <label class="field"><span>Node</span><select id="lruNode" title="node whose linked list you watch"></select></label>
+      <div class="field action">
+        <button type="submit" class="btn primary" id="lruFill"
+          title="insert lab:lru:N keys until the tail gives one up">Fill to overflow</button>
+      </div>
+      <label class="field narrow-f"><span>Keys</span>
+        <input type="number" id="lruCount" value="12" min="1" max="300"
+          title="keys to insert — preset to capacity − size + 1, the number that triggers one eviction">
+      </label>
+      <label class="field narrow-f"><span>Delay ms</span>
+        <input type="number" id="lruDelay" value="80" min="0" max="1000" title="delay between writes">
+      </label>
+      <label class="field grow"><span>Key</span>
+        <input type="text" id="lruKey" placeholder="blank = the tail (next victim)" autocomplete="off">
+      </label>
+      <div class="field action">
+        <button type="button" class="btn" id="lruTouch"
+          title="GET: a hit hops the key to HEAD">Touch</button>
+        <button type="button" class="btn warn" id="lruDelete"
+          title="DELETE /cache on this node: unlinks the key by hand">Delete</button>
+        <button type="button" class="btn ghost" id="lruClear"
+          title="prefix-flush every lab:lru: key on this node">Clear</button>
+      </div>
     </form>
+
     <div class="lab-stats" id="lruStats"></div>
     <div class="lru-strip" id="lruStrip"></div>
     <div class="lru-legend">
@@ -273,8 +329,8 @@
 </main>
 
 <footer class="foot">
-  <span>Layer 9 &mdash; the cluster and its datasets are fully manageable from this UI:
-  scale nodes, create datasets, add and delete entries, evict or delete keys.</span>
+  DCS &mdash; distributed cache, consistent hashing, replication, warm-up &amp; search caching.
+  Router on <code>:8000</code>, nodes on <code>:8001&ndash;8008</code>.
 </footer>
 
 <script src="app.js"></script>
