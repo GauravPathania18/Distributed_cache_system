@@ -89,33 +89,41 @@ Fastest signal that nothing regressed. No servers needed.
 pytest -q
 ```
 
-Expected: **303 passed** in ~55s, no failures, no errors.
+Expected: **376 passed, 1 skipped** in ~70s, no failures, no errors.
 
 Breakdown (for pinpointing a regression):
 
 | Module | Tests | Command to isolate |
 |---|---|---|
-| LRU cache engine | 14 | `pytest tests/test_cache.py -v` |
-| Consistent hashing | 16 | `pytest tests/test_consistent_hash.py -v` |
-| Router endpoints | 8 | `pytest tests/test_router.py -v` |
-| SQLite repository (+ read-only SQL) | 20 | `pytest tests/test_repository.py -v` |
-| Cache-aside service | 13 | `pytest tests/test_cache_service.py -v` |
-| Circuit breaker | 11 | `pytest tests/test_circuit_breaker.py -v` |
-| Single-flight coalescing | 5 | `pytest tests/test_single_flight.py -v` |
-| Node lifecycle (6.1) | 28 | `pytest tests/test_node_lifecycle.py -v` |
+| Cached search (8.1) | 39 | `pytest tests/test_search.py -v` |
+| Replication (7.2-7.6) | 37 | `pytest tests/test_replication.py -v` |
 | Dataset importer (files → per-dataset SQLite) | 29 | `pytest tests/test_import_dataset.py -v` |
-| Dataset registry (manifest + schema/key sniff) | 19 | `pytest tests/test_registry.py -v` |
-| Multi-dataset repository (prefix routing) | 15 | `pytest tests/test_multi_repository.py -v` |
+| Node lifecycle (6.1) | 28 | `pytest tests/test_node_lifecycle.py -v` |
+| Warm-up (6.3/6.4) | 28 | `pytest tests/test_warmup.py -v` |
+| Dataset registry (manifest + schema/key sniff) | 21 | `pytest tests/test_registry.py -v` |
+| SQLite repository (+ read-only SQL) | 20 | `pytest tests/test_repository.py -v` |
+| Multi-dataset repository (prefix routing) | 18 | `pytest tests/test_multi_repository.py -v` |
+| Cold-start seeding | 18 | `pytest tests/test_seeding.py -v` |
+| LRU cache engine | 16 | `pytest tests/test_cache.py -v` |
+| Consistent hashing | 16 | `pytest tests/test_consistent_hash.py -v` |
 | Statistics / hot keys (6.2) | 15 | `pytest tests/test_statistics.py -v` |
-| Warm-up (6.3/6.4) | 21 | `pytest tests/test_warmup.py -v` |
-| Node URL config | 6 | `pytest tests/test_config.py -v` |
-| Replication (7.2-7.6) | 34 | `pytest tests/test_replication.py -v` |
-| Cached search (8.1) | 25 | `pytest tests/test_search.py -v` |
+| Cache-aside service | 13 | `pytest tests/test_cache_service.py -v` |
+| Dataset admin routes (9) | 12 | `pytest tests/test_datasets_routes.py -v` |
+| Process manager (spawn / stop nodes) | 12 | `pytest tests/test_process_manager.py -v` |
+| Circuit breaker | 11 | `pytest tests/test_circuit_breaker.py -v` |
+| Cluster-control routes (9) | 9 | `pytest tests/test_manage_routes.py -v` |
+| Router endpoints | 9 | `pytest tests/test_router.py -v` |
 | Telemetry / DB-load metric (8.2) | 7 | `pytest tests/test_telemetry.py -v` |
+| Node URL config | 6 | `pytest tests/test_config.py -v` |
+| Single-flight coalescing | 5 | `pytest tests/test_single_flight.py -v` |
 | Dashboard + web UI (8.3) | 4 | `pytest tests/test_dashboard.py -v` |
+| LRU lab (Lab 5) | 4 | `pytest tests/test_lru_lab.py -v` |
 
-**Pass criteria:** 377 passed, 0 failed. Any other count means a
-lost/added test — diff against this table before suspecting the code.
+**Pass criteria:** 376 passed, 1 skipped, 0 failed. Any other count
+means a lost/added test — diff against this table before suspecting
+the code. The one skip is the Excel-import test, which needs the
+optional `requirements-import.txt` (openpyxl); install it and all
+377 run.
 
 **Data-safety check after the run** (proves tests are hermetic):
 
@@ -990,22 +998,28 @@ coalesced read is exactly one database hit, not one per request.
 
 ### 11.5 The UI end-to-end
 
-Open `http://127.0.0.1:8000/` and walk the four tabs:
+Open `http://127.0.0.1:8000/` and walk the six tabs:
 
 1. **Search** — run a query twice; watch the source banner flip
    amber → green. Toggle a facet; the chips update.
 2. **Dashboard** — every node's hit rate is 0–100, the telemetry
    panel matches the curl numbers, hot keys are listed.
-3. **Inspector** — enter `netflix_titles:s1`; cache and DB values agree.
+3. **Cluster** — scale up by one: a new node card appears, goes
+   through `STARTING` to `READY` and joins the ring. Scale back
+   down: the card is removed and the port is released.
+4. **Datasets** — create a scratch entity, open it to browse its
+   entries, add a JSON row, then delete the row and the entity.
+5. **Inspector** — enter `netflix_titles:s1`; cache and DB values agree.
    Browse the prefix `q:` to see the cached result sets themselves.
-4. **Cache Lab** — pick a query, iterations = 20, press **Run**.
-   The cumulative chart shows 1 SQL run then a flat line, with
-   `95.0%` (or thereabouts) reduction displayed.
+6. **Cache Lab** — pick a query, leave **Runs** at its default of
+   100, press **Run**. The cumulative chart shows 1 SQL run then a
+   flat line, with `99.0%` reduction displayed.
 
 Pass criteria: UI served at `/ui`, first search `database` then
 `cache`, facets filter correctly, telemetry shows `search_cache`
-climbing while `search_database` stays at 1, and the Cache Lab
-chart visibly plateaus.
+climbing while `search_database` stays at 1, the Cluster and
+Datasets tabs both mutate state without a page reload, and the
+Cache Lab chart visibly plateaus.
 
 ---
 
@@ -1015,7 +1029,7 @@ Copy this table into the session notes and tick every row.
 
 | # | Feature | Phase | Pass criteria |
 |---|---|---|---|
-| 1 | Test suite green | 0 | 377 passed |
+| 1 | Test suite green | 0 | 376 passed, 1 skipped |
 | 2 | Tests are hermetic | 0 | registry + dataset files unchanged after pytest |
 | 3 | Import dry-run (no servers) | 1 | plan printed, `nothing was written` |
 | 4 | Registry listing | 1 | one line per dataset, no traceback |
@@ -1064,15 +1078,17 @@ Copy this table into the session notes and tick every row.
 | 47 | Node entry carries sequence | 9 | `/internal/entry` shows sequence |
 | 48 | Manual resync + 404 | 9 | done; unknown node 404 |
 | 49 | Failover recorded on kill | 9 | last_failover + history, 2/3 |
-| 50 | Replication unit tests | 0 | 34 replication tests pass |
+| 50 | Replication unit tests | 0 | 37 replication tests pass |
 | 51 | UI served at /ui | 10 | `/` 307 redirect, `/ui` 200 HTML |
 | 52 | Search SQL then cache | 10 | 1st `database`, repeat `cache` |
 | 53 | Facets + entity filters | 10 | total only counts matching rows |
 | 54 | Unknown entity / bad sort | 10 | 422 / silent fallback, no crash |
 | 55 | Telemetry load reduction | 10 | `search_database` stays 1 |
-| 56 | Cache Lab demo | 10 | chart plateaus, ~95% reduction |
+| 56 | Cache Lab demo | 10 | chart plateaus, ~99% reduction |
+| 57 | Cluster scale ± from the UI | 10 | card appears, reaches `READY`, disappears on scale-down |
+| 58 | Datasets create / browse / delete | 10 | entity listed, entries readable, delete removes it |
 
-Result: ___/56 passed  |  Date: ______  |  Tester: ______
+Result: ___/58 passed  |  Date: ______  |  Tester: ______
 
 ---
 
@@ -1130,7 +1146,7 @@ Get-NetTCPConnection -LocalPort 8001,8002,8003 -State Listen `
 
 For a fast "is it basically alive?" check between larger changes:
 
-1. `pytest -q` → 377 passed (Phase 0)
+1. `pytest -q` → 376 passed, 1 skipped (Phase 0)
 2. `python run.py --seed` → seeds datasets/, then `/cluster/status` shows 3/3 ready (Phase 3)
 3. `curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1` twice → `database` then `cache`
 4. Web UI Inspector → `netflix_titles:s1` → `CONSISTENT`

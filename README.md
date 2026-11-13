@@ -10,7 +10,7 @@ recovery when the cluster restarts.
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
 - **Web UI:** http://127.0.0.1:8000/ (vanilla HTML/JS, no build step)
-- **Tests:** pytest — 386 tests
+- **Tests:** pytest — 377 tests (376 passed, 1 skipped)
 
 ---
 
@@ -164,8 +164,9 @@ the circuit breaker, hot keys and the replication log. The
 browse a prefix — including the `q:` result sets themselves. The
 **Cache Lab** runs a fixed query N times and charts the cumulative
 cache hits against SQL queries, making the DB-load-reduction number
-visibly obvious (e.g. 20 runs → 1 SQL + 19 cache hits = 95%
-reduction). Telemetry is counted on real operations in
+visibly obvious: **100 runs by default → 1 SQL + 99 cache hits = 99%
+reduction** (the first request has to miss, so a 20-run demo reads
+95%). Telemetry is counted on real operations in
 `services/telemetry.py`, not on HTTP requests, so a single-flight
 coalesced read counts exactly one database hit.
 
@@ -190,8 +191,9 @@ the deletion path is split in two: `DELETE /cache/{key}` only **evicts**
 the node copies (the database row survives — 404 when no node held
 it), while `DELETE /db/{key}` **deletes** the row everywhere
 (database + node copies + search caches). The Inspector shows both
-buttons side by side, and the **Lab** adds a node-failure drill and
-an eviction burst next to the search/point-read storms.
+buttons side by side, and the **Lab** grew into five repeatable
+experiments: the search storm, the point-read storm, a node-failure
+drill, an eviction burst, and a live LRU-eviction watcher.
 
 ---
 
@@ -314,7 +316,7 @@ examples in [`commands.md`](commands.md).
 | **Cluster** | Scale ±/set the cluster, per-node cards with state, process (owned/attached/stopped), PID, stats and start/stop/restart buttons; auto-refreshes every 3 s |
 | **Datasets** | Create an entity (new isolated DB), browse its entries, add a JSON row, delete single rows or the whole dataset |
 | **Inspector** | Inspect any key and browse a prefix — with the split **Evict from cache** / **Delete from database** buttons and a verdict line |
-| **Lab** | Search storm (entity selectable), point-read storm, node-failure drill (kill a node mid-run) and eviction burst — each with a live verdict |
+| **Lab** | Five repeatable experiments — Lab 1 search storm (entity selectable, 100 runs by default), Lab 2 point-read storm, Lab 3 node-failure drill (kill a node mid-run), Lab 4 eviction burst and Lab 5 live LRU eviction — each with a live verdict |
 
 ---
 
@@ -324,7 +326,7 @@ examples in [`commands.md`](commands.md).
 pytest -v
 ```
 
-Expected: **377 passed** — 39 search + 37 replication +
+Expected: **376 passed, 1 skipped** (377 collected) — 39 search + 37 replication +
 29 dataset import + 28 node lifecycle + 28 warm-up + 21 registry +
 20 repository + 18 multi-dataset repository + 18 seeding + 16 cache +
 16 consistent hash + 15 statistics + 13 cache-service +
@@ -332,6 +334,9 @@ Expected: **377 passed** — 39 search + 37 replication +
 11 circuit-breaker + 9 cluster-control routes + 9 router +
 7 telemetry + 6 config + 5 single-flight + 4 LRU lab +
 4 dashboard.
+
+The one skip is the Excel-import test, which needs the optional
+`requirements-import.txt` (openpyxl). Install it and all 377 run.
 
 ### Bringing your own data
 
