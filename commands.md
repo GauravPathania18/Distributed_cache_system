@@ -190,29 +190,29 @@ Then in a second terminal:
 # http://localhost:8001/docs
 
 # Health check
-curl http://localhost:8001/health
+curl.exe http://localhost:8001/health
 
 # SET a value with a 60s TTL
-curl -X PUT http://localhost:8001/cache/user:101 `
+curl.exe -X PUT http://localhost:8001/cache/user:101 `
   -H "Content-Type: application/json" `
   -d '{"value":{"name":"Gaurav","age":21},"ttl":60}'
 
 # GET it back
-curl http://localhost:8001/cache/user:101
+curl.exe http://localhost:8001/cache/user:101
 
 # EXISTS check
-curl http://localhost:8001/cache/user:101/exists
+curl.exe http://localhost:8001/cache/user:101/exists
 
 # DELETE
-curl -X DELETE http://localhost:8001/cache/user:101
+curl.exe -X DELETE http://localhost:8001/cache/user:101
 
 # Stats (hits / misses / hit_rate / evictions)
-curl http://localhost:8001/stats
+curl.exe http://localhost:8001/stats
 
 # Layer 6.2 - current statistics window + hottest keys
-curl http://localhost:8001/stats/window
-curl "http://localhost:8001/stats/window?limit=5"
-curl "http://localhost:8001/stats/top-keys?limit=10"
+curl.exe http://localhost:8001/stats/window
+curl.exe "http://localhost:8001/stats/window?limit=5"
+curl.exe "http://localhost:8001/stats/top-keys?limit=10"
 ```
 
 Missing keys return HTTP 404 `{"detail": "Cache miss"}`.
@@ -308,7 +308,7 @@ Architecture now running:
 ### Check cluster status
 
 ```powershell
-curl http://localhost:8000/cluster/status
+curl.exe http://localhost:8000/cluster/status
 ```
 
 Returns:
@@ -339,7 +339,7 @@ every known node — see Layer 6.1.
 ### PUT (replicated to primary + replica)
 
 ```powershell
-curl -X PUT http://localhost:8000/cache/user:101 `
+curl.exe -X PUT http://localhost:8000/cache/user:101 `
   -H "Content-Type: application/json" `
   -d '{"value":{"name":"Gaurav","age":21},"ttl":300}'
 ```
@@ -358,13 +358,13 @@ Response shows which nodes received the copy:
 ### GET (tries primary, falls back to replica)
 
 ```powershell
-curl http://localhost:8000/cache/user:101
+curl.exe http://localhost:8000/cache/user:101
 ```
 
 ### DELETE (invalidates both primary and replica)
 
 ```powershell
-curl -X DELETE http://localhost:8000/cache/user:101
+curl.exe -X DELETE http://localhost:8000/cache/user:101
 ```
 
 ### Live fault-tolerance demo
@@ -372,7 +372,7 @@ curl -X DELETE http://localhost:8000/cache/user:101
 1. Store a key:
 
 ```powershell
-curl -X PUT http://localhost:8000/cache/user:101 `
+curl.exe -X PUT http://localhost:8000/cache/user:101 `
   -H "Content-Type: application/json" `
   -d '{"value":"Gaurav","ttl":300}'
 ```
@@ -397,7 +397,7 @@ curl -X PUT http://localhost:8000/cache/user:101 `
 4. **GET still works** via the replica:
 
 ```powershell
-curl http://localhost:8000/cache/user:101
+curl.exe http://localhost:8000/cache/user:101
 # => "Gaurav"
 ```
 
@@ -420,7 +420,7 @@ python main.py --port 8002 --capacity 5000
 7. Node 2 rejoins the ring. Check:
 
 ```powershell
-curl http://localhost:8000/cluster/status
+curl.exe http://localhost:8000/cluster/status
 ```
 
 > **Note:** When a node rejoins, its local cache is empty.
@@ -459,7 +459,7 @@ try the commands below.
 ### PUT — writes to database + cache
 
 ```powershell
-curl -X PUT http://localhost:8000/cache/user:42 `
+curl.exe -X PUT http://localhost:8000/cache/user:42 `
   -H "Content-Type: application/json" `
   -d '{"value":{"name":"Gaurav","age":20},"ttl":300}'
 ```
@@ -467,7 +467,7 @@ curl -X PUT http://localhost:8000/cache/user:42 `
 ### GET — served from cache
 
 ```powershell
-curl http://localhost:8000/cache/user:42
+curl.exe http://localhost:8000/cache/user:42
 ```
 
 ```json
@@ -486,7 +486,7 @@ The simplest way is to restart the nodes, or hit each node's
 `/cache/{key}` DELETE endpoint on ports 8001-8003. Then:
 
 ```powershell
-curl http://localhost:8000/cache/user:42
+curl.exe http://localhost:8000/cache/user:42
 ```
 
 ```json
@@ -504,10 +504,10 @@ Request it once more — it is now back in the cache (`source: "cache"`).
 
 ```powershell
 # Read straight from SQLite (bypasses the cache)
-curl http://localhost:8000/db/user:42
+curl.exe http://localhost:8000/db/user:42
 
 # Delete straight from SQLite (cache is NOT touched)
-curl -X DELETE http://localhost:8000/db/user:42
+curl.exe -X DELETE http://localhost:8000/db/user:42
 ```
 
 > These `/db/*` endpoints exist only to make the cache-aside behavior
@@ -554,7 +554,7 @@ only cache misses cannot be satisfied.
 ### Inspect the breaker
 
 ```powershell
-curl http://localhost:8000/circuit-breaker/status
+curl.exe http://localhost:8000/circuit-breaker/status
 ```
 
 ```json
@@ -581,13 +581,13 @@ Move-Item data\cache.db data\cache.db.bak
 3. A cache miss now returns **503**:
 
 ```powershell
-curl http://localhost:8000/cache/user:404
+curl.exe http://localhost:8000/cache/user:404
 ```
 
 4. After 3 failures the breaker is OPEN and the router answers fast:
 
 ```powershell
-curl http://localhost:8000/circuit-breaker/status
+curl.exe http://localhost:8000/circuit-breaker/status
 # state: "open"
 ```
 
@@ -723,7 +723,7 @@ Tests and demos call `configure_cluster(...)`, which bootstraps as
 ### Inspect the lifecycle
 
 ```powershell
-curl http://localhost:8000/cluster/status
+curl.exe http://localhost:8000/cluster/status
 ```
 
 ```json
@@ -771,7 +771,7 @@ python main.py --port 8002 --capacity 5000
 6. Verify:
 
 ```powershell
-curl http://localhost:8000/cluster/status
+curl.exe http://localhost:8000/cluster/status
 ```
 
 ### Layer 6.1 tests
@@ -840,7 +840,7 @@ hit_rate = hits / (hits + misses)        # 0.92 == 92%
 
 ```powershell
 # Current window: counters + hit rate + hottest keys + last_window
-curl "http://localhost:8001/stats/window?limit=5"
+curl.exe "http://localhost:8001/stats/window?limit=5"
 ```
 
 ```json
@@ -864,7 +864,7 @@ curl "http://localhost:8001/stats/window?limit=5"
 
 ```powershell
 # Just the ranking
-curl "http://localhost:8001/stats/top-keys?limit=10"
+curl.exe "http://localhost:8001/stats/top-keys?limit=10"
 ```
 
 ```json
@@ -889,14 +889,14 @@ LRU hit percentage).
 
 ```powershell
 # Generate some traffic against a running node (Layer 4 setup)
-curl -X PUT http://localhost:8001/cache/user:42 `
+curl.exe -X PUT http://localhost:8001/cache/user:42 `
   -H "Content-Type: application/json" `
   -d '{"value":"Gaurav","ttl":300}'
 
-curl http://localhost:8001/cache/user:42     # hit
-curl http://localhost:8001/cache/nope        # 404 -> miss
+curl.exe http://localhost:8001/cache/user:42     # hit
+curl.exe http://localhost:8001/cache/nope        # 404 -> miss
 
-curl "http://localhost:8001/stats/top-keys?limit=5"
+curl.exe "http://localhost:8001/stats/top-keys?limit=5"
 ```
 
 ### Configuration
@@ -1011,13 +1011,13 @@ everything else loads lazily on cache MISS.
 
 ```powershell
 # Merged cluster hot-key ranking (+ per-node window summaries)
-curl "http://localhost:8000/cluster/hot-keys?limit=10&per_node=100"
+curl.exe "http://localhost:8000/cluster/hot-keys?limit=10&per_node=100"
 
 # Warm-up state per node
-curl http://localhost:8000/cluster/warmup
+curl.exe http://localhost:8000/cluster/warmup
 
 # Manually (re)start a warm-up for one node
-curl -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A8001"
+curl.exe -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A8001"
 ```
 
 ```json
@@ -1081,23 +1081,23 @@ uvicorn router.router:app --port 8000
 ```powershell
 # 1. Generate traffic through the router (feeds both views)
 1..10 | ForEach-Object {
-  curl -X PUT http://localhost:8000/cache/user:42 `
+  curl.exe -X PUT http://localhost:8000/cache/user:42 `
     -H "Content-Type: application/json" -d '{"value":"Gaurav","ttl":300}'
-  curl http://localhost:8000/cache/user:42 | Out-Null
+  curl.exe http://localhost:8000/cache/user:42 | Out-Null
 }
 
 # 2. Inspect the merged hot list
-curl "http://localhost:8000/cluster/hot-keys?limit=5"
+curl.exe "http://localhost:8000/cluster/hot-keys?limit=5"
 
 # 3. Kill a node (Ctrl+C its terminal), then restart it:
 python main.py --port 8001
 
 # 4. Watch it recover: state=running -> done, then READY
-curl http://localhost:8000/cluster/warmup
-curl http://localhost:8000/cluster/status
+curl.exe http://localhost:8000/cluster/warmup
+curl.exe http://localhost:8000/cluster/status
 
 # 5. Or drive a warm-up manually for any node
-curl -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A8002"
+curl.exe -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A8002"
 ```
 
 On a **cold boot** (no statistics yet) warm-up completes instantly
@@ -1215,8 +1215,8 @@ Notes:
 
 ```powershell
 python import_dataset.py --file datasets/users.csv
-curl http://localhost:8000/cache/users:42    # source: "database" first, then "cache"
-curl http://localhost:8000/db/users:42       # straight from the dataset's SQLite file
+curl.exe http://localhost:8000/cache/users:42    # source: "database" first, then "cache"
+curl.exe http://localhost:8000/db/users:42       # straight from the dataset's SQLite file
 ```
 
 ### Inspect what is registered
@@ -1279,22 +1279,22 @@ Six tabs:
 ```powershell
 # One entity per imported dataset (name + filters/sorts generated
 # from its sniffed schema)
-curl http://127.0.0.1:8000/search/entities
+curl.exe http://127.0.0.1:8000/search/entities
 
 # Keyword search — first run hits the database, the repeat is cached.
 # The entity name is your dataset's name (see import_dataset.py --list).
-curl "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=desc&page_size=8"
-curl "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=desc&page_size=8"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=desc&page_size=8"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?q=breaking&sort=release_year&dir=desc&page_size=8"
 
 # Faceted filters — parameter names come from /search/entities
-curl "http://127.0.0.1:8000/search/netflix_titles?type=Movie&release_year_min=2018&release_year_max=2021"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles?type=Movie&release_year_min=2018&release_year_max=2021"
 
 # Autocomplete suggestions (cached separately)
-curl "http://127.0.0.1:8000/search/netflix_titles/suggest?field=type&q=tv"
+curl.exe "http://127.0.0.1:8000/search/netflix_titles/suggest?field=type&q=tv"
 
 # Browse dataset keys, or the cached q: result sets themselves
-curl "http://127.0.0.1:8000/browse/prefix?prefix=netflix_titles:&limit=10"
-curl "http://127.0.0.1:8000/browse/prefix?prefix=q:&limit=10"
+curl.exe "http://127.0.0.1:8000/browse/prefix?prefix=netflix_titles:&limit=10"
+curl.exe "http://127.0.0.1:8000/browse/prefix?prefix=q:&limit=10"
 ```
 
 Every search response carries `source` (`database` | `cache`),
@@ -1309,10 +1309,10 @@ read counts exactly one database hit.
 
 ```powershell
 # Current counters
-curl http://127.0.0.1:8000/dashboard/aggregate | python -m json.tool
+curl.exe http://127.0.0.1:8000/dashboard/aggregate | python -m json.tool
 
 # Reset before a demo
-curl -X POST http://127.0.0.1:8000/dashboard/telemetry/reset
+curl.exe -X POST http://127.0.0.1:8000/dashboard/telemetry/reset
 ```
 
 ### The Cache Lab demo
@@ -1353,19 +1353,19 @@ but each action is a plain endpoint you can curl.
 
 ```powershell
 # What is running right now: state, PID, process ownership, cache stats
-curl http://127.0.0.1:8000/cluster/nodes
+curl.exe http://127.0.0.1:8000/cluster/nodes
 
 # Scale to 4 nodes - spawns/adopts a real main.py process, which then
 # gates through health -> warm-up -> READY
-curl -X POST http://127.0.0.1:8000/cluster/nodes -H "Content-Type: application/json" -d '{"target": 4}'
+curl.exe -X POST http://127.0.0.1:8000/cluster/nodes -H "Content-Type: application/json" -d '{"target": 4}'
 
 # Scale back down - highest ports leave first, their processes stop
-curl -X POST http://127.0.0.1:8000/cluster/nodes -H "Content-Type: application/json" -d '{"target": 3}'
+curl.exe -X POST http://127.0.0.1:8000/cluster/nodes -H "Content-Type: application/json" -d '{"target": 3}'
 
 # Individual lifecycle, once the node exists
-curl -X POST http://127.0.0.1:8000/cluster/nodes/8004/stop
-curl -X POST http://127.0.0.1:8000/cluster/nodes/8004/start
-curl -X POST http://127.0.0.1:8000/cluster/nodes/8004/restart
+curl.exe -X POST http://127.0.0.1:8000/cluster/nodes/8004/stop
+curl.exe -X POST http://127.0.0.1:8000/cluster/nodes/8004/start
+curl.exe -X POST http://127.0.0.1:8000/cluster/nodes/8004/restart
 ```
 
 A port that already answers `/health` is **adopted**, never spawned
@@ -1380,27 +1380,27 @@ own search entity.
 
 ```powershell
 # Everything registered: prefix, schema and live row count
-curl http://127.0.0.1:8000/datasets
+curl.exe http://127.0.0.1:8000/datasets
 
 # Create a new entity (key_column = the column that becomes the key)
-curl -X POST http://127.0.0.1:8000/datasets -H "Content-Type: application/json" -d '{"name": "scratch", "key_column": "id"}'
+curl.exe -X POST http://127.0.0.1:8000/datasets -H "Content-Type: application/json" -d '{"name": "scratch", "key_column": "id"}'
 
 # Inspect it
-curl http://127.0.0.1:8000/datasets/scratch
+curl.exe http://127.0.0.1:8000/datasets/scratch
 
 # Page through its rows (limit 1-500, offset >= 0)
-curl "http://127.0.0.1:8000/datasets/scratch/entries?limit=20&offset=0"
+curl.exe "http://127.0.0.1:8000/datasets/scratch/entries?limit=20&offset=0"
 
 # Add one row - the key is derived server-side (declared key column,
 # then "id", then the next free number); re-posting an id upserts
-curl -X POST http://127.0.0.1:8000/datasets/scratch/entries -H "Content-Type: application/json" -d '{"value": {"id": 1, "title": "hello"}}'
+curl.exe -X POST http://127.0.0.1:8000/datasets/scratch/entries -H "Content-Type: application/json" -d '{"value": {"id": 1, "title": "hello"}}'
 
 # Delete one row everywhere (DB row + node copies + search caches)
-curl -X DELETE "http://127.0.0.1:8000/datasets/scratch/entries?key=scratch:1"
+curl.exe -X DELETE "http://127.0.0.1:8000/datasets/scratch/entries?key=scratch:1"
 
 # Delete the whole dataset: node copies by prefix, search caches,
 # replication-log entries, manifest row and the SQLite file
-curl -X DELETE http://127.0.0.1:8000/datasets/scratch
+curl.exe -X DELETE http://127.0.0.1:8000/datasets/scratch
 ```
 
 Every mutation purges the affected `q:`/`s:` search caches on disk
