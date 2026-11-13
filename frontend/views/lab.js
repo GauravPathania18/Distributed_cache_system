@@ -112,7 +112,7 @@
     box.innerHTML = "";
     box.appendChild(statCard("Cache hits", cacheHits, "served with 0 SQL", "good"));
     box.appendChild(statCard("SQL queries", dbRuns, "database actually touched"));
-    box.appendChild(statCard("Load reduction", `${pct}%`, "of all requests", "accent"));
+    box.appendChild(statCard("Load reduction", `${pct}%`, `this run · ${cacheHits + dbRuns} requests of one query`, "accent"));
     const c = avg(results.filter((r) => r.hit).map((r) => r.ms));
     const d = avg(results.filter((r) => !r.hit).map((r) => r.ms));
     box.appendChild(statCard("Avg cache", c == null ? "—" : `${c.toFixed(1)} ms`, "per cached request"));

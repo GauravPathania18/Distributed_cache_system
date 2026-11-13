@@ -27,7 +27,8 @@ function el(tag, attrs = {}, children = []) {
   }
   for (const c of [].concat(children)) {
     if (c === null || c === undefined) continue;
-    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    // Nodes pass through; strings, numbers and booleans become text.
+    node.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
   }
   return node;
 }
@@ -489,7 +490,7 @@ function renderStatCards(d) {
     el("div", { class: "sub" }, sub || ""),
   ]);
   box.appendChild(card("DB load reduction", `${t.db_load_reduction_pct ?? 0}%`,
-    `${(t.db_reads_avoided ?? 0).toLocaleString()} reads served without SQL`, "good"));
+    `${(t.db_reads_avoided ?? 0).toLocaleString()} reads served without SQL · since boot, across all queries`, "good"));
   box.appendChild(card("SQL queries issued", (t.db_reads ?? 0).toLocaleString(),
     `${(t.search_database ?? 0)} from search · ${t.gets_database ?? 0} point reads`));
   box.appendChild(card("Reads avoided", (t.db_reads_avoided ?? 0).toLocaleString(),
