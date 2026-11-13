@@ -45,7 +45,7 @@ datasets/
 # report (drafts, exports, backups, screenshots, generated figures, bench
 # scripts and their JSON results) and is deliberately never committed.
 # ---------------------------------------------------------------------------
-/DCS_Capstone_Report_v1*.docx
-/DCS_Capstone_Report_v1*.pdf
-/PersonalLLM_Capstone_Report_v7*.docx
+/DCS_Capstone_Report_*.docx
+/DCS_Capstone_Report_*.pdf
+/PersonalLLM_Capstone_Report_*.docx
 /_report_bench/
