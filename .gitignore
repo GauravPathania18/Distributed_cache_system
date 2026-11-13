@@ -39,3 +39,13 @@ datasets/
 
 # Research papers
 /DCS_research
+
+# ---------------------------------------------------------------------------
+# Capstone report artifacts. Everything below is produced for the written
+# report (drafts, exports, backups, screenshots, generated figures, bench
+# scripts and their JSON results) and is deliberately never committed.
+# ---------------------------------------------------------------------------
+/DCS_Capstone_Report_v1*.docx
+/DCS_Capstone_Report_v1*.pdf
+/PersonalLLM_Capstone_Report_v7*.docx
+/_report_bench/
