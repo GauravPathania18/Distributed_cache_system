@@ -16,6 +16,10 @@ python -m venv .venv
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional: Parquet/Excel imports (the suite's Excel test skips
+# without them — 376 passed + 1 skipped instead of 377 passed)
+pip install -r requirements-import.txt
 ```
 
 You should see `(venv)` in your prompt. Re-activate it whenever you
@@ -29,10 +33,13 @@ DCS/
 ├── .venv/                <- virtual environment (packages)
 ├── cache/                <- Layer 1 + 6.2/6.3: LRU cache engine
 │   ├── __init__.py
-│   ├── hot_keys.py         <- Layer 6.3: cluster-wide hot-key ranking
+│   ├── _cache_stats.py      <- size()/stats()/keys() inspection mixin
+│   ├── _linked_list_ops.py  <- O(1) list pointer + eviction ops
+│   ├── _load_state.py       <- per-key load record for get_or_set
+│   ├── hot_keys.py          <- Layer 6.3: cluster-wide hot-key ranking
 │   ├── lru_cache.py
 │   ├── node.py
-│   └── statistics.py       <- Layer 6.2: hit/miss counters + hot keys
+│   └── statistics.py        <- Layer 6.2: hit/miss counters + hot keys
 ├── cluster/              <- Layer 4 + 6.1/6.3: cluster management
 │   ├── __init__.py
 │   ├── consistent_hash.py   <- hashing + ring views (with_node)
@@ -76,7 +83,8 @@ DCS/
 │   ├── style.css
 │   ├── app.js                <- shell + the Search and Dashboard views
 │   └── views/                <- cluster, datasets, inspector, lab
-├── tests/                <- test suite
+├── tests/                <- test suite (23 modules, 377 tests)
+│   ├── __init__.py
 │   ├── conftest.py         <- points tests at a throwaway database
 │   ├── test_cache.py
 │   ├── test_consistent_hash.py
@@ -116,7 +124,8 @@ DCS/
 ├── README.md
 ├── PROJECT_GUIDE.md
 ├── TESTING_GUIDE.md
-└── commands.md
+├── commands.md
+└── LICENSE
 ```
 
 ---
@@ -170,8 +179,8 @@ unaffected (curl tries both instantly).
 pytest tests/test_cache.py -v
 ```
 
-Expected: 14 tests pass (LRU eviction, TTL, stats, cache-stampede
-prevention with get_or_set, etc.).
+Expected: 16 tests pass (LRU eviction, TTL, stats, prefix delete,
+cache-stampede prevention with get_or_set, etc.).
 
 ---
 
@@ -213,6 +222,12 @@ curl.exe http://localhost:8001/stats
 curl.exe http://localhost:8001/stats/window
 curl.exe "http://localhost:8001/stats/window?limit=5"
 curl.exe "http://localhost:8001/stats/top-keys?limit=10"
+
+# LRU recency order (MRU -> LRU): index 0 is the most recently used
+# key, the last entry is what the next overflow evicts.
+# This is the endpoint Lab 5 watches; the router proxies it as
+# GET /cluster/nodes/8001/cache-state (Layer 9).
+curl.exe http://localhost:8001/stats/lru
 ```
 
 Missing keys return HTTP 404 `{"detail": "Cache miss"}`.
@@ -361,11 +376,18 @@ Response shows which nodes received the copy:
 curl.exe http://localhost:8000/cache/user:101
 ```
 
-### DELETE (invalidates both primary and replica)
+### DELETE (evicts every cache copy — the database row stays)
 
 ```powershell
 curl.exe -X DELETE http://localhost:8000/cache/user:101
+# => {"status":"evicted","key":"user:101","database":"kept",
+#     "nodes":["http://localhost:8001","http://localhost:8002"]}
 ```
+
+Since Layer 9 the router's `DELETE /cache/{key}` only **evicts** the
+copies on the owning nodes; the SQLite row survives and the next read
+reloads it. Deleting the data itself is `DELETE /db/{key}` (see Layer 5
+and Layer 9).
 
 ### Live fault-tolerance demo
 
@@ -450,8 +472,10 @@ CacheService
 ```
 
 GET flow: cache HIT → return; cache MISS → database → populate cache →
-return. SET writes to database **then** cache. DELETE removes from
-database **and** invalidates the cache.
+return. SET writes to database **then** cache. Deletion is split
+(Layer 9): `DELETE /cache/{key}` **evicts** the node copies and keeps
+the row, `DELETE /db/{key}` **deletes** the row and cascades that
+eviction with it.
 
 Start the nodes and router exactly as in Layer 4 (4 terminals), then
 try the commands below.
@@ -500,24 +524,33 @@ curl.exe http://localhost:8000/cache/user:42
 
 Request it once more — it is now back in the cache (`source: "cache"`).
 
-### Direct database endpoints (TEMPORARY — for testing only)
+### Direct database endpoints (source of truth, bypasses cache-aside)
 
 ```powershell
 # Read straight from SQLite (bypasses the cache)
 curl.exe http://localhost:8000/db/user:42
 
-# Delete straight from SQLite (cache is NOT touched)
+# Delete the row EVERYWHERE: DB row + node copies + any q:/s:
+# search caches that referenced it (write-invalidate, so no read can
+# re-populate a stale copy)
 curl.exe -X DELETE http://localhost:8000/db/user:42
 ```
 
-> These `/db/*` endpoints exist only to make the cache-aside behavior
-> observable while developing. They are not part of the final design.
+> Since Layer 9 these endpoints are a permanent part of the API, not
+> a debugging leftover: this `DELETE` is the **delete** half of the
+> deletion split, `DELETE /cache/{key}` is the **evict** half. To
+> manufacture a mismatch for the Inspector (`STALE` / `PARTIAL`),
+> write a divergent value straight onto a node instead — a node-level
+> `PUT http://127.0.0.1:8001/cache/user:42` (or the router's
+> per-node proxy, Layer 9) touches only that node's RAM and leaves
+> the database row alone.
 
 ### Layer 5 tests
 
 ```powershell
 pytest tests/test_repository.py tests/test_cache_service.py -v
 pytest tests/test_router.py -v
+pytest tests/test_circuit_breaker.py tests/test_single_flight.py -v
 ```
 
 - `test_repository.py` — SQLite CRUD + JSON round-trip.
@@ -574,7 +607,7 @@ curl.exe http://localhost:8000/circuit-breaker/status
 2. Delete/corrupt the SQLite file so it cannot open:
 
 ```powershell
-Stop-Service -NoWait  # or simply move data/cache.db away
+# Move the database away (no such thing as a "SQLite service")
 Move-Item data\cache.db data\cache.db.bak
 ```
 
@@ -1041,10 +1074,13 @@ curl.exe -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A
     "enabled": true,
     "limit": 1000,
     "rate_limit": 100,
+    "seed": {"strategy": "popular", "per_dataset": 250,
+             "fill_ratio": 0.6, "fallback_capacity": 100},
     "hot_keys": {"tracked_keys": 342, "max_keys": 10000, "untracked": 0},
     "nodes": {
         "http://localhost:8001": {
             "state": "done",
+            "source": "hot_keys",
             "attempts": 1,
             "keys_attempted": 4,
             "keys_loaded": 3,
@@ -1057,6 +1093,11 @@ curl.exe -X POST "http://localhost:8000/cluster/warmup/http%3A%2F%2Flocalhost%3A
     }
 }
 ```
+
+`seed` reports the Layer 6.5 cold-start policy (`null` when
+`SEED_ENABLED=off`) and each node's `source` says which pool filled
+it: `hot_keys` (traffic history reloaded) or `seed` (empty ranking →
+data-driven cold start, see the next section).
 
 Warm-up states: `pending → running → done | failed` (plus
 `disabled`). A manual trigger on an unknown node returns 404.
@@ -1129,6 +1170,216 @@ pytest tests/test_warmup.py -v
 - Double `ensure()` dedupes; disabled mode gates nothing
 - Endpoints: `/cluster/hot-keys` (merge + shape),
   `/cluster/warmup` (status + manual trigger + 404)
+
+---
+
+## Layer 6.5 - Cold-start seeding (what an empty cache starts with)
+
+Warm-up answers "what did the cluster *learn* is hot?" — a
+brand-new boot has learned nothing yet, so every node would come up
+empty (first request = a database miss for everything). Seeding
+decides the first contents from the **data** instead:
+
+```
+fresh boot (router hot-key ranking is EMPTY)
+        │
+        ▼
+per dataset: rank rows by its popularity column
+   (score / aggregate_rating / release_year / ... — the same default
+    sort the Search tab shows; SEED_STRATEGY=random samples instead)
+        │
+        ▼
+top SEED_PER_DATASET rows per dataset → interleaved across datasets
+        │
+        ▼
+ownership filter — computed on the DECLARED membership, so during a
+full boot every node gets a distinct slice, not the same top keys
+        │
+        ▼
+budget = node capacity × SEED_FILL_RATIO  (capacity read from /stats)
+        │
+        ▼
+normal warm-up mechanics: rate-limited DB reads → direct writes →
+warm-up done + recovery_threshold → READY → rejoin the ring
+```
+
+Rules:
+
+- The seeder only speaks while the ranking is **empty**. The moment
+  any traffic history exists, hot keys win and seeding steps aside.
+- The `capacity × SEED_FILL_RATIO` budget means seeding can never
+  overflow a node and evict its own seeds; the rest of the LRU stays
+  free for live traffic.
+- Seeds are a starting set, not a reservation: cache-aside and LRU
+  eviction take over immediately (every access moves a key back to
+  the MRU front).
+- A fresh process also skips the replication snapshot (its log is
+  empty), so persisted `q:`/`s:` search rows regenerate through
+  normal write-through and the initial cache is exactly the seeded
+  subset.
+
+### Observing it
+
+```powershell
+# Policy + per-node outcome
+curl.exe http://127.0.0.1:8000/cluster/warmup
+
+# What the freshly seeded node is actually holding: the recency list
+# (seeded keys were written directly, so they are in the LRU even
+# though they have never been *read* yet)
+curl.exe "http://127.0.0.1:8001/stats/lru"
+```
+
+```json
+{
+    "seed": {"strategy": "popular", "per_dataset": 250,
+             "fill_ratio": 0.6, "fallback_capacity": 100},
+    "nodes": {
+        "http://127.0.0.1:8001": {
+            "state": "done",
+            "source": "seed",
+            "keys_attempted": 340,
+            "keys_loaded": 333
+        }
+    }
+}
+```
+
+`seed` is `null` when `SEED_ENABLED=off`; `source` is `"hot_keys"`
+instead whenever traffic history existed. `keys_loaded` varies with
+dataset size and cluster width — it is the keys this node *owns*,
+capped by its seed budget.
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SEED_ENABLED` | `on` | Master switch (off = no seeder wired, old empty cold start) |
+| `SEED_STRATEGY` | `popular` | `popular` (top rows per dataset's popularity column) or `random` |
+| `SEED_FILL_RATIO` | `0.6` | Fraction of a node's own capacity seeding may claim |
+| `SEED_PER_DATASET` | `250` | Candidate rows pulled per dataset (nodes keep only what they own) |
+| `SEED_FALLBACK_CAPACITY` | `100` | Capacity assumed for a node that does not answer `/stats` |
+
+### Layer 6.5 tests
+
+```powershell
+pytest tests/test_seeding.py -v
+```
+
+18 tests: popularity ordering per dataset, interleaving, budget
+math, capacity fallback, strategy normalization — plus the warm-up
+integration in `tests/test_warmup.py` (seeds on a fresh boot, steps
+aside as soon as history exists, a DB outage during seeding keeps
+the node gated).
+
+---
+
+## Layer 7 - Replication: sequence, log, sync & failover
+
+Every mutation gets a cluster-wide sequence number *before* it fans
+out, so a bounded in-memory log describes what was intended even if
+the process dies mid-write. Nodes acknowledge the highest sequence
+they applied; the router can then bring a lagging node current and
+records every failover.
+
+```
+PUT /cache/{key}
+   │
+   ├─► allocate sequence → append to the replication log (deque)
+   ├─► database write (source of truth, through the circuit breaker)
+   └─► fan out to the RF=2 owners, every copy carries the sequence
+              │
+              ▼
+   node acks → per-node acked_sequence high-water marks (behind = 0)
+```
+
+### Status
+
+```powershell
+curl.exe http://localhost:8000/cluster/replication
+```
+
+```json
+{
+    "enabled": true,
+    "current_sequence": 3,
+    "log_size": 3,
+    "log_capacity": 10000,
+    "snapshot_threshold": 1000,
+    "nodes": {
+        "http://localhost:8001": {"acked_sequence": 3, "behind": 0,
+                                  "active": true, "sync": "done"}
+    },
+    "last_failover": null,
+    "failovers": [],
+    "syncs": {}
+}
+```
+
+### Sync / resync
+
+```powershell
+# Incremental log replay when the node is a little behind, full DB
+# snapshot when the gap is large or the log rolled over. Unknown
+# node -> 404.
+curl.exe -X POST "http://localhost:8000/cluster/resync/http%3A%2F%2F127.0.0.1%3A8001"
+curl.exe -X POST "http://localhost:8000/cluster/resync/http%3A%2F%2F9999"
+```
+
+### Node-internal endpoints (ports 8001+)
+
+Normally driven by the router, but they are plain HTTP and useful
+for verification:
+
+```powershell
+# Apply one replicated mutation locally (no fan-out) — carries the sequence
+curl.exe -X PUT "http://127.0.0.1:8001/internal/replicate/user:77" `
+  -H "Content-Type: application/json" `
+  -d '{"value": "v", "ttl": 60, "sequence": 3}'
+curl.exe -X DELETE "http://127.0.0.1:8001/internal/replicate/user:77"
+
+# Versioned read: value + the sequence it was applied with
+curl.exe "http://127.0.0.1:8001/internal/entry/user:77"
+# => {"key":"user:77","exists":true,"value":"v","sequence":3}
+
+# Drop a whole key prefix on THIS node (dataset delete / lab cleanup)
+curl.exe -X DELETE "http://127.0.0.1:8001/internal/prefix/netflix_titles:"
+# => {"status":"flushed","prefix":"...","removed":N}
+
+# Graceful shutdown — exactly what POST /cluster/nodes/{port}/stop calls
+curl.exe -X POST "http://127.0.0.1:8001/internal/shutdown"
+```
+
+### Failover demo
+
+1. Write a key, then `Ctrl+C` one node's terminal.
+2. Watch `/cluster/replication` record `last_failover` and append to
+   `failovers` (capped at 50); `/cluster/status` shows `active: 2/3`.
+3. Re-replication runs in the background and rewrites the dead node's
+   keys onto their new owners so redundancy returns to RF=2 —
+   `tests/test_replication.py::test_repair_restores_ownership_after_failure`
+   proves exactly this.
+4. Restart the node: it rejoins gated (`RECOVERING` → warm-up →
+   `READY`) and the health pass retries sync until it is current.
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `REPLICATION_ENABLED` | `on` | Master switch for the log, acks and sync |
+| `REPLICATION_LOG_SIZE` | `10000` | Bound on the log (a bounded `deque` — **in-memory**, not a durable journal) |
+| `SYNC_SNAPSHOT_THRESHOLD` | `1000` | Sequence gap at which a resync switches from log replay to a full DB snapshot |
+
+### Layer 7 tests
+
+```powershell
+pytest tests/test_replication.py -v
+```
+
+37 tests: sequence allocation on write, the bounded log, per-node
+acks, incremental vs. snapshot sync, failure-detection integration,
+recorded failover history and re-replication/repair after a node is
+lost.
 
 ---
 
@@ -1226,9 +1477,10 @@ python import_dataset.py --list
 ```
 
 ```text
-netflix_titles   netflix_titles:   rows=8807   key=show_id     netflix_titles.csv
-imdb_movies      imdb_movies:      rows=10178  key=(row #)     imdb_movies.csv
-zomato_restaurant_dataset  zomato_restaurant_dataset:  rows=9551  key=Restaurant ID  Zomato Restaurant Dataset.csv
+ai_usage_and_impact_on_students_and_professionals ai_usage_and_impact_on_students_and_professionals: rows=288      key=User_ID          AI_Usage_and_Impact_on_Students_and_Professionals.csv
+imdb_movies                      imdb_movies:         rows=10178    key=(row #)          imdb_movies.csv
+netflix_titles                   netflix_titles:      rows=8807     key=show_id          netflix_titles.csv
+zomato_restaurant_dataset        zomato_restaurant_dataset: rows=9551     key=Restaurant ID    Zomato Restaurant Dataset.csv
 ```
 
 The dataset files are ordinary SQLite databases — open
@@ -1331,7 +1583,7 @@ reduction**, with the SQL count flat-lining after the first run.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SEARCH_TTL` | `300` | Seconds a `q:` result set stays in cache. |
-| `SEARCH_PAGE_SIZE_DEFAULT` | `20` | Default page size. |
+| `SEARCH_PAGE_SIZE` | `20` | Default page size (config name `SEARCH_PAGE_SIZE_DEFAULT`). |
 | `SEARCH_PAGE_SIZE_MAX` | `100` | Hard cap — anything larger is clamped. |
 
 ### Layer 8 tests
@@ -1406,6 +1658,31 @@ curl.exe -X DELETE http://127.0.0.1:8000/datasets/scratch
 Every mutation purges the affected `q:`/`s:` search caches on disk
 *and* in the nodes, so a stale search page can never outlive its data.
 
+### Direct per-node cache proxy (lab / cleanup helper)
+
+These target exactly **one** pool port — the hash ring never decides
+where the key goes, which is what makes a deterministic LRU demo
+(Lab 5) possible. A port outside the pool returns 400, an
+unreachable node 502.
+
+```powershell
+# That node's LRU list in recency order (MRU -> LRU) + counters
+curl.exe http://127.0.0.1:8000/cluster/nodes/8001/cache-state
+
+# Read / write / evict one key on that node only
+curl.exe http://127.0.0.1:8000/cluster/nodes/8001/cache/user:42
+curl.exe -X PUT http://127.0.0.1:8000/cluster/nodes/8001/cache/user:42 `
+  -H "Content-Type: application/json" -d '{"value": "scratch", "ttl": 60}'
+curl.exe -X DELETE http://127.0.0.1:8000/cluster/nodes/8001/cache/user:42
+
+# Drop a whole prefix on that node (proxied to its /internal/prefix)
+curl.exe -X DELETE http://127.0.0.1:8000/cluster/nodes/8001/cache-prefix/q:
+```
+
+`cache-state` is the node's own `GET /stats/lru` proxied through.
+Because writes here bypass the database *and* replication, treat
+them as lab/cleanup tools — not as the application write path.
+
 ### Layer 9 tests
 
 ```powershell
@@ -1423,7 +1700,7 @@ pytest tests/test_manage_routes.py tests/test_datasets_routes.py tests/test_proc
 pytest -v
 ```
 
-Expected: **376 pass, 1 skipped** (377 collected) — 39 search +
+Expected: **377 pass, 0 skipped** (~80s) — 39 search +
 37 replication + 29 dataset import + 28 node lifecycle + 28 warm-up +
 21 registry + 20 repository + 18 multi-dataset repository +
 18 seeding + 16 cache + 16 consistent hash + 15 statistics +
@@ -1432,8 +1709,9 @@ Expected: **376 pass, 1 skipped** (377 collected) — 39 search +
 7 telemetry + 6 config + 5 single-flight + 4 LRU lab +
 4 dashboard.
 
-The skip is the Excel-import test, which needs the optional
-`requirements-import.txt` (openpyxl).
+On a machine **without** the optional `requirements-import.txt`
+(pandas / pyarrow / openpyxl) the Excel-import test skips and the
+suite reports **376 pass, 1 skipped** — the other 376 are unchanged.
 
 ---
 
@@ -1471,6 +1749,23 @@ In each terminal press `Ctrl + C`.
   blocks on a missing key — the database stays the source of truth.
   A database outage during warm-up keeps the node in RECOVERING
   (retried every health pass) instead of routing to a cold node.
+- **Cold start (Layer 6.5):** when that ranking is still empty — a
+  brand-new boot — nodes are seeded from the *data*: each dataset's
+  top rows by its popularity column, interleaved across datasets and
+  capped at `capacity × SEED_FILL_RATIO` per node. `/cluster/warmup`
+  shows the policy under `seed` and each node's `source`
+  (`seed` vs `hot_keys`). Any traffic history at all makes the seeder
+  step aside.
+- **Replication (Layer 7):** every write carries a cluster-wide
+  sequence number, the router keeps a bounded **in-memory** log and
+  per-node ack watermarks, `POST /cluster/resync/{node:path}` catches
+  a lagging node up (log replay or full snapshot), and failovers are
+  recorded. Re-replication restores RF=2 after a node dies.
+- **Deletion is split (Layer 9):** `DELETE /cache/{key}` only evicts
+  the node copies (database row kept; 404 when no node held it),
+  `DELETE /db/{key}` deletes the row everywhere and cascades the
+  eviction. Dataset/entry mutations also purge the matching `q:`/`s:`
+  search caches.
 - Layer 5 uses SQLite with **no TTL** — the DB keeps data forever;
   TTL only affects the in-memory cache. The system store lives at
   `data/cache.db`, every imported dataset in `data/datasets/<name>.db`

@@ -10,7 +10,9 @@ recovery when the cluster restarts.
 - **HTTP layer:** FastAPI + Uvicorn
 - **Source of truth:** SQLite (no external services required)
 - **Web UI:** http://127.0.0.1:8000/ (vanilla HTML/JS, no build step)
-- **Tests:** pytest — 377 tests (376 passed, 1 skipped)
+- **Tests:** pytest — 377 tests, all passing (without the optional
+  `requirements-import.txt` extras the Excel import test skips:
+  376 passed + 1 skipped)
 
 ---
 
@@ -204,6 +206,9 @@ drill, an eviction burst, and a live LRU-eviction watcher.
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+# optional: Parquet/Excel imports — also the one test that skips
+# without it (376 passed + 1 skipped instead of 377 passed)
+pip install -r requirements-import.txt
 
 # 2. THE one command: imports everything sitting in datasets/
 #    (once, with --seed), spawns 3 nodes + the router, and prints
@@ -262,6 +267,12 @@ Configuration (environment variables):
 | `NODE_PORT_BASE` | `8001` | First port of that pool (`8001…8008` by default) |
 | `NODE_CAPACITY` | `5000` | Cache capacity given to nodes spawned by the router |
 | `NODE_START_TIMEOUT` | `10` | Seconds a scale/start request waits for a fresh node to answer `/health` |
+| `REPLICATION_ENABLED` | `on` | Layer 7 replication log, per-node acks and sync |
+| `REPLICATION_LOG_SIZE` | `10000` | Bound on the in-memory replication log (a `deque`, not a durable journal) |
+| `SYNC_SNAPSHOT_THRESHOLD` | `1000` | Sequence gap at which a resync switches from log replay to a full DB snapshot |
+| `SEARCH_TTL` | `300` | Seconds a `q:` / `s:` search entry stays in the cache |
+| `SEARCH_PAGE_SIZE` | `20` | Default search page size |
+| `SEARCH_PAGE_SIZE_MAX` | `100` | Hard cap — larger page sizes are clamped |
 
 ---
 
@@ -286,6 +297,9 @@ Cluster control (Layer 9 — these spawn/stop real processes):
 | POST | `/cluster/nodes/{port}/start` | Spawn & register a single pool port (400 outside the pool) |
 | POST | `/cluster/nodes/{port}/stop` | Graceful `/internal/shutdown`, then deregister |
 | POST | `/cluster/nodes/{port}/restart` | Stop + start the same port |
+| GET | `/cluster/nodes/{port}/cache-state` | One node's LRU list, capacity and counters (`/stats/lru` proxied) |
+| GET/PUT/DELETE | `/cluster/nodes/{port}/cache/{key}` | Read / write / evict a key on exactly that node — no ring fan-out, no database |
+| DELETE | `/cluster/nodes/{port}/cache-prefix/{prefix:path}` | Drop a whole key prefix on that node (lab cleanup) |
 
 Dataset administration (each entity = one isolated SQLite file):
 
@@ -299,11 +313,15 @@ Dataset administration (each entity = one isolated SQLite file):
 | POST | `/datasets/{name}/entries` | `{"value": {...}}` — upsert one row; key derived from `key_column` → `id` → sequence; purges search caches + re-syncs stats |
 | DELETE | `/datasets/{name}/entries?key=...` | Delete one row (DB row + node copies + search-cache purge) |
 
-Search, dashboard and cluster introspection (`/search/*`,
-`/dashboard/*`, `/cluster/status`, `/cluster/hot-keys`,
-`/cluster/warmup`, `/cluster/replication`, `/circuit-breaker/status`,
-`/health`, …) are unchanged from Layer 8 and listed with curl
-examples in [`commands.md`](commands.md).
+Search, dashboard, warm-up/seeding and replication introspection
+(`/search/*`, `/dashboard/*`, `/cluster/status`, `/cluster/hot-keys`,
+`/cluster/warmup` — which also reports the `seed` policy and each
+node's `source` of candidates — `/cluster/replication`,
+`POST /cluster/resync/{node:path}`, `/circuit-breaker/status`,
+`/health`, …) are listed with curl examples in
+[`commands.md`](commands.md), together with the cache
+node's own surface (`/internal/*` replication/shutdown endpoints and
+`/stats/lru`).
 
 ---
 
@@ -326,7 +344,7 @@ examples in [`commands.md`](commands.md).
 pytest -v
 ```
 
-Expected: **376 passed, 1 skipped** (377 collected) — 39 search + 37 replication +
+Expected: **377 passed, 0 skipped** (~80s) — 39 search + 37 replication +
 29 dataset import + 28 node lifecycle + 28 warm-up + 21 registry +
 20 repository + 18 multi-dataset repository + 18 seeding + 16 cache +
 16 consistent hash + 15 statistics + 13 cache-service +
@@ -335,8 +353,10 @@ Expected: **376 passed, 1 skipped** (377 collected) — 39 search + 37 replicati
 7 telemetry + 6 config + 5 single-flight + 4 LRU lab +
 4 dashboard.
 
-The one skip is the Excel-import test, which needs the optional
-`requirements-import.txt` (openpyxl). Install it and all 377 run.
+All 377 tests run when the optional `requirements-import.txt` extras
+(pandas / pyarrow / openpyxl) are installed — the state of this
+machine. Without them the Excel-import test skips and the suite
+reports **376 passed, 1 skipped**; either count is green.
 
 ### Bringing your own data
 
@@ -365,6 +385,20 @@ Full command reference, curl examples and live fault-tolerance
 walkthroughs live in [`commands.md`](commands.md).
 For the internal file-by-file implementation and import reference, see
 [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md).
+
+---
+
+## Report artifacts
+
+The written capstone report for this project sits in the repository
+root as `DCS_Capstone_Report_*.docx` / `DCS_Capstone_Report_*.pdf`
+(plus older `PersonalLLM_*` drafts), with its benchmark harness,
+generated figures and UI screenshots under `_report_bench/`. All of
+it is gitignored on purpose: the report is a *derived* artifact —
+this README, [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md),
+[`commands.md`](commands.md), [`TESTING_GUIDE.md`](TESTING_GUIDE.md)
+and the tracked `tests/` are the source of truth for the project's
+state.
 
 ---
 

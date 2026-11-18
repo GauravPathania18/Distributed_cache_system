@@ -30,6 +30,11 @@ python -m venv .venv
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional but recommended: Parquet/Excel imports — this is also the
+# one dependency the suite's Excel test needs (without it: 376
+# passed, 1 skipped instead of 377 passed)
+pip install -r requirements-import.txt
 ```
 
 You must see `(venv)` in the prompt before running anything below.
@@ -65,7 +70,7 @@ Get-NetTCPConnection -LocalPort 8000,8001,8002,8003 `
 Expected: a non-empty list of your dataset names, e.g.
 
 ```
-['imdb_movies', 'netflix_titles', 'zomato_restaurant_dataset']
+['ai_usage_and_impact_on_students_and_professionals', 'imdb_movies', 'netflix_titles', 'zomato_restaurant_dataset']
 ```
 
 If it prints `[]` — drop a file into `datasets/` and run
@@ -89,7 +94,11 @@ Fastest signal that nothing regressed. No servers needed.
 pytest -q
 ```
 
-Expected: **376 passed, 1 skipped** in ~70s, no failures, no errors.
+Expected: **377 passed, 0 skipped** in ~80s, no failures, no errors.
+(The suite reports **376 passed, 1 skipped** on a machine *without*
+the optional `requirements-import.txt` extras — the skipped Excel
+import test. Both counts are green; this machine has pandas / pyarrow
+/ openpyxl installed, so all 377 run.)
 
 Breakdown (for pinpointing a regression):
 
@@ -119,11 +128,11 @@ Breakdown (for pinpointing a regression):
 | Dashboard + web UI (8.3) | 4 | `pytest tests/test_dashboard.py -v` |
 | LRU lab (Lab 5) | 4 | `pytest tests/test_lru_lab.py -v` |
 
-**Pass criteria:** 376 passed, 1 skipped, 0 failed. Any other count
-means a lost/added test — diff against this table before suspecting
-the code. The one skip is the Excel-import test, which needs the
-optional `requirements-import.txt` (openpyxl); install it and all
-377 run.
+**Pass criteria:** **377 passed, 0 skipped, 0 failed** (or
+**376 passed, 1 skipped** when `requirements-import.txt` is not
+installed — the Excel-import test is the only conditional skip).
+Any other count means a lost/added test — diff against this table
+before suspecting the code.
 
 **Data-safety check after the run** (proves tests are hermetic):
 
@@ -245,9 +254,19 @@ Expected within ~10–20s:
 0. Before the cluster starts, the drop folder seeds (once per file):
 
 ```
-  [SEED] imported: netflix_titles.csv -> netflix_titles (8807 rows)
+  [SEED] imported: AI_Usage_and_Impact_on_Students_and_Professionals.csv -> ai_usage_and_impact_on_students_and_professionals (288 rows)
   [SEED] imported: imdb_movies.csv -> imdb_movies (10178 rows)
+  [SEED] imported: netflix_titles.csv -> netflix_titles (8807 rows)
+  [SEED] imported: Zomato Restaurant Dataset.csv -> zomato_restaurant_dataset (9551 rows)
 ```
+
+Files are processed in case-insensitive filename order (A → z). The
+count is *rows written*: the AI-usage CSV has 300 records but 12
+duplicate `User_ID`s collapse (last value wins), so 288 keys land.
+
+(When *no* file needs importing, `run.py` prints
+`[SEED] drop folder empty or fully imported` instead — each file is
+imported once, and again only if its size or mtime changed.)
 
 1. The launcher spawns 3 background nodes (logs in
    `data/logs/node-<port>.log`) and runs the router in this terminal:
@@ -475,9 +494,18 @@ curl.exe -X PUT http://127.0.0.1:8000/cache/user:101 `
 curl.exe http://127.0.0.1:8000/cache/user:101
 # => {"key":"user:101","value":{...},"source":"cache","node":"http://127.0.0.1:8001"}
 
-# DELETE - DB + both replicas
+# DELETE (cache) - EVICT the node copies, the database row stays
 curl.exe -X DELETE http://127.0.0.1:8000/cache/user:101
-# => {"status":"deleted","key":"user:101","deleted_from_database":true, ...}
+# => {"status":"evicted","key":"user:101","database":"kept",
+#     "nodes":["http://127.0.0.1:8001","http://127.0.0.1:8002"]}
+
+# ...so the next GET reloads from the source of truth
+curl.exe http://127.0.0.1:8000/cache/user:101
+# => ..."source":"database"   (and "cache" again on the second GET)
+
+# DELETE (database) - row + node copies + matching search caches
+curl.exe -X DELETE http://127.0.0.1:8000/db/user:101
+# => {"status":"deleted","key":"user:101", ...}
 
 # 404 when the key exists nowhere
 curl.exe http://127.0.0.1:8000/cache/user:101
@@ -495,18 +523,22 @@ curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1
 curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1
 # => ..."source":"cache","node":"http://127.0.0.1:800x"
 
-# Direct DB endpoints (testing-only, bypass cache)
+# Direct DB endpoints (source of truth, bypass cache-aside)
 curl.exe http://127.0.0.1:8000/db/netflix_titles:s1
 # => {"key":"netflix_titles:s1","value":{...},"source":"database"}
 curl.exe http://127.0.0.1:8000/db/netflix_titles:s2
-curl.exe -X DELETE http://127.0.0.1:8000/db/netflix_titles:s2   # deletes DB row ONLY
-curl.exe http://127.0.0.1:8000/cache/netflix_titles:s2          # => 404 (gone from DB)
+curl.exe -X DELETE http://127.0.0.1:8000/db/netflix_titles:s2   # row + node copies + search caches
+curl.exe http://127.0.0.1:8000/cache/netflix_titles:s2          # => 404 (gone everywhere)
 ```
 
-> The `/db/*` DELETE intentionally leaves the cache stale — that is
-> how you can manufacture a `STALE` verdict for the web UI Inspector.
-> Re-import the dataset with `--reimport` (Phase 8) afterwards to
-> restore the row.
+> `DELETE /db/{key}` is the "delete" half of the Layer 9 split: it
+> removes the row **and** cascades the eviction, so no later read can
+> resurrect stale data. To manufacture a `STALE` / `PARTIAL` verdict
+> for the Inspector, write a divergent value straight onto a node
+> instead — e.g. `curl.exe -X PUT http://127.0.0.1:8001/cache/netflix_titles:s1 -H "Content-Type: application/json" -d '{"value":{"title":"stale copy"}}'`
+> — which touches only that node's RAM and leaves the database row
+> alone. Re-import the dataset with `--reimport` (Phase 8) to
+> restore anything you deleted.
 
 ### 5.5 Distribution demo (optional)
 
@@ -740,9 +772,12 @@ Expected shape:
   "enabled": true,
   "limit": 1000,
   "rate_limit": 100,
+  "seed": {"strategy": "popular", "per_dataset": 250,
+           "fill_ratio": 0.6, "fallback_capacity": 100},
   "nodes": {
     "http://127.0.0.1:8001": {
       "state": "running",        -> then "done"
+      "source": "hot_keys",      -> "seed" on a fresh boot (Layer 6.5)
       "attempts": 1,
       "keys_attempted": 1,
       "keys_loaded": 1,
@@ -752,6 +787,10 @@ Expected shape:
   }
 }
 ```
+
+`seed` is `null` when `SEED_ENABLED=off`. `source` says which pool
+filled the node: `hot_keys` (traffic history was reloaded) or `seed`
+(the ranking was empty, so the data-driven cold-start seed ran).
 
 4. Final state:
 
@@ -818,10 +857,14 @@ python import_dataset.py --list
 Expected — one line per dataset (live rows, prefix, key column):
 
 ```
+ai_usage_and_impact_on_students_and_professionals ai_usage_and_impact_on_students_and_professionals: rows=288      key=User_ID          AI_Usage_and_Impact_on_Students_and_Professionals.csv
 imdb_movies                      imdb_movies:         rows=10178    key=(row #)          imdb_movies.csv
 netflix_titles                   netflix_titles:      rows=8807     key=show_id          netflix_titles.csv
-zomato_restaurant_dataset        ...                  rows=9551     key=Restaurant ID    Zomato Restaurant Dataset.csv
+zomato_restaurant_dataset        zomato_restaurant_dataset: rows=9551     key=Restaurant ID    Zomato Restaurant Dataset.csv
 ```
+
+(The AI-usage file holds 300 records but 12 duplicate `User_ID`s
+collapse on import — last value wins — so its live row count is 288.)
 
 Each dataset is its own physical SQLite file:
 
@@ -844,7 +887,7 @@ curl.exe http://127.0.0.1:8000/db/imdb_movies:1          # direct read from that
 Or simply use the web UI tabs (Search / Datasets / Inspector) — same data.
 
 Import tests are covered by `pytest tests/test_import_dataset.py
-tests/test_registry.py tests/test_multi_repository.py -v` (63 tests).
+tests/test_registry.py tests/test_multi_repository.py -v` (68 tests).
 
 ---
 
@@ -1029,7 +1072,7 @@ Copy this table into the session notes and tick every row.
 
 | # | Feature | Phase | Pass criteria |
 |---|---|---|---|
-| 1 | Test suite green | 0 | 376 passed, 1 skipped |
+| 1 | Test suite green | 0 | 377 passed, 0 skipped (376 + 1 skip without import extras) |
 | 2 | Tests are hermetic | 0 | registry + dataset files unchanged after pytest |
 | 3 | Import dry-run (no servers) | 1 | plan printed, `nothing was written` |
 | 4 | Registry listing | 1 | one line per dataset, no traceback |
@@ -1054,7 +1097,7 @@ Copy this table into the session notes and tick every row.
 | 23 | Router /cluster/status gate | 4 | 503 until ready, then 3/3 |
 | 24 | Replicated PUT via curl | 4 | `replicated_to: 2` |
 | 25 | GET via curl | 4 | `source: cache` |
-| 26 | DELETE via curl | 4 | `deleted_from_database: true` |
+| 26 | DELETE (evict) via curl | 4 | `status: evicted`, `database: kept`, next GET reloads from the DB |
 | 27 | /db/* direct endpoints | 4 | read + delete bypass cache |
 | 28 | Distribution loop (§5.5) | 4 | keys spread over nodes |
 | 29 | Node failure detection | 5 | `[NODE FAILED]` in ~6–20s |
@@ -1087,8 +1130,11 @@ Copy this table into the session notes and tick every row.
 | 56 | Cache Lab demo | 10 | chart plateaus, ~99% reduction |
 | 57 | Cluster scale ± from the UI | 10 | card appears, reaches `READY`, disappears on scale-down |
 | 58 | Datasets create / browse / delete | 10 | entity listed, entries readable, delete removes it |
+| 59 | Cold-start seeding (6.5) | 7 | fresh boot: `/cluster/warmup` carries a `seed` block and the node record shows `source: "seed"` |
+| 60 | Evict vs. delete split (9.3) | 3 | `DELETE /cache/{key}` keeps the DB row (`404` when no node held it); `DELETE /db/{key}` removes row + copies |
+| 61 | Lab 5 — live LRU eviction | 10 | attach a node from the Cluster tab, run the lab, insert / touch / evict animate |
 
-Result: ___/58 passed  |  Date: ______  |  Tester: ______
+Result: ___/61 passed  |  Date: ______  |  Tester: ______
 
 ---
 
@@ -1146,7 +1192,7 @@ Get-NetTCPConnection -LocalPort 8001,8002,8003 -State Listen `
 
 For a fast "is it basically alive?" check between larger changes:
 
-1. `pytest -q` → 376 passed, 1 skipped (Phase 0)
+1. `pytest -q` → 377 passed, 0 skipped (Phase 0)
 2. `python run.py --seed` → seeds datasets/, then `/cluster/status` shows 3/3 ready (Phase 3)
 3. `curl.exe http://127.0.0.1:8000/cache/netflix_titles:s1` twice → `database` then `cache`
 4. Web UI Inspector → `netflix_titles:s1` → `CONSISTENT`

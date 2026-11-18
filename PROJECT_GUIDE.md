@@ -10,11 +10,13 @@ project-level metadata/documentation files. It describes
 the purpose of each file, the problems it addresses, its principal classes or
 functions, and why its imports are needed.
 
-Generated data, local environments, and research materials are
-excluded from this inventory. In particular, `.gitignore`
-excludes `data/`, `datasets/`, `.venv/`, and `/DCS_research` — while
-the pytest suite under `tests/` is tracked. The README and
-`commands.md` state the expected test counts.
+Generated data, local environments, research materials, and report
+artifacts are excluded from this inventory. In particular,
+`.gitignore` excludes `data/`, `datasets/`, `.venv/`, `/DCS_research`,
+the capstone report files (`DCS_Capstone_Report_*`, `PersonalLLM_*`)
+and the whole `_report_bench/` tree — while the pytest suite under
+`tests/` is tracked. The README and `commands.md` state the expected
+test counts.
 
 ## 2. Problem statement and solution
 
@@ -42,11 +44,21 @@ DCS is an educational Python implementation of a distributed cache with:
 - Node lifecycle states, periodic health checks, and gated recovery.
 - In-memory operation statistics, bounded hot-key tracking, and throttled
   cache warm-up before a recovering node re-enters the ring.
+- Cold-start seeding: a brand-new boot has no traffic history to
+  replay, so each node's first contents are chosen from the **data**
+  (every dataset's top rows by its popularity column), interleaved
+  across datasets and capped at a fraction of the node's capacity.
 - Replicated writes with a sequence-numbered log, sync/resync, recorded
   failover and re-replication back onto healthy nodes.
 - Cached keyword/facet search over the datasets, router-side DB-load
   telemetry, and a six-tab web UI (Search, Dashboard, Cluster,
   Datasets, Inspector, Lab) served by the router itself.
+- Cluster control and dataset administration over HTTP: spawn, scale,
+  stop and restart real node processes; create entities as isolated
+  SQLite files; browse, add and delete their rows — with every
+  mutation purging the search caches it invalidates. Deletion itself
+  is split: evict the cache copies, or delete the database row
+  everywhere.
 - A one-command launcher (`run.py`) that seeds the drop folder, spawns
   the node processes and runs the router, plus a file-based dataset
   importer.
@@ -61,7 +73,11 @@ cache. A cache hit does not require a database call.
 API reports failure if no cache node accepted the value, even though the
 database write may already have succeeded.
 
-**DELETE:** router → SQLite delete → invalidate selected cache nodes.
+**DELETE (split, Layer 9):** `DELETE /cache/{key}` evicts the key from
+the selected cache nodes and keeps the SQLite row (404 when no node
+held it). `DELETE /db/{key}` deletes the SQLite row first and then
+cascades the eviction plus a purge of the affected `q:`/`s:` search
+caches, so no later read can resurrect stale data.
 
 **Node recovery:** health checks drive `STARTING` / `FAILED` nodes into
 `RECOVERING`; they remain out of the live ring. Warm-up merges hot-key data,
@@ -76,9 +92,15 @@ and the recovery gate are satisfied.
 - Cache values are JSON-serialized in SQLite; cache TTL applies only to the
   in-memory cache, not to the database record.
 - Cache nodes do not access SQLite directly; the router owns orchestration.
-- Replication in the current implementation is a fan-out of an operation to
-  the distinct nodes returned by `NodeManager`. There is no replica quorum,
-  version vector, replication log, or anti-entropy repair protocol.
+- Replication is a fan-out of an operation to the distinct nodes
+  returned by `NodeManager`, sequenced by a cluster-wide counter the
+  router owns: each mutation is recorded in a bounded **in-memory**
+  log before it fans out, nodes acknowledge the highest sequence they
+  applied, `POST /cluster/resync/{node:path}` catches a lagging node
+  up (incremental replay or full snapshot) and re-replication restores
+  the replication factor after a failure. There is still no replica
+  quorum, version vector, durable journal, or continuous anti-entropy
+  protocol — nodes never talk to each other, only the router does.
 - `SingleFlight` coalesces requests only inside one Python process.
 - Node statistics and router hot-key rankings are in-memory process state;
   they are not durable across router restarts.
@@ -467,6 +489,120 @@ and the recovery gate are satisfied.
   the attempt failed so later health passes can retry. A failed direct cache
   write is counted but does not itself mark the node health-failed.
 
+#### [`services/seeding.py`](./services/seeding.py)
+
+- **Purpose/problem solved:** Layer 6.5 — decides what an *empty* node
+  holds before any traffic exists, when the Layer 6.3 ranking has
+  nothing to reload. Selection policy lives here; the mechanics
+  (ownership, throttling, writing) stay in `warmup.py`.
+- **Functions/class:** `normalize_strategy()` accepts `popular` /
+  `random`; `popularity_order()` ranks a dataset by the column its
+  schema flags as the popularity signal (`score`,
+  `aggregate_rating`, `release_year`, …); `dataset_keys()` +
+  `interleave()` build the cross-dataset candidate pool and
+  `seed_keys()` is the store-level entry point; `fetch_capacity()`
+  reads a node's real capacity from `/stats` and `seed_budget()`
+  computes `capacity × SEED_FILL_RATIO`. `CacheSeeder.candidates()`,
+  `budget(node)` and `status()` (reported as `seed` by
+  `GET /cluster/warmup`) are what `CacheWarmup` calls — a missing
+  seeder means seeding is off.
+- **Imports:** `requests` fetches node capacity; `build_entities()`
+  from `services.search` reuses each entity's default sort as its
+  popularity order; `DatabaseQueryError` /
+  `DatabaseUnavailableError` separate "nothing to seed" from a DB
+  outage (which must keep the node gated).
+
+#### [`services/replication.py`](./services/replication.py)
+
+- **Purpose/problem solved:** Layer 7.3–7.6 — router-side write
+  ordering. The router is the single sequencing authority, so nodes
+  never talk to each other and replication loops are structurally
+  impossible.
+- **Class/functions:** `ReplicationManager.next_sequence()` allocates
+  the cluster-wide sequence; `record()` appends each mutation to a
+  bounded in-memory `deque` *before* the fan-out; `ack()` /
+  `acked_sequence()` keep per-node high-water marks; `entries_since()`
+  and `log_oldest_sequence()` back the incremental path, while
+  `_needs_snapshot()` / `_snapshot_node()` switch to a full DB pull
+  when the gap is large; `sync_node()` runs the sync, `repair()` /
+  `repair_active_nodes()` re-replicate after a failure (Layer 7.6),
+  `record_failover()` / `failovers()` / `last_failover()` keep the
+  history, and `status()` is what `GET /cluster/replication` returns.
+  `install()` hooks the lifecycle so a `RECOVERING` node is synced
+  with the same retry-per-health-pass pattern warm-up uses.
+- **Imports:** `deque` is the bounded log; `threading` enforces the
+  single-writer status model; `DatabaseUnavailableError` keeps a DB
+  outage from being mistaken for a completed sync.
+
+#### [`services/search.py`](./services/search.py)
+
+- **Purpose/problem solved:** Layer 8.1 — keyword/facet/range/sort
+  search over every registered dataset, where each distinct query
+  combination is one cache entry (`q:` prefix, `SEARCH_TTL`) so a
+  repeated search never touches SQL again.
+- **Functions/class:** `build_entities()` turns each dataset's
+  sniffed schema into the filters, ranges, sortable columns and
+  suggest fields the UI renders; `_safe()` canonicalizes user values
+  into URL-path-safe cache-key fragments (case-folded, `/` forbidden);
+  `SearchService.entities()`, `search()` (build `q:` key → cache hit
+  or run `_run()`/`_where()`/`_order()` SQL → write through the cache),
+  `suggest()` (separate `s:` keys) and `browse()` (prefix paging used
+  by the Inspector).
+- **Imports:** `math`/`re`/`time` implement pagination, key
+  sanitization and the `took_ms`/`db_took_ms` timings; the database
+  exception types map outages to 503 and bad SQL to a query error.
+
+#### [`services/telemetry.py`](./services/telemetry.py)
+
+- **Purpose/problem solved:** Layer 8.2 — the DB-load-reduction
+  number. It counts **real operations**, not HTTP requests, so N
+  concurrent misses coalesced by `SingleFlight` record exactly one
+  database read.
+- **Class/functions:** `RequestTelemetry.record_get(source)` /
+  `record_search(hit)` / `record_set()` / `record_delete()` increment
+  the counters; `stats()` returns them with the derived
+  `db_reads_avoided` and `db_load_reduction_pct`; `reset()` clears
+  them for a demo.
+- **Imports:** `threading` protects the counters; `time` stamps the
+  window.
+
+#### [`services/process_manager.py`](./services/process_manager.py)
+
+- **Purpose/problem solved:** Layer 9.1 — spawn and stop cache-node
+  OS processes for a parent process (the router scaling the cluster
+  from the UI, or `run.py`). It owns processes only; membership
+  bookkeeping stays in `routes_manage.py`.
+- **Functions:** `project_python()` prefers the project venv
+  interpreter; `process_manager.start(port, capacity)` runs
+  `main.py`, `stop(port)` terminates a child it owns or kills via the
+  PID file `main.py` wrote, and `stop_all()` is the router/launcher
+  shutdown hook. Logs go to `data/logs/node-<port>.log`, PID files to
+  `data/pids/`, so a node started by *another* process is still
+  adoptable and stoppable; the `spawner` hook is injectable for tests.
+- **Imports:** `os`/`sys` resolve paths and the interpreter;
+  `subprocess`/`signal` start and stop children; `threading`/`time`
+  implement the bounded start wait.
+
+#### [`services/dataset_admin.py`](./services/dataset_admin.py)
+
+- **Purpose/problem solved:** Layer 9.2 — one place owns every
+  mutation a dataset can suffer from the UI and keeps four stores in
+  step: database rows, node copies, `q:`/`s:` search caches and the
+  replication log (so a lagging replica cannot resurrect a flushed
+  row on its next sync).
+- **Class/functions:** `DatasetAdmin.list()` / `get()` / `entries()`
+  browse; `create()` materializes an isolated SQLite file plus its
+  manifest entry; `add_entry()` derives a conflict-free key
+  (`key_column` → `id` → next sequence) and upserts on repeat;
+  `delete_entry()` / `delete_dataset()` cascade eviction, prefix
+  flushes, search-cache purges and log drops; `after_key_change(key)`
+  is the hook `PUT|DELETE /cache` and `/db` call for dataset keys, and
+  `purge_search_caches()` / `_sync_stats()` keep pages and manifest
+  row counts honest.
+- **Imports:** `detect_schema`/`slugify` from the registry re-detect
+  the schema after edits (`SCHEMA_SAMPLE` rows); `DatabaseRepository`
+  reads and writes the entity's own file.
+
 ### 3.5 `router/` — HTTP API and application wiring
 
 #### [`router/__init__.py`](./router/__init__.py)
@@ -558,6 +694,100 @@ and the recovery gate are satisfied.
   `Query` validate/translate HTTP inputs; `app` registers routes; `_components`
   provides the shared cluster/services.
 
+#### [`router/routes_static.py`](./router/routes_static.py)
+
+- **Purpose/problem solved:** Serves the web UI from disk on every
+  request and sends the bare root URL to it.
+- **Behavior:** mounts `app.mount("/ui", StaticFiles(directory=FRONTEND_DIR,
+  html=True))` **last on purpose** — Starlette matches in registration
+  order, so `/cache`, `/search`, `/dashboard`, `/cluster` and `/db`
+  always win and the static mount only answers what they do not. A
+  missing frontend directory prints a warning instead of blocking API
+  boot, and `root()` answers `GET /` with a redirect to `/ui`.
+- **Imports:** `os` checks the directory; `FRONTEND_DIR` (env
+  `FRONTEND_DIR`) locates it; `RedirectResponse` and `StaticFiles`
+  implement the two behaviors.
+
+#### [`router/routes_search.py`](./router/routes_search.py)
+
+- **Purpose/problem solved:** Layer 8.1 HTTP surface for cached
+  search and prefix browsing.
+- **Endpoints:** `GET /search/entities` returns the per-entity
+  filters, sortable columns and suggest fields the UI renders;
+  `GET /search/{entity}` runs one cached query combination (response
+  carries `source`, `cache_key`, `took_ms`, `db_took_ms`);
+  `GET /search/{entity}/suggest` serves the separately cached `s:`
+  suggestions; `GET /browse/prefix` pages any key prefix (dataset
+  keys or the cached `q:` result sets) for the Inspector.
+- **Imports:** `Request` reads the query string; `HTTPException`
+  maps a bad/unknown entity to 422, unexpected errors to 500 and a
+  database outage to 503; `_components.search_service` does the work.
+
+#### [`router/routes_dashboard.py`](./router/routes_dashboard.py)
+
+- **Purpose/problem solved:** Aggregates everything the Dashboard tab
+  shows into one call, plus the telemetry reset used before demos.
+- **Endpoints:** `GET /dashboard/aggregate` folds per-node lifetime
+  and windowed stats, router telemetry (`db_reads`,
+  `db_reads_avoided`, `db_load_reduction_pct`), circuit-breaker and
+  replication state, hot keys and cluster size; `POST
+  /dashboard/telemetry/reset` zeroes the counters.
+- **Imports:** `requests` fans out to each node's `/stats` with a
+  short timeout and reports a dead node inline (one broken panel, not
+  a failed request); `_components` supplies telemetry, breaker and
+  replication state.
+
+#### [`router/routes_manage.py`](./router/routes_manage.py)
+
+- **Purpose/problem solved:** Layer 9.1 — cluster control from the
+  UI: which processes run where, and the ability to change that.
+- **Endpoints:** `GET /cluster/nodes` returns membership plus process
+  ownership (`owned`/`attached`/`stopped`), PID, state and cache
+  stats; `POST /cluster/nodes {"target": N}` scales (grow spawns from
+  the pool, shrink stops and deregisters the highest ports, an equal
+  target starts any dead member); `POST /cluster/nodes/{port}/start|`
+  `stop|restart` manage one pool port (400 outside the pool).
+- **Behavior:** membership bookkeeping lives here, process mechanics
+  in `services/process_manager.py`. A freshly registered node joins
+  as `STARTING` and is driven by the existing health monitor through
+  `RECOVERING` → warm-up/seeding → `READY`; `_wait_healthy()` gives a
+  scale-up `NODE_START_TIMEOUT` seconds to answer `/health`.
+- **Imports:** `ScaleRequest` (Pydantic) validates the target;
+  `check_node` probes ports; `process_manager` spawns/stops;
+  `HTTPException`/`Path` map bad ports and start failures.
+
+#### [`router/routes_node.py`](./router/routes_node.py)
+
+- **Purpose/problem solved:** Direct per-node cache access for the UI
+  (Lab 5's live LRU view) — the client API fans out through the hash
+  ring, so without these routes nobody can watch one node's linked
+  list reorder.
+- **Endpoints:** `GET /cluster/nodes/{port}/cache-state` (proxies the
+  node's `GET /stats/lru`), `GET|PUT|DELETE /cluster/nodes/{port}/
+  cache/{key}` and `DELETE /cluster/nodes/{port}/cache-prefix/
+  {prefix:path}` (proxied to `/internal/prefix`). No fan-out, no
+  replication, no database — lab traffic stays local to that node.
+- **Behavior:** `_target()` rejects any port outside
+  `NODE_PORT_BASE..+MAX_NODES-1` (400) so the proxy can never be
+  aimed at an arbitrary host; an unreachable node is 502; `_key_path()`
+  re-encodes keys so every character survives the path segment.
+- **Imports:** `requests` performs the one forward call; `Path`
+  validates the port; `CacheEntry` validates writes; `config` supplies
+  the pool bounds and timeout.
+
+#### [`router/routes_datasets.py`](./router/routes_datasets.py)
+
+- **Purpose/problem solved:** Layer 9.2 — dataset management from the
+  web UI; this module only translates HTTP, all mutation logic lives
+  in `services/dataset_admin.py`.
+- **Endpoints:** `GET|POST /datasets`, `GET|DELETE /datasets/{name}`,
+  `GET|POST /datasets/{name}/entries` and
+  `DELETE /datasets/{name}/entries?key=...` (paged browse, add or
+  upsert one row, delete one row everywhere).
+- **Imports:** `DatasetCreate`/`EntryCreate` Pydantic models validate
+  bodies; `HTTPException` maps bad input to 400, unknown
+  dataset/key to 404 and storage outages to 503.
+
 #### [`router/router.py`](./router/router.py)
 
 - **Purpose/problem solved:** Preserves the established `router.router:app`
@@ -583,10 +813,13 @@ restart. `GET /` is only a redirect to `/ui`.
   views are `view-search`, `view-dashboard`, `view-cluster`,
   `view-datasets`, `view-inspector` and `view-lab`.
 - **Important behavior:** Element ids are the contract between the
-  markup and the scripts — 95 ids in total, 88 of them referenced from
-  JavaScript, none missing. Each view opens with a `.view-head` title
-  and a one-line description, and the Lab forms use labelled
-  `.form-row` / `.field` groups.
+  markup and the scripts — 95 ids in total and every one is accounted
+  for: 89 appear literally in the JavaScript, and the six view-section
+  ids (`view-search`, `view-dashboard`, `view-cluster`,
+  `view-datasets`, `view-inspector`, `view-lab`) are addressed by the
+  router's `` `view-${name}` `` lookup. Each view opens with a
+  `.view-head` title and a one-line description, and the Lab forms use
+  labelled `.form-row` / `.field` groups.
 
 #### [`frontend/style.css`](./frontend/style.css)
 
@@ -641,11 +874,16 @@ so the shell can show/hide it:
 - **Purpose/problem solved:** Runs one independent in-memory cache node as an
   HTTP service.
 - **Functions/endpoints:** `parse_args()` handles port/capacity CLI options.
-  `CacheEntry` validates writes. `/health`, `/cache/{key}` GET/PUT/DELETE,
-  `/cache/{key}/exists`, `/stats`, `/stats/window`, and `/stats/top-keys`
-  expose cache operations and node-local statistics. The `__main__` block
-  creates a configured cache/statistics instance, starts rotation, and
-  launches Uvicorn.
+  `CacheEntry` validates normal writes and `ReplicationEntry` validates
+  the sequenced `/internal/replicate` body. `/health`, `/cache/{key}`
+  GET/PUT/DELETE, `/cache/{key}/exists`, `/stats`, `/stats/window`,
+  `/stats/top-keys` and `/stats/lru` expose cache operations and
+  node-local statistics; `/internal/replicate`, `/internal/entry`,
+  `/internal/prefix` and `/internal/shutdown` serve replication,
+  prefix purge and graceful stop. The `__main__` block creates a
+  configured cache/statistics instance, starts rotation, writes the
+  PID file that lets another process find and stop this node later,
+  and launches Uvicorn.
 - **Imports:** `argparse` parses CLI settings; `uvicorn` runs the server;
   FastAPI's `FastAPI`, `HTTPException`, and `Query` define the API and
   responses; Pydantic `BaseModel`/`Field` validate values and positive TTL;
@@ -704,7 +942,63 @@ so the shell can show/hide it:
   elapsed import time. `DatasetRegistry` owns the manifest; the repository
   classes provide batched persistence.
 
-### 3.8 Project metadata and documentation
+### 3.8 `tests/` — the automated suite
+
+23 test modules, **377 tests** in total (the per-module counts below
+are the same ones the README and `TESTING_GUIDE.md` break out).
+Everything under `tests/` is tracked in Git — the suite is part of
+the deliverable, not scratch work.
+
+#### [`tests/conftest.py`](./tests/conftest.py)
+
+- **Purpose/problem solved:** Makes pytest hermetic. The router builds
+  its `DatabaseRepository` from `CACHE_DB_PATH` **at import time** and
+  several router fixtures call `database.clear()` / `delete()`, so
+  without this file every run would operate on the real `data/cache.db`
+  and wipe it.
+- **Behavior:** Creates `tempfile.mkdtemp(prefix="dcs-tests-")` and
+  points `CACHE_DB_PATH` at a throwaway `cache.db` inside it *before
+  any test module imports the router*; an `atexit` hook removes the
+  directory afterwards (`shutil.rmtree(..., ignore_errors=True)`).
+- **Imports:** `os`/`tempfile` build the path; `atexit`/`shutil`
+  guarantee cleanup even when the suite fails.
+
+#### [`tests/__init__.py`](./tests/__init__.py)
+
+- **Purpose:** Empty package marker so the test modules form one
+  importable package.
+
+#### Test modules by concern
+
+| Module | Tests | What it pins down |
+|---|---|---|
+| `test_cache.py` | 16 | LRU engine: eviction, TTL, stats, `delete_prefix`, `get_or_set` stampede protection |
+| `test_consistent_hash.py` | 16 | Ring building, virtual nodes, replica selection with distinct physical nodes |
+| `test_statistics.py` | 15 | Counters, window rotation, bounded hot-key tracking, concurrency |
+| `test_node_lifecycle.py` | 28 | `STARTING/RECOVERING/READY/UNHEALTHY/FAILED` transitions and gating |
+| `test_warmup.py` | 28 | Throttled warm-up, ownership, rejoin gate, DB-outage behavior, seeding integration |
+| `test_seeding.py` | 18 | Layer 6.5 candidate selection: popularity ordering, interleaving, budget, fallback |
+| `test_replication.py` | 37 | Sequence allocation, bounded log, acks, incremental/snapshot sync, failover, repair |
+| `test_repository.py` | 20 | SQLite CRUD, JSON round-trip, read-only SQL inspection |
+| `test_multi_repository.py` | 18 | Prefix routing across the per-dataset files |
+| `test_registry.py` | 21 | Manifest, schema/key sniffing, drop-folder scan, reimport bookkeeping |
+| `test_import_dataset.py` | 29 | Formats, duplicate-key collapse, atomic `.import` swap, CLI flags |
+| `test_cache_service.py` | 13 | Cache-aside flow (hit/miss/set/delete), coalesced concurrent misses, DB-outage behavior, breaker opening |
+| `test_circuit_breaker.py` | 11 | `CLOSED` → `OPEN` → `HALF-OPEN` state machine |
+| `test_single_flight.py` | 5 | Leader/follower coalescing of concurrent misses |
+| `test_config.py` | 6 | Node URL/port pool parsing from `CACHE_NODES` |
+| `test_router.py` | 9 | Router endpoints end-to-end (cache, `/db`, cluster status) |
+| `test_manage_routes.py` | 9 | Scale / start / stop / restart cluster-control routes |
+| `test_datasets_routes.py` | 12 | Dataset and entry CRUD routes, incl. error mapping |
+| `test_process_manager.py` | 12 | Spawn, stop, adopt, log/PID file handling |
+| `test_search.py` | 39 | Cached search: filters, ranges, sort, pagination, suggest, browse |
+| `test_telemetry.py` | 7 | DB-load-reduction counters and derived metric |
+| `test_dashboard.py` | 4 | `/dashboard/aggregate` shape and telemetry reset |
+| `test_lru_lab.py` | 4 | Lab 5's per-node LRU view and control calls |
+
+- **Imports:** Not applicable (they exercise every package above).
+
+### 3.9 Project metadata and documentation
 
 #### [`.gitignore`](./.gitignore)
 
@@ -743,14 +1037,18 @@ so the shell can show/hide it:
   commands.
 - **Important content:** Describes the source-of-truth/cache relationship,
   the dataset import flow (drop folder → per-dataset SQLite → registry),
-  and the development roadmap.
+  the development roadmap, and where the (untracked) capstone report
+  artifacts live.
 - **Imports:** Not applicable.
 
 #### [`commands.md`](./commands.md)
 
 - **Purpose/problem solved:** Detailed operator/developer command reference:
-  environment setup, the launcher, layer-specific endpoints, fault-tolerance
-  walkthroughs, warm-up, dataset import, and test commands.
+  environment setup, the launcher, layer-by-layer endpoints and demos
+  (including cold-start seeding and the Layer 7 replication/sync
+  surface), fault-tolerance walkthroughs, dataset import, cluster
+  control and per-node helpers, the Layer 8/9 web-UI endpoints, and
+  test commands.
 - **Important content:** Contains setup and examples; it is not executable
   application logic. Cross-check these commands against the current code
   before treating them as operational guarantees.
@@ -774,7 +1072,21 @@ so the shell can show/hide it:
   the automated suite, then manual smoke phases cover the dataset
   pipeline, a single node, the router cluster, failure/rejoin, the
   circuit breaker, warm-up, import, replication and the web UI —
-  followed by a 58-row master checklist and a troubleshooting table.
+  followed by a 61-row master checklist and a troubleshooting table.
+- **Imports:** Not applicable.
+
+#### Capstone report artifacts (untracked)
+
+- **Purpose/problem solved:** The written report for this project:
+  `DCS_Capstone_Report_*.docx` / `DCS_Capstone_Report_*.pdf` in the
+  repository root, older `PersonalLLM_*` drafts, and the
+  `_report_bench/` tree that produced them — bench/soak harness,
+  figure generation, UI screenshots, validation scripts and their
+  JSON results.
+- **Important content:** Derived material only; none of it is
+  committed (see the `.gitignore` entry above). When the report and
+  the code disagree, the code and `tests/` are authoritative and the
+  report is re-exported.
 - **Imports:** Not applicable.
 
 ## 4. Runtime configuration and externally visible surfaces
@@ -791,6 +1103,22 @@ so the shell can show/hide it:
 | `WARMUP_LIMIT` | `1000` | Number of top hot keys considered |
 | `WARMUP_RATE_LIMIT` | `100` reads/second | Shared warm-up DB-read throttle |
 | `HOTKEY_MAX_KEYS` | `10000` | Router-side distinct-key bound |
+| `SEED_ENABLED` | enabled | Layer 6.5 cold-start seeding (consulted only while the hot-key ranking is empty) |
+| `SEED_STRATEGY` | `popular` | Seed selection: top rows per dataset's popularity column, or a uniform sample |
+| `SEED_FILL_RATIO` | `0.6` | Fraction of a node's own capacity seeding may claim |
+| `SEED_PER_DATASET` | `250` | Candidate rows pulled per dataset |
+| `SEED_FALLBACK_CAPACITY` | `100` | Capacity assumed for a node that does not answer `/stats` |
+| `MAX_NODES` | `8` | Node port pool the UI may spawn into |
+| `NODE_PORT_BASE` | `8001` | First port of that pool |
+| `NODE_CAPACITY` | `5000` | Capacity of nodes spawned by the router |
+| `NODE_START_TIMEOUT` | `10` seconds | How long a scale/start request waits for `/health` |
+| `REPLICATION_ENABLED` | enabled | Layer 7 log, per-node acks and sync |
+| `REPLICATION_LOG_SIZE` | `10000` | Bound on the in-memory replication log |
+| `SYNC_SNAPSHOT_THRESHOLD` | `1000` | Sequence gap that forces a snapshot resync instead of log replay |
+| `SEARCH_TTL` | `300` seconds | Lifetime of a cached `q:`/`s:` search entry |
+| `SEARCH_PAGE_SIZE` | `20` | Default search page size |
+| `SEARCH_PAGE_SIZE_MAX` | `100` | Hard cap on the search page size |
+| `FRONTEND_DIR` | `frontend/` | Directory the `/ui` static mount serves |
 
 Other code defaults include 100 virtual nodes, replication factor 2, health
 interval 2 seconds, failure threshold 3, and request timeout 2 seconds.
@@ -805,6 +1133,14 @@ interval 2 seconds, failure threshold 3, and request timeout 2 seconds.
 - `DELETE /cache/{key}`
 - `GET /cache/{key}/exists`
 - `GET /stats`, `/stats/window`, `/stats/top-keys`
+- `GET /stats/lru` — the recency-ordered key list (MRU → LRU) the
+  Lab tab watches
+- Node-internal (normally driven by the router): `PUT|DELETE
+  /internal/replicate/{key}` (apply one sequenced mutation),
+  `GET /internal/entry/{key}` (value + sequence),
+  `DELETE /internal/prefix/{prefix:path}` (drop a whole prefix) and
+  `POST /internal/shutdown` (graceful exit — what the Cluster tab's
+  *stop* calls)
 
 **Router (`router/routes_*.py`, typically port 8000):**
 
@@ -842,13 +1178,16 @@ These notes describe observed code behavior, not future design intent:
    educational and runs a single router process with local SQLite by default.
    The code shown here does not implement authentication/authorization or a
    TLS deployment configuration.
-2. **Not strongly consistent replication.** Writes are sent to selected
-   nodes without a quorum or durable replication log. A successful response
-   can list fewer nodes than the configured replication factor as long as at
-   least one node accepted the write. The Layer 7.3 log is a bounded
-   **in-memory** `deque`, so it is not a durable journal. Database-first
-   write failure is surfaced; cache fan-out failure after a successful
-   database write can still return HTTP 503.
+2. **Not strongly consistent replication.** Writes are fanned out to
+   the selected nodes without a quorum: a `PUT` reports `replicated_to`
+   and lists the nodes that accepted it. When *no* node accepted the
+   write, the API still answers HTTP 200 with a `warning` and
+   `source: "database"` — a scaled-down cluster is a legitimate state
+   and the database row is the source of truth (Layer 9). The Layer
+   7.3 log is a bounded **in-memory** `deque`, so it is not a durable
+   journal: a router restart loses both the sequence history and the
+   per-node ack marks. Only a database write failure surfaces as
+   HTTP 503; cache fan-out is best-effort.
 3. **Cache TTL and database retention differ.** Expiration removes/ignores an
    in-memory entry; the SQLite value remains until explicitly deleted.
 4. **Cache misses treat `None` as absent.** Both the cache and service use
@@ -866,6 +1205,13 @@ These notes describe observed code behavior, not future design intent:
    `services/seeding.py` with trusted SQL and is **not** exposed over HTTP —
    do not wire it up to an untrusted caller without switching the
    connection to `file:...?mode=ro`.
+7. **The per-node cache proxy deliberately bypasses the data plane.**
+   `PUT|DELETE /cluster/nodes/{port}/cache/{key}` (and Lab 5's direct
+   node calls) touch exactly one node's RAM with no database write and
+   no replication — that is precisely what makes a deterministic LRU
+   demonstration possible. Aimed at application data it creates the
+   divergence the Inspector reports as `STALE`/`PARTIAL`, so treat
+   these routes as lab and cleanup tooling, not as a write path.
 
 ## 6. Suggested reading order for maintainers
 
